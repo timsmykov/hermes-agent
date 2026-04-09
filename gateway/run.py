@@ -334,6 +334,29 @@ def _build_media_placeholder(event) -> str:
     return "\n".join(parts)
 
 
+def _merge_pending_event(existing: MessageEvent, incoming: MessageEvent) -> MessageEvent:
+    """Merge a newly queued platform event into the existing pending event.
+
+    Preserve all media attachments while concatenating any user-supplied text.
+    This prevents Telegram document bursts from overwriting earlier files while
+    the current turn is still being processed.
+    """
+    if incoming.text:
+        if existing.text:
+            existing.text = BasePlatformAdapter._merge_caption(existing.text, incoming.text)
+        else:
+            existing.text = incoming.text
+    if getattr(incoming, "media_urls", None):
+        existing.media_urls.extend(incoming.media_urls)
+        existing.media_types.extend(incoming.media_types)
+        if existing.message_type == MessageType.TEXT or not getattr(existing, "media_urls", None):
+            existing.message_type = incoming.message_type
+    if getattr(incoming, "reply_to_text", None):
+        existing.reply_to_text = incoming.reply_to_text
+        existing.reply_to_message_id = incoming.reply_to_message_id
+    return existing
+
+
 def _dequeue_pending_text(adapter, session_key: str) -> str | None:
     """Consume and return the text of a pending queued message.
 
@@ -2012,14 +2035,29 @@ class GatewayRunner:
                 # agent starts.
                 adapter = self.adapters.get(source.platform)
                 if adapter:
-                    adapter._pending_messages[_quick_key] = event
+                    existing = adapter._pending_messages.get(_quick_key)
+                    if existing:
+                        _merge_pending_event(existing, event)
+                    else:
+                        adapter._pending_messages[_quick_key] = event
+                else:
+                    self._pending_messages[_quick_key] = event.text or _build_media_placeholder(event)
                 return None
             logger.debug("PRIORITY interrupt for session %s", _quick_key[:20])
-            running_agent.interrupt(event.text)
-            if _quick_key in self._pending_messages:
-                self._pending_messages[_quick_key] += "\n" + event.text
-            else:
-                self._pending_messages[_quick_key] = event.text
+            adapter = self.adapters.get(source.platform)
+            if adapter:
+                existing = adapter._pending_messages.get(_quick_key)
+                if existing:
+                    _merge_pending_event(existing, event)
+                else:
+                    adapter._pending_messages[_quick_key] = event
+            interrupt_text = event.text or _build_media_placeholder(event)
+            running_agent.interrupt(interrupt_text)
+            if not adapter:
+                if _quick_key in self._pending_messages:
+                    self._pending_messages[_quick_key] += "\n" + interrupt_text
+                else:
+                    self._pending_messages[_quick_key] = interrupt_text
             return None
 
         # Check for commands
