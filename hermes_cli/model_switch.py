@@ -745,8 +745,27 @@ def list_authenticated_providers(
     if "nous" not in curated:
         curated["nous"] = curated["openrouter"]
 
+    allowed_provider_order = [
+        "openai-codex",
+        "copilot",
+        "minimax",
+        "xai",
+        "gemini",
+    ]
+    allowed_provider_set = set(allowed_provider_order)
+    hidden_provider_slugs = {
+        "openrouter",
+        "nous",
+        "minimax-cn",
+        "copilot-acp",
+        "github-copilot",
+        "google",
+    }
+
     # --- 1. Check Hermes-mapped providers ---
     for hermes_id, mdev_id in PROVIDER_TO_MODELS_DEV.items():
+        if hermes_id in hidden_provider_slugs or hermes_id not in allowed_provider_set:
+            continue
         if mdev_id in seen_models_dev_ids:
             continue
         pdata = data.get(mdev_id)
@@ -762,8 +781,10 @@ def list_authenticated_providers(
         if not has_creds:
             continue
 
-        # Use curated list, falling back to models.dev if no curated list
+        # Only expose curated models for the compact picker.
         model_ids = curated.get(hermes_id, [])
+        if not model_ids:
+            continue
         total = len(model_ids)
         top = model_ids[:max_models]
 
@@ -786,6 +807,8 @@ def list_authenticated_providers(
     # --- 2. Check Hermes-only providers (nous, openai-codex, copilot) ---
     from hermes_cli.providers import HERMES_OVERLAYS
     for pid, overlay in HERMES_OVERLAYS.items():
+        if pid in hidden_provider_slugs or pid not in allowed_provider_set:
+            continue
         if pid in seen_slugs:
             continue
         # Check if credentials exist
@@ -804,8 +827,10 @@ def list_authenticated_providers(
         if not has_creds:
             continue
 
-        # Use curated list
+        # Only expose curated models for the compact picker.
         model_ids = curated.get(pid, [])
+        if not model_ids:
+            continue
         total = len(model_ids)
         top = model_ids[:max_models]
 
@@ -846,8 +871,11 @@ def list_authenticated_providers(
                 "api_url": api_url,
             })
 
-    # Sort: current provider first, then by model count descending
-    results.sort(key=lambda r: (not r["is_current"], -r["total_models"]))
+    order_index = {slug: idx for idx, slug in enumerate(allowed_provider_order)}
+    results = [r for r in results if r["slug"] in allowed_provider_set and r["total_models"] > 0]
+
+    # Sort: current provider first, then by explicit picker order.
+    results.sort(key=lambda r: (not r["is_current"], order_index.get(r["slug"], 999), r["name"]))
 
     return results
 
