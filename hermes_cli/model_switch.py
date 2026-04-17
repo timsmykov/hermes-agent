@@ -734,6 +734,7 @@ def list_authenticated_providers(
 
     results: List[dict] = []
     seen_slugs: set = set()
+    seen_models_dev_ids: set = set()
 
     data = fetch_models_dev()
 
@@ -746,6 +747,8 @@ def list_authenticated_providers(
 
     # --- 1. Check Hermes-mapped providers ---
     for hermes_id, mdev_id in PROVIDER_TO_MODELS_DEV.items():
+        if mdev_id in seen_models_dev_ids:
+            continue
         pdata = data.get(mdev_id)
         if not isinstance(pdata, dict):
             continue
@@ -778,6 +781,7 @@ def list_authenticated_providers(
             "source": "built-in",
         })
         seen_slugs.add(slug)
+        seen_models_dev_ids.add(mdev_id)
 
     # --- 2. Check Hermes-only providers (nous, openai-codex, copilot) ---
     from hermes_cli.providers import HERMES_OVERLAYS

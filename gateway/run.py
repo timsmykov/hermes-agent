@@ -334,6 +334,19 @@ def _build_media_placeholder(event) -> str:
     return "\n".join(parts)
 
 
+_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".svg"}
+
+
+def _is_real_image_attachment(path: str, mtype: str, message_type=None) -> bool:
+    normalized_type = (mtype or "").lower().strip()
+    suffix = Path(path).suffix.lower()
+    if normalized_type.startswith("image/"):
+        return True
+    if message_type == MessageType.PHOTO and suffix in _IMAGE_EXTENSIONS:
+        return True
+    return False
+
+
 def _dequeue_pending_text(adapter, session_key: str) -> str | None:
     """Consume and return the text of a pending queued message.
 
@@ -347,6 +360,132 @@ def _dequeue_pending_text(adapter, session_key: str) -> str | None:
     if not text and getattr(event, "media_urls", None):
         text = _build_media_placeholder(event)
     return text
+
+
+_CONTINUATION_RE = re.compile(
+    r"^\s*(?:продолжай|продолжить|дальше|ну\s+и\??|continue|go on|keep going|resume)\s*[.!?…]*\s*$",
+    re.IGNORECASE,
+)
+
+
+def _get_event_metadata(event) -> Dict[str, Any]:
+    metadata = getattr(event, "metadata", None)
+    if isinstance(metadata, dict):
+        return metadata
+    metadata = {}
+    setattr(event, "metadata", metadata)
+    return metadata
+
+
+def _event_text_for_agent(event) -> str:
+    text = getattr(event, "text", None) or ""
+    if text:
+        return text
+    if getattr(event, "media_urls", None):
+        return _build_media_placeholder(event)
+    return ""
+
+
+def _is_continuation_message(text: str) -> bool:
+    raw = (text or "").strip()
+    if not raw:
+        return False
+    if _CONTINUATION_RE.match(raw):
+        return True
+    return len(raw) <= 40 and not raw.startswith("/")
+
+
+def _merge_message_events(base_event, incoming_event):
+    from gateway.platforms.base import MessageEvent as _ME
+
+    merged = _ME(
+        text=getattr(base_event, "text", "") or "",
+        message_type=getattr(base_event, "message_type", MessageType.TEXT),
+        source=getattr(base_event, "source", None),
+        raw_message=getattr(base_event, "raw_message", None),
+        message_id=getattr(base_event, "message_id", None),
+        media_urls=list(getattr(base_event, "media_urls", None) or []),
+        media_types=list(getattr(base_event, "media_types", None) or []),
+        reply_to_message_id=getattr(base_event, "reply_to_message_id", None),
+        reply_to_text=getattr(base_event, "reply_to_text", None),
+        auto_skill=getattr(base_event, "auto_skill", None),
+        timestamp=getattr(base_event, "timestamp", datetime.now()),
+    )
+    setattr(merged, "metadata", dict(_get_event_metadata(base_event)))
+
+    incoming_text = getattr(incoming_event, "text", "") or ""
+    if incoming_text:
+        if merged.text:
+            merged.text = f"{merged.text}\n{incoming_text}"
+        else:
+            merged.text = incoming_text
+
+    seen_urls = set(merged.media_urls)
+    for idx, url in enumerate(getattr(incoming_event, "media_urls", None) or []):
+        if not url or url in seen_urls:
+            continue
+        seen_urls.add(url)
+        merged.media_urls.append(url)
+        incoming_types = getattr(incoming_event, "media_types", None) or []
+        merged.media_types.append(incoming_types[idx] if idx < len(incoming_types) else "")
+
+    incoming_type = getattr(incoming_event, "message_type", None)
+    if incoming_type and incoming_type != MessageType.TEXT:
+        merged.message_type = incoming_type
+    if getattr(incoming_event, "reply_to_text", None):
+        merged.reply_to_text = incoming_event.reply_to_text
+        merged.reply_to_message_id = incoming_event.reply_to_message_id
+    if getattr(incoming_event, "message_id", None):
+        merged.message_id = incoming_event.message_id
+    if getattr(incoming_event, "source", None):
+        merged.source = incoming_event.source
+
+    merged_meta = _get_event_metadata(merged)
+    for key, value in _get_event_metadata(incoming_event).items():
+        merged_meta[key] = value
+
+    return merged
+
+
+def _serialize_pending_event(event) -> Dict[str, Any]:
+    return {
+        "text": getattr(event, "text", "") or "",
+        "message_type": getattr(getattr(event, "message_type", None), "value", None)
+        or str(getattr(event, "message_type", MessageType.TEXT)),
+        "message_id": getattr(event, "message_id", None),
+        "media_urls": list(getattr(event, "media_urls", None) or []),
+        "media_types": list(getattr(event, "media_types", None) or []),
+        "reply_to_message_id": getattr(event, "reply_to_message_id", None),
+        "reply_to_text": getattr(event, "reply_to_text", None),
+        "auto_skill": getattr(event, "auto_skill", None),
+        "timestamp": getattr(event, "timestamp", datetime.now()).isoformat(),
+        "metadata": dict(_get_event_metadata(event)),
+    }
+
+
+def _deserialize_pending_event(data: Dict[str, Any], source):
+    from gateway.platforms.base import MessageEvent as _ME
+
+    raw_type = data.get("message_type") or MessageType.TEXT.value
+    try:
+        message_type = MessageType(raw_type)
+    except Exception:
+        message_type = MessageType.TEXT
+
+    event = _ME(
+        text=data.get("text", "") or "",
+        message_type=message_type,
+        source=source,
+        message_id=data.get("message_id"),
+        media_urls=list(data.get("media_urls") or []),
+        media_types=list(data.get("media_types") or []),
+        reply_to_message_id=data.get("reply_to_message_id"),
+        reply_to_text=data.get("reply_to_text"),
+        auto_skill=data.get("auto_skill"),
+        timestamp=datetime.fromisoformat(data["timestamp"]) if data.get("timestamp") else datetime.now(),
+    )
+    setattr(event, "metadata", dict(data.get("metadata") or {}))
+    return event
 
 
 def _check_unavailable_skill(command_name: str) -> str | None:
@@ -502,6 +641,12 @@ class GatewayRunner:
         self._running_agents: Dict[str, Any] = {}
         self._running_agents_ts: Dict[str, float] = {}  # start timestamp per session
         self._pending_messages: Dict[str, str] = {}  # Queued messages during interrupt
+        self._pending_events_path = _hermes_home / ".pending_media_batches.json"
+        self._pending_events_lock = threading.Lock()
+        self._pending_events: Dict[str, Dict[str, Any]] = self._load_pending_events()
+        self._student_grading_runs_path = _hermes_home / ".student_grading_sessions.json"
+        self._student_grading_runs_lock = threading.Lock()
+        self._student_grading_runs: Dict[str, Dict[str, Any]] = self._load_student_grading_runs()
 
         # Cache AIAgent instances per session to preserve prompt caching.
         # Without this, a new AIAgent is created per message, rebuilding the
@@ -777,6 +922,127 @@ class GatewayRunner:
             group_sessions_per_user=getattr(config, "group_sessions_per_user", True),
             thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
         )
+
+    def _load_pending_events(self) -> Dict[str, Dict[str, Any]]:
+        try:
+            if self._pending_events_path.exists():
+                return json.loads(self._pending_events_path.read_text(encoding="utf-8")) or {}
+        except Exception as e:
+            logger.warning("Failed to load pending media batches: %s", e)
+        return {}
+
+    def _load_student_grading_runs(self) -> Dict[str, Dict[str, Any]]:
+        try:
+            if self._student_grading_runs_path.exists():
+                payload = json.loads(self._student_grading_runs_path.read_text(encoding="utf-8")) or {}
+                if isinstance(payload, dict):
+                    return payload
+        except Exception as e:
+            logger.warning("Failed to load student-grading session state: %s", e)
+        return {}
+
+    def _save_pending_events(self) -> None:
+        tmp_path = self._pending_events_path.with_suffix(".tmp")
+        tmp_path.write_text(
+            json.dumps(self._pending_events, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        tmp_path.replace(self._pending_events_path)
+
+    def _save_student_grading_runs(self) -> None:
+        tmp_path = self._student_grading_runs_path.with_suffix(".tmp")
+        tmp_path.write_text(
+            json.dumps(self._student_grading_runs, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        tmp_path.replace(self._student_grading_runs_path)
+
+    def _queue_pending_event(self, session_key: str, event) -> None:
+        if not session_key or event is None:
+            return
+        with self._pending_events_lock:
+            existing_data = self._pending_events.get(session_key)
+            if existing_data:
+                existing_event = _deserialize_pending_event(existing_data, getattr(event, "source", None))
+                merged = _merge_message_events(existing_event, event)
+            else:
+                merged = event
+            self._pending_events[session_key] = _serialize_pending_event(merged)
+            self._save_pending_events()
+
+    def _peek_pending_event(self, session_key: str, source: SessionSource):
+        if not session_key:
+            return None
+        with self._pending_events_lock:
+            data = self._pending_events.get(session_key)
+        if not data:
+            return None
+        try:
+            return _deserialize_pending_event(data, source)
+        except Exception as e:
+            logger.warning("Failed to deserialize pending event for %s: %s", session_key[:20], e)
+            return None
+
+    def _clear_pending_event(self, session_key: str) -> None:
+        if not session_key:
+            return
+        with self._pending_events_lock:
+            if self._pending_events.pop(session_key, None) is not None:
+                self._save_pending_events()
+
+    def _get_student_grading_run(self, session_key: str) -> Optional[Dict[str, Any]]:
+        if not session_key:
+            return None
+        with self._student_grading_runs_lock:
+            payload = self._student_grading_runs.get(session_key)
+            return dict(payload) if isinstance(payload, dict) else None
+
+    def _set_student_grading_run(self, session_key: str, payload: Dict[str, Any]) -> None:
+        if not session_key:
+            return
+        with self._student_grading_runs_lock:
+            self._student_grading_runs[session_key] = dict(payload)
+            self._save_student_grading_runs()
+
+    def _clear_student_grading_run(self, session_key: str) -> None:
+        if not session_key:
+            return
+        with self._student_grading_runs_lock:
+            if self._student_grading_runs.pop(session_key, None) is not None:
+                self._save_student_grading_runs()
+
+    def _consume_pending_event(self, session_key: str, source: SessionSource, adapter=None):
+        event = self._peek_pending_event(session_key, source)
+        if event is not None:
+            self._clear_pending_event(session_key)
+            if adapter and hasattr(adapter, "get_pending_message"):
+                try:
+                    adapter.get_pending_message(session_key)
+                except Exception:
+                    pass
+            return event
+        if adapter and hasattr(adapter, "get_pending_message"):
+            return adapter.get_pending_message(session_key)
+        return None
+
+    def _maybe_restore_pending_batch(self, session_key: str, event, source: SessionSource):
+        if getattr(event, "media_urls", None):
+            return event
+        if event.get_command():
+            return event
+        pending_event = self._peek_pending_event(session_key, source)
+        if pending_event is None:
+            return event
+        restored = _merge_message_events(pending_event, event)
+        restored_meta = _get_event_metadata(restored)
+        restored_meta["restored_pending_batch"] = True
+        logger.info(
+            "Restored pending media batch for session %s onto follow-up %r (%d attachment(s))",
+            session_key[:20],
+            (event.text or "")[:40],
+            len(getattr(restored, "media_urls", None) or []),
+        )
+        return restored
 
     def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict) -> dict:
         from agent.smart_model_routing import resolve_turn_route
@@ -1763,6 +2029,542 @@ class GatewayRunner:
         if config and hasattr(config, "get_unauthorized_dm_behavior"):
             return config.get_unauthorized_dm_behavior(platform)
         return "pair"
+
+    def _collect_document_infos(self, event: MessageEvent) -> List[Dict[str, Any]]:
+        import mimetypes as _mimetypes
+        import os as _os
+        import re as _re
+
+        text_extensions = {".txt", ".md", ".csv", ".log", ".json", ".xml", ".yaml", ".yml", ".toml", ".ini", ".cfg"}
+        document_infos: List[Dict[str, Any]] = []
+        for i, path in enumerate(getattr(event, "media_urls", None) or []):
+            mtype = event.media_types[i] if i < len(event.media_types) else ""
+            if mtype in ("", "application/octet-stream"):
+                ext = _os.path.splitext(path)[1].lower()
+                if ext in text_extensions:
+                    mtype = "text/plain"
+                else:
+                    guessed, _ = _mimetypes.guess_type(path)
+                    if guessed:
+                        mtype = guessed
+            if not mtype.startswith(("application/", "text/")):
+                continue
+
+            basename = _os.path.basename(path)
+            parts = basename.split("_", 2)
+            display_name = parts[2] if len(parts) >= 3 else basename
+            display_name = _re.sub(r"[^\w.\- ]", "_", display_name)
+            document_infos.append(
+                {
+                    "display_name": display_name,
+                    "path": path,
+                    "mime_type": mtype,
+                    "is_text": mtype.startswith("text/"),
+                }
+            )
+        return document_infos
+
+    def _detect_student_grading_batch(self, message_text: str, document_infos: List[Dict[str, Any]]) -> Dict[str, Any]:
+        lower_names = [str(info["display_name"]).lower() for info in document_infos]
+        assignment_like = any(
+            any(token in name for token in ("case", "assignment", "task", "homework", "hw"))
+            for name in lower_names
+        )
+        student_batch_like = len(document_infos) >= 3
+        unit_named_count = sum(
+            1
+            for name in lower_names
+            if re.search(r"\b(?:unit|юнит)\s*[0-9]+\b", name, flags=re.I)
+        )
+        likely_reference_count = sum(
+            1
+            for name in lower_names
+            if any(token in name for token in ("reference", "rubric", "criteria", "baseline", "klimenko"))
+        )
+        submission_like_count = max(0, len(document_infos) - likely_reference_count)
+        unit_matches = {
+            match.group(1)
+            for name in lower_names
+            for match in [re.search(r"\bunit\s*([0-9]+)\b", name), re.search(r"\bюнит\s*([0-9]+)\b", name)]
+            if match
+        }
+        message_unit_match = re.search(r"\b(?:unit|юнит)\s*([0-9]+)\b", message_text or "", flags=re.I)
+        if message_unit_match:
+            unit_matches.add(message_unit_match.group(1))
+        unit_batch_like = len(unit_matches) <= 1
+        lower_message_text = (message_text or "").lower()
+        grading_text_like = any(
+            token in lower_message_text
+            for token in (
+                "grade",
+                "grading",
+                "review",
+                "check",
+                "students",
+                "student",
+                "submission",
+                "submissions",
+                "assignment",
+                "homework",
+                "case",
+                "unit",
+                "rubric",
+                "score",
+                "table",
+                "проверь",
+                "провер",
+                "оцени",
+                "оцен",
+                "студент",
+                "работ",
+                "задани",
+                "кейс",
+                "юнит",
+                "таблиц",
+                "балл",
+            )
+        )
+        explicit_all_batch = any(
+            token in lower_message_text
+            for token in ("all", "everyone", "each", "every", "все", "всех", "кажд")
+        )
+        meta_discussion_like = any(
+            token in lower_message_text
+            for token in (
+                "role",
+                "roles",
+                "council",
+                "planner",
+                "executor",
+                "reviewer",
+                "arbiter",
+                "instruction",
+                "instructions",
+                "workflow architecture",
+                "архитектур",
+                "роль",
+                "роли",
+                "инструкц",
+                "оркестрац",
+                "council-mode",
+            )
+        )
+        group_name = ""
+        group_match = re.search(r"\bgroup\s*([a-z0-9_-]+)\b", lower_message_text)
+        if group_match:
+            group_name = f"Group{group_match.group(1)}"
+        elif "первая группа" in lower_message_text:
+            group_name = "Group1"
+        elif "вторая группа" in lower_message_text:
+            group_name = "Group2"
+        unit_number = None
+        if len(unit_matches) == 1:
+            try:
+                unit_number = int(next(iter(unit_matches)))
+            except (TypeError, ValueError):
+                unit_number = None
+        attachment_batch_like = (
+            len(document_infos) >= 5
+            and unit_batch_like
+            and unit_named_count >= max(3, len(document_infos) // 2)
+            and submission_like_count >= max(3, len(document_infos) - 2)
+        )
+        return {
+            "document_infos": document_infos,
+            "assignment_like": assignment_like,
+            "student_batch_like": student_batch_like,
+            "attachment_batch_like": attachment_batch_like,
+            "unit_batch_like": unit_batch_like,
+            "grading_text_like": grading_text_like,
+            "explicit_all_batch": explicit_all_batch,
+            "meta_discussion_like": meta_discussion_like,
+            "unit_number": unit_number,
+            "group_name": group_name,
+            "is_batch": student_batch_like and unit_batch_like and (assignment_like or grading_text_like or attachment_batch_like),
+        }
+
+    def _extract_student_grading_constraints(self, message_text: str) -> Dict[str, Any]:
+        lower_message_text = (message_text or "").lower()
+        max_score_override = None
+        patterns = [
+            r"максимум(?:\s+за\s+этот\s+кейс)?\s+(\d+)\s+бал",
+            r"всего\s+максимум\s+(\d+)\s+бал",
+            r"max(?:imum)?\s+score\s*[=:]?\s*(\d+)",
+            r"out\s+of\s+(\d+)\b",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, lower_message_text)
+            if not match:
+                continue
+            try:
+                candidate = int(match.group(1))
+            except (TypeError, ValueError):
+                continue
+            if candidate > 0:
+                max_score_override = candidate
+                break
+        return {
+            "max_score_override": max_score_override,
+        }
+
+    def _student_grading_python_bin(self) -> str:
+        candidates = [
+            _hermes_home / "profiles" / "orchestrator" / "hermes-agent" / "venv" / "bin" / "python",
+            _hermes_home / "hermes-agent" / "venv" / "bin" / "python",
+            Path("/opt/hermes-upstream/venv/bin/python"),
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                return str(candidate)
+        return sys.executable or "python3"
+
+    def _student_grading_script_path(self) -> Path:
+        candidates = [
+            _hermes_home / "profiles" / "orchestrator" / "skills" / "productivity" / "student-grading" / "scripts" / "review_pipeline.py",
+            _hermes_home / "skills" / "productivity" / "student-grading" / "scripts" / "review_pipeline.py",
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        return candidates[0]
+
+    async def _run_student_grading_cli(self, cmd: List[str]) -> Dict[str, Any]:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        stdout_text = stdout.decode("utf-8", errors="replace").strip()
+        stderr_text = stderr.decode("utf-8", errors="replace").strip()
+        payload = None
+        if stdout_text:
+            try:
+                payload = json.loads(stdout_text)
+            except json.JSONDecodeError:
+                payload = None
+        return {
+            "success": proc.returncode == 0 and isinstance(payload, dict),
+            "returncode": proc.returncode,
+            "stdout": stdout_text,
+            "stderr": stderr_text,
+            "payload": payload or {},
+        }
+
+    def _student_grading_status_block(self, *, stage: str, workers: int, status: str) -> str:
+        return (
+            "```text\n"
+            f"mode: student-grading\n"
+            f"stage: {stage}\n"
+            f"workers: {workers}\n"
+            f"status: {status}\n"
+            "```"
+        )
+
+    def _format_student_grading_response(self, report: Dict[str, Any], *, unit_number: int, run_id: str) -> str:
+        publication_markdown = str(report.get("publication_markdown") or "").strip()
+        if publication_markdown:
+            return publication_markdown
+        coverage = report.get("coverage", {}) or {}
+        rows = list(report.get("rows") or [])
+        total = int(coverage.get("total_bundles") or len(rows) or 0)
+        processed = int(coverage.get("processed_bundles") or 0)
+        status = str(report.get("status") or "unknown")
+        lines = [
+            f"Проверка Unit {unit_number} завершена: {processed}/{total}.",
+            f"run_id: `{run_id}`",
+            "",
+            "```text",
+            f"{'Student':24} {'Score':8} Status",
+            f"{'-' * 24} {'-' * 8} {'-' * 16}",
+        ]
+        for row in rows[:40]:
+            student = str(row.get("student", ""))[:24].ljust(24)
+            score = str(row.get("score", ""))[:8].ljust(8)
+            row_status = str(row.get("status", ""))[:16]
+            lines.append(f"{student} {score} {row_status}")
+        lines.append("```")
+        if len(rows) > 40:
+            lines.append(f"...и ещё {len(rows) - 40} строк в итоговом run.")
+        warnings = report.get("warnings") or []
+        if warnings:
+            lines.append("")
+            lines.append("Warnings:")
+            lines.extend(f"- {warning}" for warning in warnings[:5])
+        if status != "complete":
+            missing = coverage.get("missing_bundles") or []
+            if missing:
+                lines.append("")
+                lines.append(f"Run incomplete: {len(missing)} bundle(s) still need processing.")
+        return "\n".join(lines).strip()
+
+    async def _maybe_run_student_grading_batch(
+        self,
+        *,
+        event: MessageEvent,
+        source: SessionSource,
+        session_key: str,
+        message_text: str,
+    ) -> Optional[Dict[str, Any]]:
+        document_infos = self._collect_document_infos(event)
+        batch_meta = self._detect_student_grading_batch(message_text, document_infos)
+        existing_run = self._get_student_grading_run(session_key)
+        resume_existing_run = bool(
+            existing_run
+            and document_infos
+            and (
+                not batch_meta.get("unit_number")
+                or int(existing_run.get("unit_number") or 0) == int(batch_meta.get("unit_number") or 0)
+            )
+        )
+        if not batch_meta["is_batch"] and not resume_existing_run:
+            return None
+        constraints = self._extract_student_grading_constraints(message_text)
+
+        unit_number = batch_meta.get("unit_number")
+        if not unit_number and resume_existing_run:
+            try:
+                unit_number = int(existing_run.get("unit_number") or 0) or None
+            except (TypeError, ValueError):
+                unit_number = None
+        if not batch_meta.get("group_name") and resume_existing_run:
+            batch_meta["group_name"] = str(existing_run.get("group_name") or "")
+        if not unit_number:
+            return {
+                "response": (
+                    "Я распознал пакет работ для student-grading, но не смог надёжно определить номер юнита. "
+                    "Поэтому я не буду импровизировать вручную. Пришли `Unit N` в тексте или приложи файл, где юнит указан явно."
+                ),
+                "deterministic": True,
+                "handled": True,
+            }
+
+        script_path = self._student_grading_script_path()
+        python_bin = self._student_grading_python_bin()
+        if existing_run and int(existing_run.get("unit_number") or 0) == unit_number:
+            run_id = str(existing_run.get("run_id"))
+        elif batch_meta.get("group_name"):
+            run_id = f"telegram-unit-{unit_number}-{str(batch_meta['group_name']).lower()}"
+        else:
+            run_id = f"telegram-unit-{unit_number}-{int(time.time())}"
+
+        adapter = self.adapters.get(source.platform)
+        send_meta = {"thread_id": source.thread_id} if source.thread_id else None
+        status_message_id: Optional[str] = None
+        status_edit_enabled = True
+
+        async def send_or_edit_student_grading_status(*, stage: str, workers: int, status: str) -> None:
+            nonlocal status_message_id, status_edit_enabled
+            if not adapter:
+                return
+            content = self._student_grading_status_block(stage=stage, workers=workers, status=status)
+            try:
+                if status_message_id and status_edit_enabled:
+                    edit_result = await adapter.edit_message(source.chat_id, status_message_id, content)
+                    if edit_result.success:
+                        return
+                    status_edit_enabled = False
+
+                send_result = await adapter.send(source.chat_id, content, metadata=send_meta)
+                if send_result.success and send_result.message_id and not status_message_id:
+                    status_message_id = send_result.message_id
+            except Exception:
+                status_edit_enabled = False
+
+        await send_or_edit_student_grading_status(stage="discover", workers=0, status="running")
+
+        self._set_student_grading_run(
+            session_key,
+            {
+                "run_id": run_id,
+                "unit_number": unit_number,
+                "updated_at": datetime.utcnow().isoformat() + "Z",
+                "source": "telegram-batch",
+            },
+        )
+
+        discover_cmd = [
+            python_bin,
+            str(script_path),
+            "discover",
+            "local-batch",
+            *[str(info["path"]) for info in document_infos],
+            "--unit",
+            str(unit_number),
+            "--run-id",
+            run_id,
+            "--source-label",
+            "telegram-batch",
+        ]
+        if batch_meta.get("group_name"):
+            discover_cmd.extend(["--group", str(batch_meta["group_name"])])
+        if constraints.get("max_score_override"):
+            discover_cmd.extend(["--max-score-override", str(constraints["max_score_override"])])
+        discover_result = await self._run_student_grading_cli(discover_cmd)
+        if not discover_result["success"]:
+            return {
+                "response": (
+                    "Student-grading batch был распознан, но deterministic discover упал. "
+                    "Я не продолжаю через ручной workflow.\n\n"
+                    "```text\n"
+                    f"{(discover_result['stderr'] or discover_result['stdout'] or 'unknown discover failure')[:3000]}\n"
+                    "```"
+                ),
+                "deterministic": True,
+                "handled": True,
+            }
+
+        discover_payload = discover_result["payload"]
+        bundle_count = int(discover_payload.get("bundle_count") or 0)
+        actual_worker_lanes = 1 if bundle_count > 0 else 0
+        await send_or_edit_student_grading_status(stage="grading", workers=actual_worker_lanes, status="running")
+
+        orchestrate_cmd = [
+            python_bin,
+            str(script_path),
+            "orchestrate-run",
+            "--run-id",
+            run_id,
+        ]
+        orchestrate_result = await self._run_student_grading_cli(orchestrate_cmd)
+        if not orchestrate_result["success"]:
+            return {
+                "response": (
+                    "Student-grading discover прошёл, но deterministic worker-wave orchestration упал. "
+                    "Я не откатываюсь в ручной shell-анализ.\n\n"
+                    "```text\n"
+                    f"{(orchestrate_result['stderr'] or orchestrate_result['stdout'] or 'unknown orchestration failure')[:3000]}\n"
+                    "```"
+                ),
+                "deterministic": True,
+                "handled": True,
+            }
+
+        report = orchestrate_result["payload"]
+        await send_or_edit_student_grading_status(stage="reduce", workers=0, status=report.get("status", "finished"))
+        return {
+            "response": self._format_student_grading_response(report, unit_number=unit_number, run_id=run_id),
+            "deterministic": True,
+            "handled": True,
+        }
+
+    async def _prepare_message_text_from_event(self, event: MessageEvent, source: SessionSource) -> str:
+        """Build the agent-facing message text, including media enrichment."""
+        message_text = event.text or ""
+
+        _is_shared_thread = (
+            source.chat_type != "dm"
+            and source.thread_id
+            and not getattr(self.config, "thread_sessions_per_user", False)
+        )
+        if _is_shared_thread and source.user_name:
+            message_text = f"[{source.user_name}] {message_text}"
+
+        if event.media_urls:
+            image_paths = []
+            for i, path in enumerate(event.media_urls):
+                mtype = event.media_types[i] if i < len(event.media_types) else ""
+                if _is_real_image_attachment(path, mtype, event.message_type):
+                    image_paths.append(path)
+            if image_paths:
+                message_text = await self._enrich_message_with_vision(
+                    message_text, image_paths
+                )
+
+        if event.media_urls:
+            audio_paths = []
+            for i, path in enumerate(event.media_urls):
+                mtype = event.media_types[i] if i < len(event.media_types) else ""
+                is_audio = (
+                    mtype.startswith("audio/")
+                    or event.message_type in (MessageType.VOICE, MessageType.AUDIO)
+                )
+                if is_audio:
+                    audio_paths.append(path)
+            if audio_paths:
+                message_text = await self._enrich_message_with_transcription(
+                    message_text, audio_paths
+                )
+                _stt_fail_markers = (
+                    "No STT provider",
+                    "STT is disabled",
+                    "can't listen",
+                    "VOICE_TOOLS_OPENAI_KEY",
+                )
+                if any(m in message_text for m in _stt_fail_markers):
+                    _stt_adapter = self.adapters.get(source.platform)
+                    _stt_meta = {"thread_id": source.thread_id} if source.thread_id else None
+                    if _stt_adapter:
+                        try:
+                            _stt_msg = (
+                                "🎤 I received your voice message but can't transcribe it — "
+                                "no speech-to-text provider is configured.\n\n"
+                                "To enable voice: install faster-whisper "
+                                "(`pip install faster-whisper` in the Hermes venv) "
+                                "and set `stt.enabled: true` in config.yaml, "
+                                "then /restart the gateway."
+                            )
+                            if self._has_setup_skill():
+                                _stt_msg += "\n\nFor full setup instructions, type: `/skill hermes-agent-setup`"
+                            await _stt_adapter.send(
+                                source.chat_id, _stt_msg,
+                                metadata=_stt_meta,
+                            )
+                        except Exception:
+                            pass
+
+        if event.media_urls:
+            document_infos = self._collect_document_infos(event)
+            if document_infos:
+                file_lines = "\n".join(
+                    f"- {info['display_name']} ({info['mime_type']}): {info['path']}"
+                    for info in document_infos
+                )
+                batch_meta = self._detect_student_grading_batch(message_text, document_infos)
+
+                batch_note_lines = [
+                    "The user attached the following document files (local cached paths):",
+                    file_lines,
+                    "",
+                ]
+
+                if batch_meta["is_batch"]:
+                    batch_note_lines.extend(
+                        [
+                            "Treat these files as one combined batch for the same task/topic.",
+                            "This batch likely represents a student-grading workflow rather than generic document QA.",
+                            "If the files look like one assignment/case plus multiple student submissions, route to `student-grading` and evaluate the whole batch together.",
+                            "This current attachment batch takes precedence over adjacent abstract discussion about roles, council design, or workflow architecture.",
+                            "Do not start a separate council/roles/architecture analysis before handling the current grading batch.",
+                            "Do not use session_search, transcript archaeology, or a global cache scan as the primary source of truth when the current batch is already attached here.",
+                            "Use the files attached in this turn/topic as the canonical input set unless the user explicitly asks for a historical comparison.",
+                        ]
+                    )
+                    if batch_meta["explicit_all_batch"]:
+                        batch_note_lines.append(
+                            "The user already implied the whole batch should be processed together. Do not ask whether to review all or only some of the files."
+                        )
+                    if batch_meta["meta_discussion_like"]:
+                        batch_note_lines.append(
+                            "The user's message also contains a secondary meta-discussion about roles or council design. Defer that secondary topic until after the current grading batch is processed."
+                        )
+                else:
+                    batch_note_lines.append(
+                        "These documents belong to the current user turn and should be considered together before asking for clarification."
+                    )
+
+                message_text = (
+                    f"{message_text}\n\n[Attached documents]\n"
+                    + "\n".join(batch_note_lines)
+                ).strip()
+                if batch_meta["is_batch"] and batch_meta["meta_discussion_like"]:
+                    message_text = (
+                        "[Primary task: process the attached student-grading batch now. "
+                        "Secondary task: defer any council/roles/meta discussion until after the grading batch is complete.]\n\n"
+                        + message_text
+                    )
+
+        return message_text
     
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
@@ -1984,6 +2786,7 @@ class GatewayRunner:
             if event.message_type == MessageType.PHOTO:
                 logger.debug("PRIORITY photo follow-up for session %s — queueing without interrupt", _quick_key[:20])
                 adapter = self.adapters.get(source.platform)
+                self._queue_pending_event(_quick_key, event)
                 if adapter:
                     # Reuse adapter queue semantics so photo bursts merge cleanly.
                     if _quick_key in adapter._pending_messages:
@@ -2011,11 +2814,13 @@ class GatewayRunner:
                 # Queue the message so it will be picked up after the
                 # agent starts.
                 adapter = self.adapters.get(source.platform)
+                self._queue_pending_event(_quick_key, event)
                 if adapter:
                     adapter._pending_messages[_quick_key] = event
                 return None
             logger.debug("PRIORITY interrupt for session %s", _quick_key[:20])
-            running_agent.interrupt(event.text)
+            self._queue_pending_event(_quick_key, event)
+            running_agent.interrupt(_event_text_for_agent(event))
             if _quick_key in self._pending_messages:
                 self._pending_messages[_quick_key] += "\n" + event.text
             else:
@@ -2055,6 +2860,9 @@ class GatewayRunner:
 
         if canonical == "status":
             return await self._handle_status_command(event)
+
+        if canonical in ("minimax", "minimax-limits", "quota", "quotas"):
+            return await self._handle_minimax_command(event)
         
         if canonical == "stop":
             return await self._handle_stop_command(event)
@@ -2299,6 +3107,215 @@ class GatewayRunner:
                 del self._running_agents[_quick_key]
             self._running_agents_ts.pop(_quick_key, None)
 
+    def _resolve_meta_topic_name(self, source) -> str:
+        chat_id = str(getattr(source, "chat_id", "") or "")
+        thread_id = str(getattr(source, "thread_id", "") or "")
+        if not chat_id or not thread_id:
+            return ""
+        try:
+            import yaml as _meta_yaml
+
+            if _config_path.exists():
+                with open(_config_path, encoding="utf-8") as _meta_f:
+                    _cfg = _meta_yaml.safe_load(_meta_f) or {}
+                for group in ((_cfg.get("extra") or {}).get("group_topics") or []):
+                    if str(group.get("chat_id", "")) != chat_id:
+                        continue
+                    for topic in group.get("topics", []):
+                        if str(topic.get("thread_id", "")) == thread_id:
+                            return str(topic.get("name", "") or "")
+        except Exception:
+            pass
+        return ""
+
+    def _classify_meta_execution(self, source, event, message_text: str) -> Dict[str, Any]:
+        text = (message_text or "").lower()
+        topic = self._resolve_meta_topic_name(source)
+        triggers: List[str] = []
+
+        def _add(name: str) -> None:
+            if name not in triggers:
+                triggers.append(name)
+
+        _simple_status_check = (
+            len(text) < 120
+            and any(token in text for token in ("проверь", "check", "active", "актив", "status", "работает"))
+            and not any(token in text for token in ("почему", "разбер", "выясни", "deploy", "migration", "incident", "review", "ревью"))
+        )
+        if topic == "Ops" and _simple_status_check:
+            return {
+                "topic": topic,
+                "trigger_classes": [],
+                "family": "",
+                "family_label": "",
+                "execution_mode": "direct",
+                "current_stage": "executing",
+                "status": "running",
+                "workers_active": 1,
+                "last_event": "Auto-triggered direct execution",
+            }
+
+        if len(text) >= 160 or text.count("\n") >= 2 or len(getattr(event, "media_urls", None) or []) >= 1:
+            _add("multi-step")
+        if any(token in text for token in ("рудн", "домашк", "homework", "grading", "grade", "unit", "проверь домашку")):
+            _add("grading-review")
+            _add("multi-step")
+        if any(token in text for token in ("browser", "page", "site", "login", "form", "click", "dom", "title", "screenshot", "страниц", "брауз")):
+            _add("browser-heavy")
+        if any(token in text for token in ("systemctl", "journalctl", "docker", "nginx", "deploy", "server", "vpn", "hiddify", "telemt", "amnezia", "infra", "ops", "restart", "service", "лог")):
+            _add("infra-ops")
+        if any(token in text for token in ("repo", "patch", "refactor", "architecture", "config", "codebase", "subsystem", "build", "merge", "integration", "workflow")):
+            _add("multi-subsystem-build")
+        if any(token in text for token in ("разбер", "пойми", "выясни", "почему", "investigate", "figure out", "diagnose", "ambiguous", "unclear")):
+            _add("ambiguity-recovery")
+
+        allowed_topics = {"General", "Build", "Ops"}
+        if topic == "General":
+            council = bool(
+                {"grading-review", "browser-heavy", "infra-ops", "multi-subsystem-build", "ambiguity-recovery"} & set(triggers)
+                or ("multi-step" in triggers and len(text) >= 140)
+            )
+        elif topic == "Build":
+            council = bool(triggers)
+        elif topic == "Ops":
+            council = bool(set(triggers) & {"infra-ops", "ambiguity-recovery", "multi-step", "browser-heavy"})
+        else:
+            council = bool(triggers) and not topic
+
+        family = ""
+        family_label = ""
+        if council:
+            trigger_set = set(triggers)
+            if "grading-review" in trigger_set or any(token in text for token in ("рудн", "homework", "домашк", "student", "студент")):
+                family = "rudn-grading"
+                family_label = "RUDN grading"
+            elif "browser-heavy" in trigger_set or any(token in text for token in ("browser", "брауз", "page", "dom", "title", "form")):
+                family = "browser-investigation"
+                family_label = "Browser investigation"
+            elif {"infra-ops", "ambiguity-recovery"} & trigger_set or topic == "Ops":
+                family = "ops-incident"
+                family_label = "Ops incident"
+            else:
+                family = "generic-council"
+                family_label = "General council"
+
+        return {
+            "topic": topic,
+            "trigger_classes": triggers,
+            "family": family,
+            "family_label": family_label,
+            "execution_mode": "council" if council else "direct",
+            "current_stage": "planning" if council else "executing",
+            "status": "running",
+            "workers_active": (3 if len(triggers) >= 2 or any(token in text for token in ("review", "ревью", "grade", "homework", "deploy")) else 2) if council else 1,
+            "last_event": (
+                "Auto-triggered council: " + ", ".join(triggers[:4])
+                if council
+                else "Auto-triggered direct execution"
+            ),
+        }
+
+    def _update_meta_runtime_snapshot(self, session_id: str, meta_state: Dict[str, Any]) -> None:
+        try:
+            runtime_path = Path(os.environ.get("HERMES_META_RUNTIME_PATH", "/var/lib/hermesbytim/meta/runtime.json"))
+            runtime_path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {}
+            if runtime_path.exists():
+                try:
+                    payload = json.loads(runtime_path.read_text()) or {}
+                except Exception:
+                    payload = {}
+            payload.setdefault("learning", {"pending_queue": 0, "last_digest_at": "", "last_artifacts": []})
+            payload.setdefault("sessions", {})
+            snapshot = {
+                "session_id": session_id,
+                "execution_mode": str(meta_state.get("execution_mode") or "direct"),
+                "current_stage": str(meta_state.get("current_stage") or "idle"),
+                "status": str(meta_state.get("status") or "idle"),
+                "workers_active": int(meta_state.get("workers_active") or 0),
+                "last_event": str(meta_state.get("last_event") or "No council activity recorded"),
+                "topic": str(meta_state.get("topic") or ""),
+                "family": str(meta_state.get("family") or ""),
+                "family_label": str(meta_state.get("family_label") or ""),
+                "trigger_classes": list(meta_state.get("trigger_classes") or []),
+                "updated_at": datetime.now().isoformat(),
+            }
+            payload["sessions"][session_id] = snapshot
+            payload["council"] = snapshot
+            payload["updated_at"] = snapshot["updated_at"]
+            tmp = runtime_path.with_suffix(runtime_path.suffix + ".tmp")
+            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+            tmp.replace(runtime_path)
+        except Exception:
+            logger.debug("Failed to update meta runtime snapshot", exc_info=True)
+
+    def _build_meta_context_note(self, meta_state: Dict[str, Any]) -> str:
+        mode = str(meta_state.get("execution_mode") or "direct")
+        triggers = ", ".join(meta_state.get("trigger_classes") or [])
+        family = str(meta_state.get("family") or "")
+        if family == "rudn-grading":
+            family_note = (
+                "Family profile: RUDN grading. Planner confirms unit, group, and publish scope first. "
+                "Executor should prefer the existing RUDN grading workflow and keep every score evidence-backed. "
+                "Reviewer must look for rubric mismatch, missing submissions, and unsafe grade publication. "
+                "Arbiter should summarize graded scope, publish state, and blockers in one answer. "
+            )
+        elif family == "browser-investigation":
+            family_note = (
+                "Family profile: Browser investigation. Planner defines the exact page objective and observed value. "
+                "Executor must stay in browser_use and use navigate -> state -> DOM -> action -> state, returning exact observed values. "
+                "Reviewer challenges stale tabs, weak extraction, and hostname-for-title mistakes. "
+                "Arbiter returns the exact observed result or the precise blocker. "
+            )
+        elif family == "ops-incident":
+            family_note = (
+                "Family profile: Ops incident. Planner defines impact, affected services, and the minimum safe diagnostic path. "
+                "Executor should inspect systemd, logs, containers, and wrappers in a reversible order. "
+                "Reviewer checks for false restarts, rollback gaps, and claims of success without root cause. "
+                "Arbiter reports impact, cause or current hypothesis, actions taken, and residual risk. "
+            )
+        else:
+            family_note = ""
+        if mode == "council":
+            return (
+                "[System note: Meta-router auto-classified this turn as council mode. "
+                f"Trigger classes: {triggers or 'multi-step'}. "
+                "Use the planner -> executor -> reviewer -> arbiter pattern. "
+                f"{family_note}"
+                "Keep public Telegram updates compact. "
+                "Update council runtime stages through /usr/local/bin/hermes-meta-event.py "
+                "when entering planning, executing, reviewing, and finalizing.]"
+            )
+        return (
+            "[System note: Meta-router auto-classified this turn as direct execution. "
+            "Stay single-worker unless ambiguity or cross-subsystem risk appears; "
+            "if that happens, switch to council mode and update /usr/local/bin/hermes-meta-event.py.]"
+        )
+
+    async def _emit_meta_stage_update(self, event, source, meta_state: Dict[str, Any]) -> None:
+        if str(meta_state.get("execution_mode") or "direct") != "council":
+            return
+        if source.platform != Platform.TELEGRAM:
+            return
+        adapter = self.adapters.get(source.platform)
+        if not adapter:
+            return
+        metadata = getattr(event, "metadata", None)
+        if not metadata and getattr(source, "thread_id", None):
+            metadata = {"thread_id": source.thread_id}
+        message = "\n".join(
+            [
+                f"mode: {meta_state.get('execution_mode', 'council')}",
+                f"stage: {meta_state.get('current_stage', 'planning')}",
+                f"workers: {meta_state.get('workers_active', 3)}",
+                f"status: {meta_state.get('status', 'running')}",
+            ]
+        )
+        try:
+            await adapter.send(source.chat_id, message, metadata=metadata)
+        except Exception:
+            logger.debug("Failed to emit council stage update", exc_info=True)
+
     async def _handle_message_with_agent(self, event, source, _quick_key: str):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
@@ -2313,6 +3330,7 @@ class GatewayRunner:
         # Get or create session
         session_entry = self.session_store.get_or_create_session(source)
         session_key = session_entry.session_key
+        event = self._maybe_restore_pending_batch(session_key, event, source)
         
         # Emit session:start for new or auto-reset sessions
         _is_new_session = (
@@ -2710,145 +3728,7 @@ class GatewayRunner:
                 if vc_context:
                     context_prompt += f"\n\n{vc_context}"
 
-        # -----------------------------------------------------------------
-        # Auto-analyze images sent by the user
-        #
-        # If the user attached image(s), we run the vision tool eagerly so
-        # the conversation model always receives a text description.  The
-        # local file path is also included so the model can re-examine the
-        # image later with a more targeted question via vision_analyze.
-        #
-        # We filter to image paths only (by media_type) so that non-image
-        # attachments (documents, audio, etc.) are not sent to the vision
-        # tool even when they appear in the same message.
-        # -----------------------------------------------------------------
-        message_text = event.text or ""
-
-        # -----------------------------------------------------------------
-        # Sender attribution for shared thread sessions.
-        #
-        # When multiple users share a single thread session (the default for
-        # threads), prefix each message with [sender name] so the agent can
-        # tell participants apart.  Skip for DMs (single-user by nature) and
-        # when per-user thread isolation is explicitly enabled.
-        # -----------------------------------------------------------------
-        _is_shared_thread = (
-            source.chat_type != "dm"
-            and source.thread_id
-            and not getattr(self.config, "thread_sessions_per_user", False)
-        )
-        if _is_shared_thread and source.user_name:
-            message_text = f"[{source.user_name}] {message_text}"
-
-        if event.media_urls:
-            image_paths = []
-            for i, path in enumerate(event.media_urls):
-                # Check media_types if available; otherwise infer from message type
-                mtype = event.media_types[i] if i < len(event.media_types) else ""
-                is_image = (
-                    mtype.startswith("image/")
-                    or event.message_type == MessageType.PHOTO
-                )
-                if is_image:
-                    image_paths.append(path)
-            if image_paths:
-                message_text = await self._enrich_message_with_vision(
-                    message_text, image_paths
-                )
-        
-        # -----------------------------------------------------------------
-        # Auto-transcribe voice/audio messages sent by the user
-        # -----------------------------------------------------------------
-        if event.media_urls:
-            audio_paths = []
-            for i, path in enumerate(event.media_urls):
-                mtype = event.media_types[i] if i < len(event.media_types) else ""
-                is_audio = (
-                    mtype.startswith("audio/")
-                    or event.message_type in (MessageType.VOICE, MessageType.AUDIO)
-                )
-                if is_audio:
-                    audio_paths.append(path)
-            if audio_paths:
-                message_text = await self._enrich_message_with_transcription(
-                    message_text, audio_paths
-                )
-                # If STT failed, send a direct message to the user so they
-                # know voice isn't configured — don't rely on the agent to
-                # relay the error clearly.
-                _stt_fail_markers = (
-                    "No STT provider",
-                    "STT is disabled",
-                    "can't listen",
-                    "VOICE_TOOLS_OPENAI_KEY",
-                )
-                if any(m in message_text for m in _stt_fail_markers):
-                    _stt_adapter = self.adapters.get(source.platform)
-                    _stt_meta = {"thread_id": source.thread_id} if source.thread_id else None
-                    if _stt_adapter:
-                        try:
-                            _stt_msg = (
-                                "🎤 I received your voice message but can't transcribe it — "
-                                "no speech-to-text provider is configured.\n\n"
-                                "To enable voice: install faster-whisper "
-                                "(`pip install faster-whisper` in the Hermes venv) "
-                                "and set `stt.enabled: true` in config.yaml, "
-                                "then /restart the gateway."
-                            )
-                            # Point to setup skill if it's installed
-                            if self._has_setup_skill():
-                                _stt_msg += "\n\nFor full setup instructions, type: `/skill hermes-agent-setup`"
-                            await _stt_adapter.send(
-                                source.chat_id, _stt_msg,
-                                metadata=_stt_meta,
-                            )
-                        except Exception:
-                            pass
-
-        # -----------------------------------------------------------------
-        # Enrich document messages with context notes for the agent
-        # -----------------------------------------------------------------
-        if event.media_urls and event.message_type == MessageType.DOCUMENT:
-            import mimetypes as _mimetypes
-            _TEXT_EXTENSIONS = {".txt", ".md", ".csv", ".log", ".json", ".xml", ".yaml", ".yml", ".toml", ".ini", ".cfg"}
-            for i, path in enumerate(event.media_urls):
-                mtype = event.media_types[i] if i < len(event.media_types) else ""
-                # Fall back to extension-based detection when MIME type is unreliable.
-                if mtype in ("", "application/octet-stream"):
-                    import os as _os2
-                    _ext = _os2.path.splitext(path)[1].lower()
-                    if _ext in _TEXT_EXTENSIONS:
-                        mtype = "text/plain"
-                    else:
-                        guessed, _ = _mimetypes.guess_type(path)
-                        if guessed:
-                            mtype = guessed
-                if not mtype.startswith(("application/", "text/")):
-                    continue
-                # Extract display filename by stripping the doc_{uuid12}_ prefix
-                import os as _os
-                basename = _os.path.basename(path)
-                # Format: doc_<12hex>_<original_filename>
-                parts = basename.split("_", 2)
-                display_name = parts[2] if len(parts) >= 3 else basename
-                # Sanitize to prevent prompt injection via filenames
-                import re as _re
-                display_name = _re.sub(r'[^\w.\- ]', '_', display_name)
-
-                if mtype.startswith("text/"):
-                    context_note = (
-                        f"[The user sent a text document: '{display_name}'. "
-                        f"Its content has been included below. "
-                        f"The file is also saved at: {path}]"
-                    )
-                else:
-                    context_note = (
-                        f"[The user sent a document: '{display_name}'. "
-                        f"The file is saved at: {path}. "
-                        f"Ask the user what they'd like you to do with it.]"
-                    )
-                message_text = f"{context_note}\n\n{message_text}"
-
+        message_text = await self._prepare_message_text_from_event(event, source)
         # -----------------------------------------------------------------
         # Inject reply context when user replies to a message not in history.
         # Telegram (and other platforms) let users reply to specific messages,
@@ -2865,6 +3745,48 @@ class GatewayRunner:
             )
             if not found_in_history:
                 message_text = f'[Replying to: "{reply_snippet}"]\n\n{message_text}'
+
+        meta_execution = self._classify_meta_execution(source, event, message_text)
+        self._update_meta_runtime_snapshot(session_entry.session_id, meta_execution)
+        context_prompt = (context_prompt + "\n\n" + self._build_meta_context_note(meta_execution)).strip()
+        await self._emit_meta_stage_update(event, source, meta_execution)
+
+        fast_path_result = await self._maybe_run_student_grading_batch(
+            event=event,
+            source=source,
+            session_key=session_key,
+            message_text=message_text,
+        )
+        if fast_path_result is not None and fast_path_result.get("handled"):
+            response = fast_path_result.get("response") or ""
+            ts = datetime.now().isoformat()
+            if not history:
+                self.session_store.append_to_transcript(
+                    session_entry.session_id,
+                    {
+                        "role": "session_meta",
+                        "tools": [],
+                        "model": "student-grading-fast-path",
+                        "platform": source.platform.value if source.platform else "",
+                        "timestamp": ts,
+                    }
+                )
+            self.session_store.append_to_transcript(
+                session_entry.session_id,
+                {"role": "user", "content": message_text, "timestamp": ts},
+            )
+            if response:
+                self.session_store.append_to_transcript(
+                    session_entry.session_id,
+                    {"role": "assistant", "content": response, "timestamp": ts},
+                )
+            self.session_store.update_session(
+                session_entry.session_key,
+                last_prompt_tokens=0,
+            )
+            if getattr(event, "media_urls", None) or _get_event_metadata(event).get("restored_pending_batch"):
+                self._clear_pending_event(session_entry.session_key)
+            return response
 
         try:
             # Emit agent:start hook
@@ -2921,6 +3843,20 @@ class GatewayRunner:
 
             response = agent_result.get("final_response") or ""
             agent_messages = agent_result.get("messages", [])
+            _meta_finish = dict(meta_execution)
+            _meta_finish.update(
+                {
+                    "current_stage": "finalizing",
+                    "status": "finished",
+                    "workers_active": 0,
+                    "last_event": (
+                        "Final answer prepared"
+                        if meta_execution.get("execution_mode") == "council"
+                        else "Direct execution finished"
+                    ),
+                }
+            )
+            self._update_meta_runtime_snapshot(session_entry.session_id, _meta_finish)
             _response_time = time.time() - _msg_start_time
             _api_calls = agent_result.get("api_calls", 0)
             _resp_len = len(response)
@@ -3082,6 +4018,10 @@ class GatewayRunner:
                 last_prompt_tokens=agent_result.get("last_prompt_tokens", 0),
             )
 
+            if not agent_failed_early and not agent_result.get("interrupted"):
+                if getattr(event, "media_urls", None) or _get_event_metadata(event).get("restored_pending_batch"):
+                    self._clear_pending_event(session_entry.session_key)
+
             # Auto voice reply: send TTS audio before the text response
             _already_sent = bool(agent_result.get("already_sent"))
             if self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent):
@@ -3114,6 +4054,18 @@ class GatewayRunner:
                 pass
             logger.exception("Agent error in session %s", session_key)
             error_type = type(e).__name__
+            try:
+                _meta_error = dict(meta_execution)
+                _meta_error.update(
+                    {
+                        "status": "blocked",
+                        "workers_active": 0,
+                        "last_event": f"Run failed: {error_type}",
+                    }
+                )
+                self._update_meta_runtime_snapshot(session_entry.session_id, _meta_error)
+            except Exception:
+                pass
             error_detail = str(e)[:300] if str(e) else "no details available"
             status_hint = ""
             status_code = getattr(e, "status_code", None)
@@ -3153,6 +4105,27 @@ class GatewayRunner:
                     )
                 elif status_code == 400:
                     status_hint = " The request was rejected by the API."
+            lower_detail = error_detail.lower()
+            should_offer_picker = (
+                status_code in {401, 402, 403, 408, 409, 429, 500, 502, 503, 504, 529}
+                or any(token in lower_detail for token in (
+                    "rate limit", "usage limit", "quota", "overloaded",
+                    "temporarily unavailable", "provider authentication",
+                    "invalid api key", "api key", "connection reset",
+                    "connection closed", "network error", "timed out",
+                ))
+            )
+            if should_offer_picker:
+                try:
+                    picker_sent = await self._offer_model_picker_after_failure(
+                        event,
+                        "Извините, текущая модель сейчас недоступна. Выберите другую, пожалуйста.",
+                    )
+                    if picker_sent:
+                        return None
+                except Exception as picker_exc:
+                    logger.debug("Failure model picker could not be shown: %s", picker_exc)
+
             return (
                 f"Sorry, I encountered an error ({error_type}).\n"
                 f"{error_detail}\n"
@@ -3363,14 +4336,28 @@ class GatewayRunner:
 
     async def _handle_status_command(self, event: MessageEvent) -> str:
         """Handle /status command."""
+        from datetime import datetime
+
         source = event.source
         session_entry = self.session_store.get_or_create_session(source)
 
         connected_platforms = [p.value for p in self.adapters.keys()]
-
-        # Check if there's an active agent
         session_key = session_entry.session_key
+
+        # Check whether this session currently has foreground or background work.
         is_running = session_key in self._running_agents
+        active_btw = 0
+        if hasattr(self, "_active_btw_tasks"):
+            _btw_task = self._active_btw_tasks.get(session_key)
+            if _btw_task and not _btw_task.done():
+                active_btw = 1
+
+        active_processes = 0
+        try:
+            from tools.process_registry import process_registry
+            active_processes = 1 if process_registry.has_active_for_session(session_key) else 0
+        except Exception:
+            active_processes = 0
 
         title = None
         if self._session_db:
@@ -3378,6 +4365,143 @@ class GatewayRunner:
                 title = self._session_db.get_session_title(session_entry.session_id)
             except Exception:
                 title = None
+
+        transcript = []
+        try:
+            transcript = self.session_store.load_transcript(source) or []
+        except Exception:
+            transcript = []
+
+        def _extract_text_preview(content, limit: int = 120) -> str:
+            if isinstance(content, str):
+                return content.strip().replace("\n", " ")[:limit]
+            if isinstance(content, list):
+                parts = []
+                for chunk in content:
+                    if not isinstance(chunk, dict):
+                        continue
+                    chunk_text = chunk.get("text") or chunk.get("content") or ""
+                    if isinstance(chunk_text, str) and chunk_text.strip():
+                        parts.append(chunk_text.strip())
+                if parts:
+                    return " ".join(parts)[:limit]
+            return ""
+
+        def _find_last_tool_names(items) -> list[str]:
+            for msg in reversed(items):
+                if not isinstance(msg, dict):
+                    continue
+                tool_calls = msg.get("tool_calls")
+                if not isinstance(tool_calls, list):
+                    continue
+                names = []
+                for tool_call in tool_calls:
+                    if not isinstance(tool_call, dict):
+                        continue
+                    function = tool_call.get("function") or {}
+                    name = function.get("name")
+                    if isinstance(name, str) and name:
+                        names.append(name)
+                if names:
+                    return names
+            return []
+
+        def _format_age(total_seconds: int) -> str:
+            if total_seconds < 60:
+                return f"{total_seconds}s ago"
+            minutes, seconds = divmod(total_seconds, 60)
+            if minutes < 60:
+                return f"{minutes}m {seconds}s ago"
+            hours, minutes = divmod(minutes, 60)
+            return f"{hours}h {minutes}m ago"
+
+        heartbeat_seconds = max(
+            0,
+            int((datetime.now() - session_entry.updated_at).total_seconds()),
+        )
+        heartbeat_bucket = "Fresh" if heartbeat_seconds < 90 else "Quiet" if heartbeat_seconds < 600 else "Stale"
+        heartbeat_label = f"{heartbeat_bucket} ({_format_age(heartbeat_seconds)})"
+        recent_heartbeat = heartbeat_seconds < 180
+
+        gateway_state = None
+        platform_state = None
+        try:
+            from gateway.status import read_runtime_status
+            runtime_status = read_runtime_status() or {}
+            if isinstance(runtime_status, dict):
+                gateway_state = runtime_status.get("gateway_state")
+                platform_state = (
+                    (runtime_status.get("platforms") or {})
+                    .get(source.platform.value, {})
+                    .get("state")
+                )
+        except Exception:
+            gateway_state = None
+            platform_state = None
+
+        execution_mode = "direct"
+        current_stage = "idle"
+        workers_active = int(bool(is_running)) + active_btw + active_processes
+        last_council_event = "No council activity recorded"
+        learning_queue = 0
+        try:
+            import json
+            import os
+            from pathlib import Path
+
+            meta_runtime_path = Path(os.environ.get("HERMES_META_RUNTIME_PATH", "/var/lib/hermesbytim/meta/runtime.json"))
+            if meta_runtime_path.exists():
+                meta_runtime = json.loads(meta_runtime_path.read_text()) or {}
+                session_meta = (meta_runtime.get("sessions") or {}).get(session_entry.session_id) or {}
+                council_state = session_meta or meta_runtime.get("council") or {}
+                learning_state = meta_runtime.get("learning") or {}
+                execution_mode = str(council_state.get("execution_mode") or execution_mode)
+                current_stage = str(council_state.get("current_stage") or current_stage)
+                workers_active = int(council_state.get("workers_active") or workers_active)
+                last_council_event = str(council_state.get("last_event") or last_council_event)
+                learning_queue = int(learning_state.get("pending_queue") or 0)
+        except Exception:
+            execution_mode = "direct"
+            current_stage = "idle"
+            workers_active = int(bool(is_running)) + active_btw + active_processes
+            last_council_event = "No council activity recorded"
+            learning_queue = 0
+
+        session_state = "Idle"
+        last_worker_event = "No recent worker events recorded"
+        if is_running or active_btw or active_processes:
+            session_state = "Working"
+            last_worker_event = "Foreground worker attached" if is_running else "Background task is still running"
+
+        if transcript:
+            last_message = transcript[-1] if isinstance(transcript[-1], dict) else {}
+            last_role = last_message.get("role")
+            last_content = last_message.get("content")
+            has_text = bool(_extract_text_preview(last_content))
+            last_tool_names = _find_last_tool_names(transcript)
+
+            if last_tool_names:
+                last_worker_event = f"Last tool step: {', '.join(last_tool_names[:3])}"
+            elif last_role == "tool":
+                last_worker_event = "Tool result received; awaiting the next agent step"
+            elif last_role == "assistant" and has_text:
+                last_worker_event = f"Assistant draft: {_extract_text_preview(last_content)}"
+            elif last_role == "user":
+                last_worker_event = f"User request queued: {_extract_text_preview(last_content)}"
+
+            if not (is_running or active_btw or active_processes):
+                if last_role == "tool":
+                    if recent_heartbeat:
+                        session_state = "Recent tool activity detected; waiting for the next agent step"
+                    else:
+                        session_state = "Interrupted after a tool step before the final answer"
+                elif last_role == "assistant" and not has_text:
+                    if recent_heartbeat:
+                        session_state = "Recent assistant activity without a final answer"
+                    else:
+                        session_state = "Interrupted before the final answer"
+                elif last_role == "user":
+                    session_state = "Waiting without an attached worker"
 
         lines = [
             "📊 **Hermes Gateway Status**",
@@ -3389,14 +4513,54 @@ class GatewayRunner:
         lines.extend([
             f"**Created:** {session_entry.created_at.strftime('%Y-%m-%d %H:%M')}",
             f"**Last Activity:** {session_entry.updated_at.strftime('%Y-%m-%d %H:%M')}",
+            f"**Heartbeat:** {heartbeat_label}",
             f"**Tokens:** {session_entry.total_tokens:,}",
             f"**Agent Running:** {'Yes ⚡' if is_running else 'No'}",
+            f"**/btw Running:** {'Yes ⚡' if active_btw else 'No'}",
+            f"**Background Work:** {'Yes ⚡' if active_processes else 'No'}",
+            f"**Active Work Items:** {int(bool(is_running)) + active_btw + active_processes}",
+            f"**Execution Mode:** {execution_mode}",
+            f"**Current Stage:** {current_stage}",
+            f"**Workers Active:** {workers_active}",
+            f"**Session State:** {session_state}",
+            f"**Last Worker Event:** {last_worker_event}",
+            f"**Last Council Event:** {last_council_event}",
+            f"**Learning Queue:** {learning_queue}",
+        ])
+        if gateway_state:
+            lines.append(f"**Gateway Runtime:** {gateway_state}")
+        if platform_state:
+            lines.append(f"**{source.platform.value.title()} Link:** {platform_state}")
+        lines.extend([
             "",
             f"**Connected Platforms:** {', '.join(connected_platforms)}",
         ])
 
         return "\n".join(lines)
-    
+
+    async def _handle_minimax_command(self, event: MessageEvent) -> str:
+        """Handle /minimax command."""
+        import asyncio
+
+        command = ["/usr/local/bin/minimax-plan-limits.py", "--telegram"]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=40)
+        except Exception as exc:
+            return f"MiniMax limits check failed: {exc}"
+
+        stdout = (stdout_bytes or b"").decode(errors="replace").strip()
+        stderr = (stderr_bytes or b"").decode(errors="replace").strip()
+        if stdout:
+            return stdout
+        if stderr:
+            return f"MiniMax limits check failed: {stderr}"
+        return "MiniMax limits check returned no output."
+
     async def _handle_stop_command(self, event: MessageEvent) -> str:
         """Handle /stop command - interrupt a running agent.
 
@@ -3502,13 +4666,167 @@ class GatewayRunner:
             lines.append(f"_(Requested page {requested_page} was out of range, showing page {page}.)_")
         return "\n".join(lines)
     
+    async def _offer_model_picker_after_failure(self, event: MessageEvent, notice_text: str) -> bool:
+        """Send the interactive model picker after a provider/model failure."""
+        import yaml
+        from hermes_cli.model_switch import (
+            switch_model as _switch_model,
+            list_authenticated_providers,
+        )
+
+        source = event.source
+        adapter = self.adapters.get(source.platform)
+        if adapter is None or getattr(type(adapter), "send_model_picker", None) is None:
+            return False
+
+        current_model = ""
+        current_provider = "openrouter"
+        current_base_url = ""
+        current_api_key = ""
+        user_provs = None
+        config_path = _hermes_home / "config.yaml"
+        try:
+            if config_path.exists():
+                with open(config_path, encoding="utf-8") as f:
+                    cfg = yaml.safe_load(f) or {}
+                model_cfg = cfg.get("model", {})
+                if isinstance(model_cfg, dict):
+                    current_model = model_cfg.get("default", "")
+                    current_provider = model_cfg.get("provider", current_provider)
+                    current_base_url = model_cfg.get("base_url", "")
+                user_provs = cfg.get("providers")
+        except Exception:
+            pass
+
+        session_key = self._session_key_for_source(source)
+        override = getattr(self, "_session_model_overrides", {}).get(session_key, {})
+        if override:
+            current_model = override.get("model", current_model)
+            current_provider = override.get("provider", current_provider)
+            current_base_url = override.get("base_url", current_base_url)
+            current_api_key = override.get("api_key", current_api_key)
+
+        try:
+            providers = list_authenticated_providers(
+                current_provider=current_provider,
+                user_providers=user_provs,
+                max_models=50,
+            )
+        except Exception:
+            providers = []
+
+        if not providers:
+            return False
+
+        _self = self
+        _session_key = session_key
+        _cur_model = current_model
+        _cur_provider = current_provider
+        _cur_base_url = current_base_url
+        _cur_api_key = current_api_key
+
+        async def _on_model_selected(_chat_id: str, model_id: str, provider_slug: str) -> str:
+            result = _switch_model(
+                raw_input=model_id,
+                current_provider=_cur_provider,
+                current_model=_cur_model,
+                current_base_url=_cur_base_url,
+                current_api_key=_cur_api_key,
+                is_global=True,
+                explicit_provider=provider_slug,
+            )
+            if not result.success:
+                return f"Error: {result.error_message}"
+
+            cached_entry = None
+            _cache_lock = getattr(_self, "_agent_cache_lock", None)
+            _cache = getattr(_self, "_agent_cache", None)
+            if _cache_lock and _cache is not None:
+                with _cache_lock:
+                    cached_entry = _cache.get(_session_key)
+            if cached_entry and cached_entry[0] is not None:
+                try:
+                    cached_entry[0].switch_model(
+                        new_model=result.new_model,
+                        new_provider=result.target_provider,
+                        api_key=result.api_key,
+                        base_url=result.base_url,
+                        api_mode=result.api_mode,
+                    )
+                except Exception as exc:
+                    logger.warning("Failure-picker model switch failed for cached agent: %s", exc)
+
+            if not hasattr(_self, "_pending_model_notes"):
+                _self._pending_model_notes = {}
+            _self._pending_model_notes[_session_key] = (
+                f"[Note: model was just switched from {_cur_model} to {result.new_model} "
+                f"via {result.provider_label or result.target_provider}. "
+                f"Adjust your self-identification accordingly.]"
+            )
+            if not hasattr(_self, "_session_model_overrides"):
+                _self._session_model_overrides = {}
+            _self._session_model_overrides[_session_key] = {
+                "model": result.new_model,
+                "provider": result.target_provider,
+                "api_key": result.api_key,
+                "base_url": result.base_url,
+                "api_mode": result.api_mode,
+            }
+
+            try:
+                if config_path.exists():
+                    with open(config_path, encoding="utf-8") as f:
+                        cfg = yaml.safe_load(f) or {}
+                else:
+                    cfg = {}
+                model_cfg = cfg.setdefault("model", {})
+                model_cfg["default"] = result.new_model
+                model_cfg["provider"] = result.target_provider
+                if result.base_url:
+                    model_cfg["base_url"] = result.base_url
+                from hermes_cli.config import save_config
+                save_config(cfg)
+            except Exception as exc:
+                logger.warning("Failed to persist failure-picker model switch: %s", exc)
+
+            plabel = result.provider_label or result.target_provider
+            lines = [f"Model switched to `{result.new_model}`"]
+            lines.append(f"Provider: {plabel}")
+            mi = result.model_info
+            if mi:
+                if mi.context_window:
+                    lines.append(f"Context: {mi.context_window:,} tokens")
+                if mi.max_output:
+                    lines.append(f"Max output: {mi.max_output:,} tokens")
+                if mi.has_cost_data():
+                    lines.append(f"Cost: {mi.format_cost()}")
+                lines.append(f"Capabilities: {mi.format_capabilities()}")
+            lines.append("Saved as the default model for new sessions.")
+            return "\n".join(lines)
+
+        metadata = {"thread_id": source.thread_id} if source.thread_id else None
+        try:
+            await adapter.send(source.chat_id, notice_text, metadata=metadata)
+        except Exception:
+            return False
+        result = await adapter.send_model_picker(
+            chat_id=source.chat_id,
+            providers=providers,
+            current_model=current_model,
+            current_provider=current_provider,
+            session_key=session_key,
+            on_model_selected=_on_model_selected,
+            metadata=metadata,
+        )
+        return bool(result and result.success)
+
     async def _handle_model_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /model command — switch model for this session.
 
         Supports:
           /model                              — interactive picker (Telegram/Discord) or text list
-          /model <name>                       — switch for this session only
-          /model <name> --global              — switch and persist to config.yaml
+          /model <name>                       — switch and persist for future sessions
+          /model <name> --global              — explicit persist (same behavior in gateway)
           /model <name> --provider <provider> — switch provider + model
           /model --provider <provider>        — switch to provider, auto-detect model
         """
@@ -3523,6 +4841,8 @@ class GatewayRunner:
 
         # Parse --provider and --global flags
         model_input, explicit_provider, persist_global = parse_model_flags(raw_args)
+        # Gateway users expect /model changes to survive /new and future chats.
+        persist_global = True
 
         # Read current model/provider from config
         current_model = ""
@@ -3593,7 +4913,7 @@ class GatewayRunner:
                             current_model=_cur_model,
                             current_base_url=_cur_base_url,
                             current_api_key=_cur_api_key,
-                            is_global=False,
+                            is_global=persist_global,
                             explicit_provider=provider_slug,
                         )
                         if not result.success:
@@ -3649,7 +4969,7 @@ class GatewayRunner:
                             if mi.has_cost_data():
                                 lines.append(f"Cost: {mi.format_cost()}")
                             lines.append(f"Capabilities: {mi.format_capabilities()}")
-                        lines.append("_(session only — use `/model <name> --global` to persist)_")
+                        lines.append("Saved as the default model for new sessions.")
                         return "\n".join(lines)
 
                     metadata = {"thread_id": source.thread_id} if source.thread_id else None
@@ -3688,9 +5008,9 @@ class GatewayRunner:
             except Exception:
                 pass
 
-            lines.append("`/model <name>` — switch model")
-            lines.append("`/model <name> --provider <slug>` — switch provider")
-            lines.append("`/model <name> --global` — persist")
+            lines.append("`/model <name>` — switch model and save it")
+            lines.append("`/model <name> --provider <slug>` — switch provider and save it")
+            lines.append("`/model <name> --global` — explicit persist")
             return "\n".join(lines)
 
         # Perform the switch
@@ -3806,9 +5126,9 @@ class GatewayRunner:
             lines.append(f"Warning: {result.warning_message}")
 
         if persist_global:
-            lines.append("Saved to config.yaml (`--global`)")
+            lines.append("Saved to config.yaml for future sessions.")
         else:
-            lines.append("_(session only -- add `--global` to persist)_")
+            lines.append("Saved only for this session.")
 
         return "\n".join(lines)
 
@@ -4559,6 +5879,19 @@ class GatewayRunner:
             from hermes_cli.tools_config import _get_platform_tools
             enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
 
+            session_override = self._session_model_overrides.get(session_key, {})
+            if session_override:
+                model = session_override.get("model", model)
+                runtime_kwargs = dict(runtime_kwargs)
+                if session_override.get("provider"):
+                    runtime_kwargs["provider"] = session_override["provider"]
+                if session_override.get("api_key"):
+                    runtime_kwargs["api_key"] = session_override["api_key"]
+                if session_override.get("base_url"):
+                    runtime_kwargs["base_url"] = session_override["base_url"]
+                if session_override.get("api_mode"):
+                    runtime_kwargs["api_mode"] = session_override["api_mode"]
+
             pr = self._provider_routing
             max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
             reasoning_config = self._load_reasoning_config()
@@ -4584,7 +5917,7 @@ class GatewayRunner:
                     platform=platform_key,
                     user_id=source.user_id,
                     session_db=self._session_db,
-                    fallback_model=self._fallback_model,
+                    fallback_model=None,
                 )
 
                 return agent.run_conversation(
@@ -4758,7 +6091,7 @@ class GatewayRunner:
                     session_id=task_id,
                     platform=platform_key,
                     session_db=None,
-                    fallback_model=self._fallback_model,
+                    fallback_model=None,
                     skip_memory=True,
                     skip_context_files=True,
                     persist_session=False,
@@ -5156,6 +6489,7 @@ class GatewayRunner:
         new_entry = self.session_store.switch_session(session_key, target_id)
         if not new_entry:
             return "Failed to switch session."
+        self._clear_student_grading_run(session_key)
 
         # Get the title for confirmation
         title = self._session_db.get_session_title(target_id) or name
@@ -5247,6 +6581,7 @@ class GatewayRunner:
 
         # Evict any cached agent for this session
         self._evict_cached_agent(session_key)
+        self._clear_student_grading_run(session_key)
 
         msg_count = len([m for m in history if m.get("role") == "user"])
         return (
@@ -6689,7 +8024,7 @@ class GatewayRunner:
                     platform=platform_key,
                     user_id=source.user_id,
                     session_db=self._session_db,
-                    fallback_model=self._fallback_model,
+                    fallback_model=None,
                 )
                 if _cache_lock and _cache is not None:
                     with _cache_lock:
@@ -7049,8 +8384,10 @@ class GatewayRunner:
                 if hasattr(adapter, 'has_pending_interrupt') and adapter.has_pending_interrupt(session_key):
                     agent = agent_holder[0]
                     if agent:
-                        pending_event = adapter.get_pending_message(session_key)
-                        pending_text = pending_event.text if pending_event else None
+                        pending_event = getattr(adapter, "_pending_messages", {}).get(session_key)
+                        if pending_event is not None:
+                            self._queue_pending_event(session_key, pending_event)
+                        pending_text = _event_text_for_agent(pending_event) if pending_event else None
                         logger.debug("Interrupt detected from adapter, signaling agent...")
                         agent.interrupt(pending_text)
                         break
@@ -7228,24 +8565,33 @@ class GatewayRunner:
             
             # Get pending message from adapter.
             # Use session_key (not source.chat_id) to match adapter's storage keys.
-            pending = None
+            pending_event = None
             if result and adapter and session_key:
                 if result.get("interrupted"):
-                    pending = _dequeue_pending_text(adapter, session_key)
-                    if not pending and result.get("interrupt_message"):
-                        pending = result.get("interrupt_message")
+                    pending_event = self._consume_pending_event(session_key, source, adapter=adapter)
+                    if pending_event is None and result.get("interrupt_message"):
+                        from gateway.platforms.base import MessageEvent as _ME
+                        pending_event = _ME(
+                            text=result.get("interrupt_message") or "",
+                            message_type=MessageType.TEXT,
+                            source=source,
+                        )
                 else:
-                    pending = _dequeue_pending_text(adapter, session_key)
-                    if pending:
-                        logger.debug("Processing queued message after agent completion: '%s...'", pending[:40])
+                    pending_event = self._consume_pending_event(session_key, source, adapter=adapter)
+                    if pending_event:
+                        logger.debug(
+                            "Processing queued message after agent completion: '%s...'",
+                            _event_text_for_agent(pending_event)[:40],
+                        )
             
             # Safety net: if the pending text is a slash command (e.g. "/stop",
             # "/new"), discard it — commands should never be passed to the agent
             # as user input.  The primary fix is in base.py (commands bypass the
             # active-session guard), but this catches edge cases where command
             # text leaks through the interrupt_message fallback.
-            if pending and pending.strip().startswith("/"):
-                _pending_parts = pending.strip().split(None, 1)
+            pending_text = _event_text_for_agent(pending_event) if pending_event else None
+            if pending_text and pending_text.strip().startswith("/"):
+                _pending_parts = pending_text.strip().split(None, 1)
                 _pending_cmd_word = _pending_parts[0][1:].lower() if _pending_parts else ""
                 if _pending_cmd_word:
                     try:
@@ -7256,12 +8602,13 @@ class GatewayRunner:
                                 "commands must not be passed as agent input",
                                 _pending_cmd_word,
                             )
-                            pending = None
+                            pending_event = None
+                            pending_text = None
                     except Exception:
                         pass
 
-            if pending:
-                logger.debug("Processing pending message: '%s...'", pending[:40])
+            if pending_event:
+                logger.debug("Processing pending message: '%s...'", pending_text[:40] if pending_text else "")
                 
                 # Clear the adapter's interrupt event so the next _run_agent call
                 # doesn't immediately re-trigger the interrupt before the new agent
@@ -7279,8 +8626,14 @@ class GatewayRunner:
                     )
                     # Queue the pending message for normal processing on next turn
                     adapter = self.adapters.get(source.platform)
+                    if pending_event is not None:
+                        self._queue_pending_event(session_key, pending_event)
                     if adapter and hasattr(adapter, 'queue_message'):
-                        adapter.queue_message(session_key, pending)
+                        adapter.queue_message(
+                            session_key,
+                            pending_event if pending_event is not None else (pending_text or ""),
+                            source=source,
+                        )
                     return result_holder[0] or {"final_response": response, "messages": history}
 
                 was_interrupted = result.get("interrupted")
@@ -7294,7 +8647,7 @@ class GatewayRunner:
                     if first_response and not _already_streamed:
                         try:
                             await adapter.send(source.chat_id, first_response,
-                                               metadata=getattr(event, "metadata", None))
+                                               metadata=_status_thread_metadata)
                         except Exception as e:
                             logger.warning("Failed to send first response before queued message: %s", e)
                 # else: interrupted — discard the interrupted response ("Operation
@@ -7303,8 +8656,9 @@ class GatewayRunner:
 
                 # Process the pending message with updated history
                 updated_history = result.get("messages", history)
+                pending_text = await self._prepare_message_text_from_event(pending_event, source)
                 return await self._run_agent(
-                    message=pending,
+                    message=pending_text,
                     context_prompt=context_prompt,
                     history=updated_history,
                     source=source,

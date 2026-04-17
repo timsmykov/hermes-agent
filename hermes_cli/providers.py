@@ -231,6 +231,8 @@ _LABEL_OVERRIDES: Dict[str, str] = {
     "nous": "Nous Portal",
     "openai-codex": "OpenAI Codex",
     "copilot-acp": "GitHub Copilot ACP",
+    "gemini": "Gemini",
+    "google": "Gemini",
     "local": "Local endpoint",
 }
 
