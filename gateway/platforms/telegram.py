@@ -108,6 +108,151 @@ def _strip_mdv2(text: str) -> str:
     return cleaned
 
 
+import re
+from typing import List, Optional, Tuple
+
+
+def _split_fenced_blocks(text: str) -> List[Tuple[bool, str]]:
+    parts: List[Tuple[bool, str]] = []
+    cursor = 0
+    for match in re.finditer(r"```[\s\S]*?```", text):
+        if match.start() > cursor:
+            parts.append((False, text[cursor:match.start()]))
+        parts.append((True, match.group(0)))
+        cursor = match.end()
+    if cursor < len(text):
+        parts.append((False, text[cursor:]))
+    return parts
+
+
+def _normalize_cell(cell: str) -> str:
+    cell = cell.strip()
+    cell = re.sub(r"\*\*(.+?)\*\*", r"\1", cell)
+    cell = re.sub(r"`(.+?)`", r"\1", cell)
+    return re.sub(r"\s+", " ", cell).strip()
+
+
+def _parse_pipe_table(block: str) -> Optional[str]:
+    lines = [line.rstrip() for line in block.splitlines() if line.strip()]
+    if len(lines) < 2:
+        return None
+    if not all(line.lstrip().startswith("|") for line in lines):
+        return None
+
+    raw_rows = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped.startswith("|"):
+            return None
+        row = [ _normalize_cell(cell) for cell in stripped.strip("|").split("|") ]
+        raw_rows.append(row)
+
+    if len(raw_rows) < 2:
+        return None
+
+    separator = raw_rows[1]
+    if not all(re.fullmatch(r":?-{3,}:?", cell.replace(" ", "")) for cell in separator):
+        return None
+
+    headers = raw_rows[0]
+    data_rows = raw_rows[2:]
+    if not data_rows:
+        return None
+
+    col_count = max(len(headers), *(len(r) for r in data_rows))
+    headers += [""] * (col_count - len(headers))
+    padded_rows = [headers] + [r + [""] * (col_count - len(r)) for r in data_rows]
+    widths = [max(len(row[i]) for row in padded_rows) for i in range(col_count)]
+
+    def fmt(row: List[str]) -> str:
+        return " | ".join(row[i].ljust(widths[i]) for i in range(col_count)).rstrip()
+
+    rendered = [fmt(headers), "-+-".join("-" * w for w in widths)]
+    rendered.extend(fmt(row) for row in padded_rows[1:])
+    return "```text\n" + "\n".join(rendered).rstrip() + "\n```"
+
+
+def _convert_pipe_tables(text: str) -> str:
+    lines = text.splitlines()
+    out: List[str] = []
+    i = 0
+    while i < len(lines):
+        if lines[i].lstrip().startswith("|"):
+            start = i
+            while i < len(lines) and lines[i].strip() and lines[i].lstrip().startswith("|"):
+                i += 1
+            candidate = "\n".join(lines[start:i])
+            converted = _parse_pipe_table(candidate)
+            if converted:
+                out.append(converted)
+            else:
+                out.extend(lines[start:i])
+            continue
+        out.append(lines[i])
+        i += 1
+    return "\n".join(out)
+
+
+_LABEL_LINE_RE = re.compile(
+    r"^(?:[-*]\s+)?(?:\*\*)?([A-Za-zА-Яа-я0-9 _/\-]{2,40})(?:\*\*)?\s*:\s+(.+?)\s*$"
+)
+
+
+def _normalize_label_runs(text: str) -> str:
+    lines = text.splitlines()
+    out: List[str] = []
+    i = 0
+    while i < len(lines):
+        current = re.sub(r"^(?:[-*]\s+)?\*\*([^*]+):\*\*\s+", r"\1: ", lines[i].strip())
+        match = _LABEL_LINE_RE.match(current)
+        if not match:
+            out.append(lines[i])
+            i += 1
+            continue
+
+        run = []
+        j = i
+        while j < len(lines):
+            candidate = re.sub(r"^(?:[-*]\s+)?\*\*([^*]+):\*\*\s+", r"\1: ", lines[j].strip())
+            if not candidate:
+                break
+            m = _LABEL_LINE_RE.match(candidate)
+            if not m:
+                break
+            run.append((m.group(1).strip(), m.group(2).strip()))
+            j += 1
+
+        if len(run) >= 3:
+            key_width = max(len(k) for k, _ in run)
+            rendered = "\n".join(f"{k.ljust(key_width)} : {v}" for k, v in run)
+            out.append("```text\n" + rendered + "\n```")
+            i = j
+            continue
+
+        out.append(lines[i])
+        i += 1
+    return "\n".join(out)
+
+
+def normalize_telegram_layout(text: str) -> str:
+    if not text or "```text" in text:
+        # idempotent enough; still run around fenced blocks if needed below
+        pass
+
+    parts = []
+    for is_code, chunk in _split_fenced_blocks(text):
+        if is_code:
+            parts.append(chunk)
+            continue
+        normalized = _convert_pipe_tables(chunk)
+        normalized = _normalize_label_runs(normalized)
+        parts.append(normalized)
+    result = "".join(parts)
+    result = re.sub(r"\n{3,}", "\n\n", result).strip()
+    return result
+
+
+
 class TelegramAdapter(BasePlatformAdapter):
     """
     Telegram bot adapter.
@@ -135,6 +280,11 @@ class TelegramAdapter(BasePlatformAdapter):
         self._media_batch_delay_seconds = float(os.getenv("HERMES_TELEGRAM_MEDIA_BATCH_DELAY_SECONDS", "0.8"))
         self._pending_photo_batches: Dict[str, MessageEvent] = {}
         self._pending_photo_batch_tasks: Dict[str, asyncio.Task] = {}
+        # Buffer rapid document uploads in one topic so a forwarded work batch
+        # reaches the gateway as one logical request instead of N separate turns.
+        self._document_batch_delay_seconds = float(os.getenv("HERMES_TELEGRAM_DOCUMENT_BATCH_DELAY_SECONDS", "1.0"))
+        self._pending_document_batches: Dict[str, MessageEvent] = {}
+        self._pending_document_batch_tasks: Dict[str, asyncio.Task] = {}
         self._media_group_events: Dict[str, MessageEvent] = {}
         self._media_group_tasks: Dict[str, asyncio.Task] = {}
         # Buffer rapid text messages so Telegram client-side splits of long
@@ -142,6 +292,9 @@ class TelegramAdapter(BasePlatformAdapter):
         self._text_batch_delay_seconds = float(os.getenv("HERMES_TELEGRAM_TEXT_BATCH_DELAY_SECONDS", "0.6"))
         self._pending_text_batches: Dict[str, MessageEvent] = {}
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
+        self._text_document_coalesce_delay_seconds = float(
+            os.getenv("HERMES_TELEGRAM_TEXT_DOCUMENT_COALESCE_DELAY_SECONDS", "8.0")
+        )
         self._token_lock_identity: Optional[str] = None
         self._polling_error_task: Optional[asyncio.Task] = None
         self._polling_conflict_count: int = 0
@@ -763,8 +916,9 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=None)
         
         try:
-            # Format and split message if needed
-            formatted = self.format_message(content)
+            # Normalize Telegram-hostile layouts before MarkdownV2 conversion.
+            normalized_content = normalize_telegram_layout(content)
+            formatted = self.format_message(normalized_content)
             chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
             if len(chunks) > 1:
                 # truncate_message appends a raw " (1/2)" suffix. Escape the
@@ -908,7 +1062,8 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._bot:
             return SendResult(success=False, error="Not connected")
         try:
-            formatted = self.format_message(content)
+            normalized_content = normalize_telegram_layout(content)
+            formatted = self.format_message(normalized_content)
             try:
                 await self._bot.edit_message_text(
                     chat_id=int(chat_id),
@@ -1122,7 +1277,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 f"⚙ *Model Configuration*\n\n"
                 f"Current model: `{current_model or 'unknown'}`\n"
                 f"Provider: {provider_label}\n\n"
-                f"Select a provider:"
+                f"Use a quick switch or select a provider:"
             )
 
             thread_id = metadata.get("thread_id") if metadata else None
@@ -1223,6 +1378,39 @@ class TelegramAdapter(BasePlatformAdapter):
             state["selected_provider_name"] = provider.get("name", provider_slug)
             state["model_list"] = models
             state["model_page"] = 0
+
+            # Fast path: if provider has exactly one model, select it immediately.
+            if len(models) == 1:
+                callback = state.get("on_model_selected")
+                if not callback:
+                    await query.answer(text="Picker expired.")
+                    return
+
+                model_id = models[0]
+                try:
+                    result_text = await callback(chat_id, model_id, provider_slug)
+                except Exception as exc:
+                    logger.error("Model picker switch failed: %s", exc)
+                    result_text = f"Error switching model: {exc}"
+
+                try:
+                    await query.edit_message_text(
+                        text=result_text,
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=None,
+                    )
+                except Exception:
+                    try:
+                        await query.edit_message_text(
+                            text=result_text,
+                            parse_mode=None,
+                            reply_markup=None,
+                        )
+                    except Exception:
+                        pass
+                await query.answer(text="Model switched!")
+                self._model_picker_state.pop(chat_id, None)
+                return
 
             keyboard, page_info = self._build_model_keyboard(models, 0)
 
@@ -2150,6 +2338,27 @@ class TelegramAdapter(BasePlatformAdapter):
         dispatching the combined message.
         """
         key = self._text_batch_key(event)
+        document_batch_key = f"{key}:document-burst"
+
+        pending_document = self._pending_document_batches.get(document_batch_key)
+        if pending_document is not None:
+            if event.text:
+                pending_document.text = (
+                    self._merge_caption(pending_document.text, event.text)
+                    if pending_document.text
+                    else event.text
+                )
+            if getattr(event, "reply_to_text", None):
+                pending_document.reply_to_text = event.reply_to_text
+                pending_document.reply_to_message_id = event.reply_to_message_id
+            prior_task = self._pending_document_batch_tasks.get(document_batch_key)
+            if prior_task and not prior_task.done():
+                prior_task.cancel()
+            self._pending_document_batch_tasks[document_batch_key] = asyncio.create_task(
+                self._flush_document_batch(document_batch_key)
+            )
+            return
+
         existing = self._pending_text_batches.get(key)
         if existing is None:
             self._pending_text_batches[key] = event
@@ -2167,14 +2376,48 @@ class TelegramAdapter(BasePlatformAdapter):
         if prior_task and not prior_task.done():
             prior_task.cancel()
         self._pending_text_batch_tasks[key] = asyncio.create_task(
-            self._flush_text_batch(key)
+            self._flush_text_batch(
+                key,
+                delay_seconds=self._text_document_coalesce_delay_seconds
+                if self._looks_like_document_task_instruction(event.text or "")
+                else self._text_batch_delay_seconds,
+            )
         )
 
-    async def _flush_text_batch(self, key: str) -> None:
+    def _looks_like_document_task_instruction(self, text: str) -> bool:
+        lower_text = (text or "").lower()
+        if not lower_text.strip():
+            return False
+        return any(
+            token in lower_text
+            for token in (
+                "unit",
+                "юнит",
+                "кейс",
+                "case",
+                "assignment",
+                "homework",
+                "работ",
+                "студент",
+                "students",
+                "submissions",
+                "submission",
+                "проверь",
+                "оцен",
+                "grading",
+                "review",
+                "балл",
+                "таблиц",
+            )
+        )
+
+    async def _flush_text_batch(self, key: str, delay_seconds: float | None = None) -> None:
         """Wait for the quiet period then dispatch the aggregated text."""
         current_task = asyncio.current_task()
         try:
-            await asyncio.sleep(self._text_batch_delay_seconds)
+            await asyncio.sleep(
+                self._text_batch_delay_seconds if delay_seconds is None else delay_seconds
+            )
             event = self._pending_text_batches.pop(key, None)
             if not event:
                 return
@@ -2234,6 +2477,75 @@ class TelegramAdapter(BasePlatformAdapter):
             prior_task.cancel()
 
         self._pending_photo_batch_tasks[batch_key] = asyncio.create_task(self._flush_photo_batch(batch_key))
+
+    # ------------------------------------------------------------------
+    # Document batching
+    # ------------------------------------------------------------------
+
+    def _document_batch_key(self, event: MessageEvent) -> str:
+        """Return a batching key for rapid document bursts in one session/topic."""
+        from gateway.session import build_session_key
+        session_key = build_session_key(
+            event.source,
+            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
+            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+        )
+        return f"{session_key}:document-burst"
+
+    async def _flush_document_batch(self, batch_key: str) -> None:
+        """Send a buffered document burst as a single MessageEvent."""
+        current_task = asyncio.current_task()
+        try:
+            await asyncio.sleep(self._document_batch_delay_seconds)
+            event = self._pending_document_batches.pop(batch_key, None)
+            if not event:
+                return
+            logger.info(
+                "[Telegram] Flushing document batch %s with %d document(s)",
+                batch_key,
+                len(event.media_urls),
+            )
+            await self.handle_message(event)
+        finally:
+            if self._pending_document_batch_tasks.get(batch_key) is current_task:
+                self._pending_document_batch_tasks.pop(batch_key, None)
+
+    def _enqueue_document_event(self, batch_key: str, event: MessageEvent) -> None:
+        """Merge document events into a pending batch and schedule flush."""
+        text_key = batch_key.rsplit(":", 1)[0]
+        pending_text = self._pending_text_batches.pop(text_key, None)
+        if pending_text is not None:
+            prior_text_task = self._pending_text_batch_tasks.get(text_key)
+            if prior_text_task and not prior_text_task.done():
+                prior_text_task.cancel()
+            self._pending_text_batch_tasks.pop(text_key, None)
+            if pending_text.text:
+                event.text = self._merge_caption(pending_text.text, event.text) if event.text else pending_text.text
+            elif not event.text:
+                event.text = pending_text.text
+            if getattr(pending_text, "reply_to_text", None):
+                event.reply_to_text = pending_text.reply_to_text
+                event.reply_to_message_id = pending_text.reply_to_message_id
+
+        existing = self._pending_document_batches.get(batch_key)
+        if existing is None:
+            self._pending_document_batches[batch_key] = event
+        else:
+            existing.media_urls.extend(event.media_urls)
+            existing.media_types.extend(event.media_types)
+            if event.text:
+                existing.text = self._merge_caption(existing.text, event.text)
+            if getattr(event, "reply_to_text", None):
+                existing.reply_to_text = event.reply_to_text
+                existing.reply_to_message_id = event.reply_to_message_id
+
+        prior_task = self._pending_document_batch_tasks.get(batch_key)
+        if prior_task and not prior_task.done():
+            prior_task.cancel()
+
+        self._pending_document_batch_tasks[batch_key] = asyncio.create_task(
+            self._flush_document_batch(batch_key)
+        )
 
     async def _handle_media_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming media messages, downloading images to local cache."""
@@ -2398,6 +2710,11 @@ class TelegramAdapter(BasePlatformAdapter):
         media_group_id = getattr(msg, "media_group_id", None)
         if media_group_id:
             await self._queue_media_group_event(str(media_group_id), event)
+            return
+
+        if msg.document:
+            batch_key = self._document_batch_key(event)
+            self._enqueue_document_event(batch_key, event)
             return
 
         await self.handle_message(event)
