@@ -6120,6 +6120,11 @@ class GatewayRunner:
                 if _cmd_def_inner.name == "footer":
                     return await self._handle_footer_command(event)
 
+            if _cmd_def_inner and _cmd_def_inner.name in {"usage", "limits"}:
+                if _cmd_def_inner.name == "usage":
+                    return await self._handle_usage_command(event)
+                return await self._handle_limits_command(event)
+
             # Gateway-handled info/control commands with dedicated
             # running-agent handlers.
             if _cmd_def_inner and _cmd_def_inner.name in _DEDICATED_HANDLERS:
@@ -6427,6 +6432,9 @@ class GatewayRunner:
 
         if canonical == "usage":
             return await self._handle_usage_command(event)
+
+        if canonical == "limits":
+            return await self._handle_limits_command(event)
 
         if canonical == "insights":
             return await self._handle_insights_command(event)
@@ -10932,9 +10940,11 @@ class GatewayRunner:
                     operator_topic = get_info(adapter, str(source.chat_id), str(source.thread_id))
                 except Exception:
                     operator_topic = None
-                # Only treat dict-shaped returns as operator-declared; a
-                # bare MagicMock or other sentinel shouldn't count.
-                if isinstance(operator_topic, dict):
+                # Only operator-configured topics are fixed. Telegram also
+                # creates user-managed DM topics from the first user message;
+                # those are cached by name and should still be renamed after
+                # Hermes generates a better session title.
+                if isinstance(operator_topic, dict) and operator_topic.get("_source") == "config":
                     return
 
         session_db = getattr(self, "_session_db", None)
@@ -11499,6 +11509,56 @@ class GatewayRunner:
         msg_count = len([m for m in history if m.get("role") == "user"])
         key = "gateway.branch.branched_one" if msg_count == 1 else "gateway.branch.branched_many"
         return t(key, title=branch_title, count=msg_count, parent=parent_session_id, new=new_session_id)
+
+    def _resolve_account_usage_context(self, event: MessageEvent, agent: Any = None) -> tuple[Optional[str], Optional[str], Optional[str]]:
+        """Resolve provider/base_url/api_key for selected model/account limits."""
+        source = event.source
+        provider = getattr(agent, "provider", None) if agent and agent is not _AGENT_PENDING_SENTINEL else None
+        base_url = getattr(agent, "base_url", None) if agent and agent is not _AGENT_PENDING_SENTINEL else None
+        api_key = getattr(agent, "api_key", None) if agent and agent is not _AGENT_PENDING_SENTINEL else None
+        if not provider and getattr(self, "_session_db", None) is not None:
+            try:
+                _entry_for_billing = self.session_store.get_or_create_session(source)
+                persisted = self._session_db.get_session(_entry_for_billing.session_id) or {}
+            except Exception:
+                persisted = {}
+            provider = provider or persisted.get("billing_provider")
+            base_url = base_url or persisted.get("billing_base_url")
+        return provider, base_url, api_key
+
+    def _resolve_current_agent_for_event(self, event: MessageEvent) -> Any:
+        """Return running/cached agent for the event's session, if any."""
+        session_key = self._session_key_for_source(event.source)
+        agent = self._running_agents.get(session_key)
+        if not agent or agent is _AGENT_PENDING_SENTINEL:
+            _cache_lock = getattr(self, "_agent_cache_lock", None)
+            _cache = getattr(self, "_agent_cache", None)
+            if _cache_lock and _cache is not None:
+                with _cache_lock:
+                    cached = _cache.get(session_key)
+                    if cached:
+                        agent = cached[0]
+        return agent
+
+    async def _handle_limits_command(self, event: MessageEvent) -> str:
+        """Handle /limits -- show selected model/account rate-limit windows only."""
+        agent = self._resolve_current_agent_for_event(event)
+        provider, base_url, api_key = self._resolve_account_usage_context(event, agent)
+        if not provider:
+            return "No selected provider found for this session yet. Send one model-backed message first, then run /limits."
+        try:
+            account_snapshot = await asyncio.to_thread(
+                fetch_account_usage,
+                provider,
+                base_url=base_url,
+                api_key=api_key,
+            )
+        except Exception:
+            account_snapshot = None
+        account_lines = render_account_usage_lines(account_snapshot, markdown=True) if account_snapshot else []
+        if account_lines:
+            return "\n".join(account_lines)
+        return f"No rate-limit data available for provider: {provider}"
 
     async def _handle_usage_command(self, event: MessageEvent) -> str:
         """Handle /usage command -- show token usage for the current session.
