@@ -5,9 +5,13 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 import httpx
+import json
+import select
+import shutil
+import subprocess
+import time
 
 from agent.anthropic_adapter import _is_oauth_token, resolve_anthropic_token
-from hermes_cli.auth import _read_codex_tokens, resolve_codex_runtime_credentials
 from hermes_cli.runtime_provider import resolve_runtime_provider
 
 
@@ -68,7 +72,12 @@ def _parse_dt(value: Any) -> Optional[datetime]:
 def _format_reset(dt: Optional[datetime]) -> str:
     if not dt:
         return "unknown"
-    local_dt = dt.astimezone()
+    try:
+        from hermes_time import get_timezone
+        tz = get_timezone()
+    except Exception:
+        tz = None
+    local_dt = dt.astimezone(tz) if tz is not None else dt.astimezone()
     delta = dt - _utc_now()
     total_seconds = int(delta.total_seconds())
     if total_seconds <= 0:
@@ -124,52 +133,153 @@ def _resolve_codex_usage_url(base_url: str) -> str:
     return normalized + "/api/codex/usage"
 
 
-def _fetch_codex_account_usage() -> Optional[AccountUsageSnapshot]:
-    creds = resolve_codex_runtime_credentials(refresh_if_expiring=True)
-    token_data = _read_codex_tokens()
-    tokens = token_data.get("tokens") or {}
-    account_id = str(tokens.get("account_id", "") or "").strip() or None
-    headers = {
-        "Authorization": f"Bearer {creds['api_key']}",
-        "Accept": "application/json",
-        "User-Agent": "codex-cli",
-    }
-    if account_id:
-        headers["ChatGPT-Account-Id"] = account_id
-    with httpx.Client(timeout=15.0) as client:
-        response = client.get(_resolve_codex_usage_url(creds.get("base_url", "")), headers=headers)
-        response.raise_for_status()
-    payload = response.json() or {}
-    rate_limit = payload.get("rate_limit") or {}
+def _readline_with_timeout(stream: Any, timeout: float) -> str:
+    """Read one line from a subprocess stream without hanging forever."""
+    try:
+        fd = stream.fileno()
+    except Exception:
+        return stream.readline()
+    ready, _, _ = select.select([fd], [], [], max(0.0, timeout))
+    if not ready:
+        raise TimeoutError("codex app-server timed out waiting for rate limits")
+    return stream.readline()
+
+
+def _codex_window_label(window: dict[str, Any], fallback: str) -> str:
+    try:
+        minutes = int(window.get("windowDurationMins"))
+    except (TypeError, ValueError):
+        return fallback
+    if minutes == 300:
+        return "5h"
+    if minutes == 10080:
+        return "Weekly"
+    if minutes % 60 == 0 and minutes < 24 * 60:
+        return f"{minutes // 60}h"
+    if minutes % (24 * 60) == 0:
+        return f"{minutes // (24 * 60)}d"
+    return f"{minutes}m"
+
+
+def _parse_codex_app_server_rate_limits(payload: dict[str, Any]) -> Optional[AccountUsageSnapshot]:
+    result = payload.get("result") or {}
+    rate_limits = result.get("rateLimits") or {}
+    if not isinstance(rate_limits, dict):
+        return None
+
     windows: list[AccountUsageWindow] = []
-    for key, label in (("primary_window", "Session"), ("secondary_window", "Weekly")):
-        window = rate_limit.get(key) or {}
-        used = window.get("used_percent")
+    for key, fallback in (("primary", "Primary"), ("secondary", "Secondary")):
+        window = rate_limits.get(key) or {}
+        if not isinstance(window, dict):
+            continue
+        used = window.get("usedPercent")
         if used is None:
             continue
         windows.append(
             AccountUsageWindow(
-                label=label,
+                label=_codex_window_label(window, fallback),
                 used_percent=float(used),
-                reset_at=_parse_dt(window.get("reset_at")),
+                reset_at=_parse_dt(window.get("resetsAt")),
             )
         )
+
     details: list[str] = []
-    credits = payload.get("credits") or {}
-    if credits.get("has_credits"):
-        balance = credits.get("balance")
-        if isinstance(balance, (int, float)):
-            details.append(f"Credits balance: ${float(balance):.2f}")
-        elif credits.get("unlimited"):
+    credits = rate_limits.get("credits")
+    if isinstance(credits, dict):
+        if credits.get("unlimited"):
             details.append("Credits balance: unlimited")
+        else:
+            balance = credits.get("balance")
+            if balance not in {None, ""}:
+                details.append(f"Credits balance: {balance}")
+    reached = rate_limits.get("rateLimitReachedType")
+    if reached:
+        details.append(f"Rate limit reached: {reached}")
+
     return AccountUsageSnapshot(
         provider="openai-codex",
-        source="usage_api",
+        source="codex_app_server",
         fetched_at=_utc_now(),
-        plan=_title_case_slug(payload.get("plan_type")),
+        title="Model limits",
+        plan=_title_case_slug(rate_limits.get("planType")),
         windows=tuple(windows),
         details=tuple(details),
     )
+
+
+def _fetch_codex_account_usage() -> Optional[AccountUsageSnapshot]:
+    codex_bin = shutil.which("codex")
+    if not codex_bin:
+        return AccountUsageSnapshot(
+            provider="openai-codex",
+            source="codex_app_server",
+            fetched_at=_utc_now(),
+            title="Model limits",
+            unavailable_reason="Codex CLI is not installed on this host.",
+        )
+
+    proc = subprocess.Popen(
+        [codex_bin, "app-server"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+    )
+    try:
+        requests = (
+            {
+                "method": "initialize",
+                "id": 1,
+                "params": {
+                    "clientInfo": {"name": "hermes", "title": "Hermes", "version": "1"},
+                    "capabilities": {"experimentalApi": True},
+                },
+            },
+            {"method": "initialized", "params": {}},
+            {"method": "account/rateLimits/read", "id": 2},
+        )
+        assert proc.stdin is not None
+        for request in requests:
+            proc.stdin.write(json.dumps(request, separators=(",", ":")) + "\n")
+        proc.stdin.flush()
+
+        deadline = time.monotonic() + 15.0
+        assert proc.stdout is not None
+        while time.monotonic() < deadline:
+            line = _readline_with_timeout(proc.stdout, max(0.0, deadline - time.monotonic()))
+            if not line:
+                break
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if payload.get("id") == 2:
+                if payload.get("error"):
+                    return AccountUsageSnapshot(
+                        provider="openai-codex",
+                        source="codex_app_server",
+                        fetched_at=_utc_now(),
+                        title="Model limits",
+                        unavailable_reason="Codex app-server returned an error.",
+                    )
+                return _parse_codex_app_server_rate_limits(payload)
+        return AccountUsageSnapshot(
+            provider="openai-codex",
+            source="codex_app_server",
+            fetched_at=_utc_now(),
+            title="Model limits",
+            unavailable_reason="Codex app-server did not return rate limits before timeout.",
+        )
+    finally:
+        try:
+            proc.terminate()
+            proc.wait(timeout=2)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
 
 
 def _fetch_anthropic_account_usage() -> Optional[AccountUsageSnapshot]:

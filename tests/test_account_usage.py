@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timezone
 
 from agent.account_usage import (
@@ -49,50 +50,87 @@ class _RoutingClient:
         return _Response(self._payloads[url])
 
 
-def test_fetch_account_usage_codex(monkeypatch):
-    monkeypatch.setattr(
-        "agent.account_usage.resolve_codex_runtime_credentials",
-        lambda refresh_if_expiring=True: {
-            "provider": "openai-codex",
-            "base_url": "https://chatgpt.com/backend-api/codex",
-            "api_key": "access-token",
-        },
-    )
-    monkeypatch.setattr(
-        "agent.account_usage._read_codex_tokens",
-        lambda: {"tokens": {"account_id": "acct_123"}},
-    )
-    monkeypatch.setattr(
-        "agent.account_usage.httpx.Client",
-        lambda timeout=15.0: _Client(
-            {
-                "plan_type": "pro",
-                "rate_limit": {
-                    "primary_window": {
-                        "used_percent": 15,
-                        "reset_at": 1_900_000_000,
-                        "limit_window_seconds": 18000,
+class _FakeCodexAppServerProc:
+    def __init__(self, *args, **kwargs):
+        self.stdin = self
+        self.stdout = self
+        self.stderr = self
+        self.returncode = None
+        self.writes = []
+        self._lines = [
+            json.dumps({"id": 1, "result": {}}) + "\n",
+            json.dumps(
+                {
+                    "id": 2,
+                    "result": {
+                        "rateLimits": {
+                            "primary": {
+                                "usedPercent": 15,
+                                "windowDurationMins": 300,
+                                "resetsAt": 1_900_000_000,
+                            },
+                            "secondary": {
+                                "usedPercent": 40,
+                                "windowDurationMins": 10080,
+                                "resetsAt": 1_900_500_000,
+                            },
+                            "credits": {"hasCredits": True, "balance": "12.5", "unlimited": False},
+                            "planType": "pro",
+                            "rateLimitReachedType": None,
+                        }
                     },
-                    "secondary_window": {
-                        "used_percent": 40,
-                        "reset_at": 1_900_500_000,
-                        "limit_window_seconds": 604800,
-                    },
-                },
-                "credits": {"has_credits": True, "balance": 12.5},
-            }
-        ),
-    )
+                }
+            )
+            + "\n",
+        ]
+
+    def write(self, data):
+        self.writes.append(data)
+
+    def flush(self):
+        pass
+
+    def readline(self):
+        return self._lines.pop(0) if self._lines else ""
+
+    def read(self):
+        return ""
+
+    def terminate(self):
+        self.returncode = -15
+
+    def wait(self, timeout=None):
+        self.returncode = 0 if self.returncode is None else self.returncode
+        return self.returncode
+
+    def kill(self):
+        self.returncode = -9
+
+
+def test_fetch_account_usage_codex_uses_app_server_rate_limits(monkeypatch):
+    procs = []
+
+    def _fake_popen(*args, **kwargs):
+        proc = _FakeCodexAppServerProc(*args, **kwargs)
+        procs.append(proc)
+        return proc
+
+    monkeypatch.setattr("agent.account_usage.shutil.which", lambda name: "/usr/local/bin/codex")
+    monkeypatch.setattr("agent.account_usage.subprocess.Popen", _fake_popen)
+    monkeypatch.setattr("agent.account_usage._readline_with_timeout", lambda stream, timeout: stream.readline())
 
     snapshot = fetch_account_usage("openai-codex")
 
     assert snapshot is not None
     assert snapshot.plan == "Pro"
     assert len(snapshot.windows) == 2
-    assert snapshot.windows[0].label == "Session"
+    assert snapshot.source == "codex_app_server"
+    assert snapshot.windows[0].label == "5h"
     assert snapshot.windows[0].used_percent == 15.0
     assert snapshot.windows[0].reset_at == datetime.fromtimestamp(1_900_000_000, tz=timezone.utc)
-    assert "Credits balance: $12.50" in snapshot.details
+    assert snapshot.windows[1].label == "Weekly"
+    assert "Credits balance: 12.5" in snapshot.details
+    assert procs and "account/rateLimits/read" in "".join(procs[0].writes)
 
 
 def test_render_account_usage_lines_includes_reset_and_provider():
