@@ -13917,6 +13917,7 @@ class GatewayRunner:
         base_url = getattr(agent, "base_url", None) if agent and agent is not _AGENT_PENDING_SENTINEL else None
         api_key = getattr(agent, "api_key", None) if agent and agent is not _AGENT_PENDING_SENTINEL else None
 
+
         # Session-scoped /model override, if present, is the user's current
         # selection even before an AIAgent has been constructed for this chat.
         session_key = None
@@ -13941,6 +13942,7 @@ class GatewayRunner:
                 persisted = {}
             provider = provider or persisted.get("billing_provider")
             base_url = base_url or persisted.get("billing_base_url")
+
 
         # Global selected provider from config.yaml.  This is the important
         # fresh-session fallback for Telegram: /limits should work immediately
