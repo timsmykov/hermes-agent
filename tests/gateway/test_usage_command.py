@@ -180,6 +180,52 @@ class TestUsageCachedAgent:
 class TestUsageAccountSection:
     """Account-limits section appended to /usage output (PR #2486)."""
 
+    def test_limits_command_registered_for_gateway(self):
+        from hermes_cli.commands import GATEWAY_KNOWN_COMMANDS, resolve_command
+
+        command = resolve_command("limits")
+
+        assert command is not None
+        assert command.name == "limits"
+        assert "limits" in GATEWAY_KNOWN_COMMANDS
+
+    @pytest.mark.asyncio
+    async def test_limits_command_shows_only_selected_provider_limits(self, monkeypatch):
+        agent = _make_mock_agent(provider="openai-codex")
+        agent.base_url = "https://chatgpt.com/backend-api/codex"
+        runner = _make_runner(SK, cached_agent=agent)
+        event = MagicMock()
+
+        calls = {}
+
+        async def _fake_to_thread(fn, *args, **kwargs):
+            calls["args"] = args
+            calls["kwargs"] = kwargs
+            return fn(*args, **kwargs)
+
+        monkeypatch.setattr("gateway.run.asyncio.to_thread", _fake_to_thread)
+        monkeypatch.setattr(
+            "gateway.run.fetch_account_usage",
+            lambda provider, base_url=None, api_key=None: object(),
+        )
+        monkeypatch.setattr(
+            "gateway.run.render_account_usage_lines",
+            lambda snapshot, markdown=False: [
+                "📈 **Model limits**",
+                "Provider: openai-codex (Pro)",
+                "5h: 85% remaining (15% used)",
+                "Weekly: 60% remaining (40% used)",
+            ],
+        )
+
+        result = await runner._handle_limits_command(event)
+
+        assert calls["args"] == ("openai-codex",)
+        assert calls["kwargs"]["base_url"] == "https://chatgpt.com/backend-api/codex"
+        assert "📈 **Model limits**" in result
+        assert "5h: 85% remaining" in result
+        assert "📊 **Session Token Usage**" not in result
+
     @pytest.mark.asyncio
     async def test_usage_command_includes_account_section(self, monkeypatch):
         agent = _make_mock_agent(provider="openai-codex")
