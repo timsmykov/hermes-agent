@@ -170,7 +170,10 @@ class DirectAlias(NamedTuple):
 
 
 # Built-in direct aliases (can be extended via config.yaml model_aliases:)
-_BUILTIN_DIRECT_ALIASES: dict[str, DirectAlias] = {}
+_BUILTIN_DIRECT_ALIASES: dict[str, DirectAlias] = {
+    "codex-spark": DirectAlias("gpt-5.3-codex-spark", "openai-codex", ""),
+    "codex 5.3 spark": DirectAlias("gpt-5.3-codex-spark", "openai-codex", ""),
+}
 
 # Merged dict (builtins + user config); populated by _load_direct_aliases()
 DIRECT_ALIASES: dict[str, DirectAlias] = {}
