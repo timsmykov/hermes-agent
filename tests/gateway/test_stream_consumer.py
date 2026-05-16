@@ -133,6 +133,88 @@ class TestFinalizeCapabilityGate:
         assert picky.edit_message.call_args[1]["finalize"] is True
 
 
+class TestStreamingRateLimit:
+    """Streaming flush cadence must not hammer Telegram edits."""
+
+    @pytest.mark.asyncio
+    async def test_buffer_threshold_only_triggers_first_frame_then_interval_gates_edits(self):
+        """Regression for Telegram flood-control stalls.
+
+        Once accumulated text exceeded buffer_threshold, the consumer used to
+        edit on every 50ms loop because len(_accumulated) stayed above the
+        threshold forever.  After the first visible frame, edit_interval must be
+        the lower bound until finish/finalize arrives.
+        """
+        adapter = MagicMock()
+        adapter.send = AsyncMock(return_value=SimpleNamespace(
+            success=True, message_id="msg_1",
+        ))
+        adapter.edit_message = AsyncMock(return_value=SimpleNamespace(
+            success=True, message_id="msg_1",
+        ))
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            StreamConsumerConfig(edit_interval=999.0, buffer_threshold=5, cursor=" ▉"),
+        )
+        task = asyncio.create_task(consumer.run())
+
+        consumer.on_delta("hello")
+        for _ in range(50):
+            if adapter.send.await_count:
+                break
+            await asyncio.sleep(0.01)
+        assert adapter.send.await_count == 1
+
+        consumer.on_delta(" world" * 20)
+        await asyncio.sleep(0.2)
+        adapter.edit_message.assert_not_awaited()
+
+        consumer.finish()
+        await asyncio.wait_for(task, timeout=1.0)
+        assert adapter.edit_message.await_count == 1
+
+
+class TestFreshFinalPreviewRetention:
+    """Fresh-final must not delete user-visible assistant previews."""
+
+    @pytest.mark.asyncio
+    async def test_fresh_final_sends_new_message_without_deleting_preview(self):
+        """Regression for Telegram disappearing answers.
+
+        Fresh-final is allowed to send a completed answer as a new message so
+        the visible timestamp reflects completion time, but it must not delete
+        the old streamed preview. Deleting the preview makes the response the
+        user is reading vanish/reflow, which looks like Hermes erased its own
+        answer.
+        """
+        adapter = MagicMock()
+        adapter.send = AsyncMock(return_value=SimpleNamespace(
+            success=True, message_id="final_msg",
+        ))
+        adapter.delete_message = AsyncMock(return_value=True)
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            StreamConsumerConfig(fresh_final_after_seconds=1.0),
+        )
+        consumer._message_id = "preview_msg"
+        consumer._message_created_ts = 0.0
+        consumer._last_sent_text = "partial preview ▉"
+
+        delivered = await consumer._try_fresh_final("complete final answer")
+
+        assert delivered is True
+        adapter.send.assert_called_once()
+        adapter.delete_message.assert_not_called()
+        assert consumer.final_response_sent is True
+        assert consumer._message_id == "final_msg"
+
+
 class TestEditMessageFinalizeSignature:
     """Every concrete platform adapter must accept the ``finalize`` kwarg.
 
@@ -794,9 +876,13 @@ class TestSegmentBreakOnToolBoundary:
         )
 
     @pytest.mark.asyncio
-    async def test_fallback_final_deletes_partial_after_chunks_succeed(self):
-        """After fallback chunks land, the frozen partial must be deleted so
-        the user sees only the complete response (#16668)."""
+    async def test_fallback_final_keeps_partial_after_chunks_succeed(self):
+        """After fallback chunks land, keep the frozen partial visible.
+
+        The fallback path intentionally sends only the missing continuation
+        tail.  If we delete the partial after sending that tail, Telegram users
+        are left seeing only the final few words of the answer.
+        """
         adapter = MagicMock()
         adapter.send = AsyncMock(
             return_value=SimpleNamespace(success=True, message_id="msg_new"),
@@ -817,7 +903,7 @@ class TestSegmentBreakOnToolBoundary:
 
         await consumer._send_fallback_final("Working on it. Done!")
 
-        adapter.delete_message.assert_awaited_once_with("chat_123", "msg_partial")
+        adapter.delete_message.assert_not_awaited()
         assert consumer._final_response_sent is True
 
     @pytest.mark.asyncio

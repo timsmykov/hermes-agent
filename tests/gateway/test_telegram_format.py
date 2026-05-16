@@ -809,9 +809,58 @@ class TestEditMessageStreamingSafety:
         # Continuations were sent threaded as replies for visual grouping.
         assert adapter._bot.send_message.await_count == len(result.continuation_message_ids)
 
+    @pytest.mark.asyncio
+    async def test_finalize_overflow_reformats_existing_chain_not_only_last_chunk(self):
+        """Regression: mid-stream overflow chunks are plain text, but final
+        finalize must Markdown-format every visible chunk in the chain.
+        Previously the stream consumer kept only the last message id, so final
+        formatting touched the last chunk and earlier Telegram messages kept
+        raw **bold** / ## markers.
+        """
+        adapter = TelegramAdapter(PlatformConfig(enabled=True, token="fake-token"))
+        adapter.MAX_MESSAGE_LENGTH = 80
+        adapter._bot = MagicMock()
+        adapter._bot.edit_message_text = AsyncMock()
+        next_id = [456]
+
+        async def _fake_send(**kwargs):
+            next_id[0] += 1
+            return SimpleNamespace(message_id=next_id[0])
+
+        adapter._bot.send_message = AsyncMock(side_effect=_fake_send)
+        adapter._bot.delete_message = AsyncMock()
+
+        content = ("**bold** chunk content with enough words to overflow. " * 8).strip()
+
+        non_final = await adapter.edit_message("123", "456", content, finalize=False)
+        assert non_final.success is True
+        assert non_final.continuation_message_ids
+        first_chain_last = non_final.message_id
+
+        adapter._bot.edit_message_text.reset_mock()
+        adapter._bot.send_message.reset_mock()
+
+        final = await adapter.edit_message("123", first_chain_last, content, finalize=True)
+
+        assert final.success is True
+        assert final.raw_response["message_ids"][0] == "456"
+        # Every existing chunk is edited during finalization, not just the last id.
+        edited_ids = [str(call.kwargs["message_id"]) for call in adapter._bot.edit_message_text.await_args_list]
+        for mid in final.raw_response["message_ids"]:
+            assert str(mid) in edited_ids
+        # Final edits use Telegram MarkdownV2 parse mode, so visible raw ** markers
+        # are converted before delivery.
+        markdown_calls = [
+            call.kwargs for call in adapter._bot.edit_message_text.await_args_list
+            if call.kwargs.get("parse_mode") is not None
+        ]
+        assert markdown_calls
+        assert all("**" not in call["text"] for call in markdown_calls)
+        assert any("*bold*" in call["text"] for call in markdown_calls)
+
 # =========================================================================
 # Telegram guest mention gating
-# =========================================================================
+# ========================================================================= 
 
 
 def _guest_test_adapter(*, guest_mode=True, require_mention=True, allowed_chats=None):

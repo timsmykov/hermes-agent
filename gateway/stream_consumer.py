@@ -424,15 +424,29 @@ class GatewayStreamConsumer:
                     or commentary_text is not None
                 )
                 if not self.cfg.buffer_only:
-                    should_edit = should_edit or (
-                        (elapsed >= self._current_edit_interval
-                            and self._accumulated)
-                        # buffer_threshold is intentionally codepoint-based:
-                        # it's a debounce heuristic ("send updates roughly
-                        # every N visible characters"), not a platform-limit
-                        # check. _len_fn is reserved for overflow detection.
-                        or len(self._accumulated) >= self.cfg.buffer_threshold
-                    )
+                    # Treat edit_interval as a hard lower bound after the first
+                    # visible frame.  The previous check compared
+                    # len(_accumulated) against buffer_threshold on every loop;
+                    # once a response exceeded ~24 chars it stayed true forever,
+                    # causing Telegram edits every ~50ms and then Bot API flood
+                    # control.  Keep buffer_threshold only for the first frame
+                    # so the user sees streaming start quickly, then rate-limit
+                    # subsequent edits by elapsed time.
+                    if self._accumulated:
+                        visible_prefix = self._visible_prefix() if self._last_sent_text else ""
+                        has_new_visible = (
+                            not visible_prefix
+                            or not self._accumulated.startswith(visible_prefix)
+                            or len(self._accumulated) > len(visible_prefix)
+                        )
+                        first_visible_frame = not self._last_sent_text
+                        should_edit = should_edit or (
+                            first_visible_frame
+                            and len(self._accumulated) >= self.cfg.buffer_threshold
+                        ) or (
+                            elapsed >= self._current_edit_interval
+                            and has_new_visible
+                        )
 
                 current_update_visible = False
                 if should_edit and self._accumulated:
@@ -755,7 +769,6 @@ class GatewayStreamConsumer:
         safe_limit = max(500, raw_limit - 100)
         chunks = self._split_text_chunks(continuation, safe_limit, len_fn=_len_fn)
 
-        stale_message_id = self._message_id  # partial message to clean up
         last_message_id: Optional[str] = None
         last_successful_chunk = ""
         sent_any_chunk = False
@@ -803,21 +816,14 @@ class GatewayStreamConsumer:
             # so any stale tool-progress bubble gets closed off.
             self._notify_new_message()
 
-        # Remove the frozen partial message so the user only sees the
-        # complete fallback response.  Best-effort — if the platform doesn't
-        # implement ``delete_message``, the delete fails (flood control still
-        # active, bot lacks permission, message too old to delete), the
-        # partial remains but at least the full answer was delivered.
-        if stale_message_id and stale_message_id != last_message_id:
-            delete_fn = getattr(self.adapter, "delete_message", None)
-            if delete_fn is not None:
-                try:
-                    await delete_fn(self.chat_id, stale_message_id)
-                except Exception as e:
-                    logger.debug(
-                        "Fallback partial cleanup failed (%s): %s",
-                        stale_message_id, e,
-                    )
+        # Keep the frozen partial message visible.  The fallback path sends
+        # only the missing continuation tail (not the whole final answer) to
+        # avoid duplicating already-visible text.  Deleting the partial after
+        # the continuation lands leaves the user with only the tail — exactly
+        # the Telegram failure Tim reported where the answer collapsed down to
+        # the final few words.  Treat streamed previews as user-visible
+        # assistant content, not temporary progress/status bubbles; destructive
+        # cleanup belongs only to explicit progress cleanup in gateway.run.
 
         self._message_id = last_message_id
         self._already_sent = True
@@ -1017,40 +1023,44 @@ class GatewayStreamConsumer:
         return age >= threshold
 
     async def _try_fresh_final(self, text: str) -> bool:
-        """Send ``text`` as a brand-new message (best-effort delete the old
-        preview) so the platform's visible timestamp reflects completion
+        """Send ``text`` as a brand-new message while keeping the old
+        preview visible so the platform's timestamp reflects completion
         time.  Returns True on successful delivery, False on any failure so
         the caller falls back to the normal edit path.
 
         Ported from openclaw/openclaw#72038.
         """
-        old_message_id = self._message_id
         try:
+            meta = dict(self.metadata) if isinstance(self.metadata, dict) else {}
+            # Fresh-final is a UX optimization. It must not block the whole
+            # turn for Telegram Bot API RetryAfter values (observed 100s+ in
+            # production); if the fresh send would wait too long, fail fast and
+            # let the normal final-edit fallback complete the streamed answer.
+            meta.setdefault("_hermes_max_flood_retry_after", 5.0)
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=text,
-                metadata=self.metadata,
+                metadata=meta,
             )
         except Exception as e:
             logger.debug("Fresh-final send failed, falling back to edit: %s", e)
             return False
         if not getattr(result, "success", False):
             return False
-        # Successful fresh send — try to delete the stale preview so the
-        # user doesn't see the old edit-stuck message underneath.  Cleanup
-        # is best-effort; platforms that don't implement ``delete_message``
-        # just leave the preview behind (still an acceptable outcome —
-        # the visible final timestamp is the important part).
-        if old_message_id and old_message_id != "__no_edit__":
-            delete_fn = getattr(self.adapter, "delete_message", None)
-            if delete_fn is not None:
-                try:
-                    await delete_fn(self.chat_id, old_message_id)
-                except Exception as e:
-                    logger.debug(
-                        "Fresh-final preview cleanup failed (%s): %s",
-                        old_message_id, e,
-                    )
+        # Successful fresh send: keep the old preview visible.
+        #
+        # We used to best-effort delete the old preview here so the chat
+        # only showed the fresh final message.  In Telegram, however, that
+        # makes the response the user was reading disappear/reflow as soon as
+        # the final send lands — and if the fresh final is delayed by flood
+        # control or appears lower in the topic, it looks exactly like Hermes
+        # erased its answer.  Fresh-final is a timestamp/UX optimization, not
+        # a destructive cleanup path, so prefer a harmless duplicate/stale
+        # preview over deleting user-visible assistant content.
+        #
+        # Temporary tool/status bubbles still use the explicit
+        # cleanup_progress path in gateway.run; this guard only applies to
+        # assistant response previews.
         # Adopt the new message id as the current message so subsequent
         # callers (e.g. overflow split loops, finalize retries) see a
         # consistent state.

@@ -1231,6 +1231,8 @@ class GatewayRunner:
         self._draining = False
         self._restart_requested = False
         self._restart_task_started = False
+        self._agent_restart_state_path = _hermes_home / ".agent_restart_state.json"
+        self._agent_restart_max_consecutive = 3
         self._restart_detached = False
         self._restart_via_service = False
         self._stop_task: Optional[asyncio.Task] = None
@@ -1740,6 +1742,15 @@ class GatewayRunner:
         if source.platform != Platform.TELEGRAM or source.chat_type != "dm":
             return False
         if not self._telegram_topic_mode_enabled(source):
+            return False
+        tid = str(source.thread_id or "")
+        if not tid or tid in self._TELEGRAM_GENERAL_TOPIC_IDS:
+            return False
+        return True
+
+    def _is_telegram_dm_topic_thread(self, source: SessionSource) -> bool:
+        """True when Telegram delivered a real private-chat topic thread id."""
+        if source.platform != Platform.TELEGRAM or source.chat_type != "dm":
             return False
         tid = str(source.thread_id or "")
         if not tid or tid in self._TELEGRAM_GENERAL_TOPIC_IDS:
@@ -2361,8 +2372,13 @@ class GatewayRunner:
         *,
         source: Optional[SessionSource] = None,
         session_key: Optional[str] = None,
+        model: Optional[str] = None,
     ) -> dict | None:
-        """Resolve reasoning effort for a session, honoring session overrides."""
+        """Resolve reasoning effort for a session, honoring session overrides.
+
+        Per-model defaults are applied only when neither session nor global
+        settings provide an explicit reasoning config.
+        """
         resolved_session_key = session_key
         if not resolved_session_key and source is not None:
             try:
@@ -2373,7 +2389,16 @@ class GatewayRunner:
         overrides = getattr(self, "_session_reasoning_overrides", {}) or {}
         if resolved_session_key and resolved_session_key in overrides:
             return overrides[resolved_session_key]
-        return self._load_reasoning_config()
+
+        resolved_reasoning = self._load_reasoning_config()
+        if resolved_reasoning is not None:
+            return resolved_reasoning
+
+        normalized_model = (model or "").strip().lower()
+        if normalized_model == "gpt-5.3-codex-spark":
+            return {"enabled": True, "effort": "high"}
+
+        return resolved_reasoning
 
     def _set_session_reasoning_override(
         self,
@@ -2452,6 +2477,8 @@ class GatewayRunner:
             return "queue"
         if mode == "steer":
             return "steer"
+        if mode in {"ask", "prompt", "choose", "choice"}:
+            return "ask"
         return "interrupt"
 
     @staticmethod
@@ -2563,6 +2590,161 @@ class GatewayRunner:
             return
         merge_pending_message_event(adapter._pending_messages, session_key, event)
 
+    def _busy_status_detail(self, running_agent: Any, session_key: str, *, now: Optional[float] = None) -> str:
+        """Return compact status detail for busy-input prompts/acks."""
+        status_parts: List[str] = []
+        now = time.time() if now is None else now
+        if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
+            try:
+                summary = running_agent.get_activity_summary()
+                api_calls = summary.get("api_call_count")
+                max_iterations = summary.get("max_iterations")
+                if api_calls is not None and max_iterations:
+                    status_parts.append(f"{api_calls}/{max_iterations}")
+                current_tool = summary.get("current_tool")
+                start_ts = self._running_agents_ts.get(session_key, 0)
+                if start_ts:
+                    elapsed_min = int((now - start_ts) / 60)
+                    if elapsed_min > 0:
+                        status_parts.append(f"{elapsed_min} min elapsed")
+                if current_tool:
+                    status_parts.append(f"running: {current_tool}")
+            except Exception:
+                pass
+        return f" ({', '.join(status_parts)})" if status_parts else ""
+
+    async def _route_busy_input(
+        self,
+        event: MessageEvent,
+        session_key: str,
+        mode: str,
+        *,
+        send_ack: bool = True,
+    ) -> bool:
+        """Apply queue/steer/interrupt semantics for input received during a busy session."""
+        adapter = self.adapters.get(event.source.platform)
+        if not adapter:
+            return False
+
+        # If the user responds to a Telegram busy-choice prompt after the
+        # original run already finished, dispatch the message normally instead
+        # of parking it in a pending slot that no active task will drain.
+        if session_key not in getattr(adapter, "_active_sessions", {}) and session_key not in self._running_agents:
+            await adapter.handle_message(event)
+            return True
+
+        running_agent = self._running_agents.get(session_key)
+        effective_mode = mode if mode in {"queue", "steer", "interrupt"} else "interrupt"
+        steered = False
+        if effective_mode == "steer":
+            steer_text = (event.text or "").strip()
+            can_steer = (
+                steer_text
+                and running_agent is not None
+                and running_agent is not _AGENT_PENDING_SENTINEL
+                and hasattr(running_agent, "steer")
+            )
+            if can_steer:
+                try:
+                    steered = bool(running_agent.steer(steer_text))
+                except Exception as exc:
+                    logger.warning("Gateway steer failed for session %s: %s", session_key, exc)
+                    steered = False
+            if not steered:
+                effective_mode = "queue"
+
+        if not steered:
+            merge_pending_message_event(adapter._pending_messages, session_key, event)
+
+        is_queue_mode = effective_mode == "queue"
+        is_steer_mode = effective_mode == "steer"
+
+        if effective_mode == "interrupt" and running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
+            try:
+                running_agent.interrupt(event.text)
+            except Exception:
+                pass
+
+        if not send_ack:
+            return True
+
+        busy_ack_enabled = os.environ.get("HERMES_GATEWAY_BUSY_ACK_ENABLED", "true").lower() == "true"
+        if not busy_ack_enabled:
+            logger.debug("Busy ack suppressed for session %s", session_key)
+            return True
+
+        _BUSY_ACK_COOLDOWN = 30
+        now = time.time()
+        last_ack = self._busy_ack_ts.get(session_key, 0)
+        if now - last_ack < _BUSY_ACK_COOLDOWN:
+            return True
+        self._busy_ack_ts[session_key] = now
+
+        status_detail = self._busy_status_detail(running_agent, session_key, now=now)
+        if is_steer_mode:
+            message = (
+                f"⏩ Steered into current run{status_detail}. "
+                f"Your message arrives after the next tool call."
+            )
+        elif is_queue_mode:
+            message = (
+                f"⏳ Queued for the next turn{status_detail}. "
+                f"I'll respond once the current task finishes."
+            )
+        else:
+            message = (
+                f"⚡ Interrupting current task{status_detail}. "
+                f"I'll respond to your message shortly."
+            )
+
+        try:
+            from agent.onboarding import (
+                BUSY_INPUT_FLAG,
+                busy_input_hint_gateway,
+                is_seen,
+                mark_seen,
+            )
+            _user_cfg = _load_gateway_config()
+            if not is_seen(_user_cfg, BUSY_INPUT_FLAG):
+                if is_steer_mode:
+                    _hint_mode = "steer"
+                elif is_queue_mode:
+                    _hint_mode = "queue"
+                else:
+                    _hint_mode = "interrupt"
+                message = (
+                    f"{message}\n\n"
+                    f"{busy_input_hint_gateway(_hint_mode)}"
+                )
+                mark_seen(_hermes_home / "config.yaml", BUSY_INPUT_FLAG)
+        except Exception as _onb_err:
+            logger.debug("Failed to apply busy-input onboarding hint: %s", _onb_err)
+
+        reply_anchor = self._reply_anchor_for_event(event)
+        thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
+        try:
+            await adapter._send_with_retry(
+                chat_id=event.source.chat_id,
+                content=message,
+                reply_to=(
+                    reply_anchor
+                    if event.source.platform == Platform.TELEGRAM
+                    and event.source.chat_type == "dm"
+                    and event.source.thread_id
+                    else (None if event.source.platform == Platform.TELEGRAM and event.source.thread_id else event.message_id)
+                ),
+                metadata=thread_meta,
+            )
+        except Exception as e:
+            logger.debug("Failed to send busy-ack: %s", e)
+
+        return True
+
+    async def _handle_busy_choice(self, event: MessageEvent, session_key: str, choice: str) -> bool:
+        """Route a Telegram busy-choice callback into queue/steer semantics."""
+        mode = "steer" if choice == "steer" else "queue"
+        return await self._route_busy_input(event, session_key, mode, send_ack=False)
+
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
         # --- Authorization gate (#17775) ---
         # The cold path (_handle_message) checks _is_user_authorized before
@@ -2614,151 +2796,23 @@ class GatewayRunner:
             return False  # let default path handle it
 
         running_agent = self._running_agents.get(session_key)
-
-        # Steer mode: inject mid-run via running_agent.steer() instead of
-        # queueing + interrupting.  If the agent isn't running yet
-        # (sentinel) or lacks steer(), or the payload is empty, fall back
-        # to queue semantics so nothing is lost.
-        effective_mode = self._busy_input_mode
-        steered = False
-        if effective_mode == "steer":
-            steer_text = (event.text or "").strip()
-            can_steer = (
-                steer_text
-                and running_agent is not None
-                and running_agent is not _AGENT_PENDING_SENTINEL
-                and hasattr(running_agent, "steer")
-            )
-            if can_steer:
-                try:
-                    steered = bool(running_agent.steer(steer_text))
-                except Exception as exc:
-                    logger.warning("Gateway steer failed for session %s: %s", session_key, exc)
-                    steered = False
-            if not steered:
-                # Fall back to queue (merge into pending messages, no interrupt)
-                effective_mode = "queue"
-
-        # Store the message so it's processed as the next turn after the
-        # current run finishes (or is interrupted).  Skip this for a
-        # successful steer — the text already landed inside the run and
-        # must NOT also be replayed as a next-turn user message.
-        if not steered:
-            merge_pending_message_event(adapter._pending_messages, session_key, event)
-
-        is_queue_mode = effective_mode == "queue"
-        is_steer_mode = effective_mode == "steer"
-
-        # If not in queue/steer mode, interrupt the running agent immediately.
-        # This aborts in-flight tool calls and causes the agent loop to exit
-        # at the next check point.
-        if effective_mode == "interrupt" and running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
+        platform_value = getattr(event.source.platform, "value", event.source.platform)
+        if self._busy_input_mode == "ask" and platform_value == Platform.TELEGRAM.value:
             try:
-                running_agent.interrupt(event.text)
-            except Exception:
-                pass  # don't let interrupt failure block the ack
-
-        # Check if busy ack is disabled — skip sending but still process the input.
-        # Placed before debounce so we don't stamp a "last ack" timestamp that was
-        # never actually delivered.
-        busy_ack_enabled = os.environ.get("HERMES_GATEWAY_BUSY_ACK_ENABLED", "true").lower() == "true"
-        if not busy_ack_enabled:
-            logger.debug("Busy ack suppressed for session %s", session_key)
-            return True  # input still processed, just no ack sent
-
-        # Debounce: only send an acknowledgment once every 30 seconds per session
-        # to avoid spamming the user when they send multiple messages quickly
-        _BUSY_ACK_COOLDOWN = 30
-        now = time.time()
-        last_ack = self._busy_ack_ts.get(session_key, 0)
-        if now - last_ack < _BUSY_ACK_COOLDOWN:
-            return True  # interrupt sent (if not queue), ack already delivered recently
-
-        self._busy_ack_ts[session_key] = now
-
-        # Build a status-rich acknowledgment
-        status_parts = []
-        if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
-            try:
-                summary = running_agent.get_activity_summary()
-                iteration = summary.get("api_call_count", 0)
-                max_iter = summary.get("max_iterations", 0)
-                current_tool = summary.get("current_tool")
-                start_ts = self._running_agents_ts.get(session_key, 0)
-                if start_ts:
-                    elapsed_min = int((now - start_ts) / 60)
-                    if elapsed_min > 0:
-                        status_parts.append(f"{elapsed_min} min elapsed")
-                if max_iter:
-                    status_parts.append(f"iteration {iteration}/{max_iter}")
-                if current_tool:
-                    status_parts.append(f"running: {current_tool}")
-            except Exception:
-                pass
-
-        status_detail = f" ({', '.join(status_parts)})" if status_parts else ""
-        if is_steer_mode:
-            message = (
-                f"⏩ Steered into current run{status_detail}. "
-                f"Your message arrives after the next tool call."
-            )
-        elif is_queue_mode:
-            message = (
-                f"⏳ Queued for the next turn{status_detail}. "
-                f"I'll respond once the current task finishes."
-            )
-        else:
-            message = (
-                f"⚡ Interrupting current task{status_detail}. "
-                f"I'll respond to your message shortly."
-            )
-
-        # First-touch onboarding: the very first time a user sends a message
-        # while the agent is busy, append a one-time hint explaining the
-        # queue/interrupt knob.  Flag is persisted to config.yaml so it never
-        # fires again on this install.
-        try:
-            from agent.onboarding import (
-                BUSY_INPUT_FLAG,
-                busy_input_hint_gateway,
-                is_seen,
-                mark_seen,
-            )
-            _user_cfg = _load_gateway_config()
-            if not is_seen(_user_cfg, BUSY_INPUT_FLAG):
-                if is_steer_mode:
-                    _hint_mode = "steer"
-                elif is_queue_mode:
-                    _hint_mode = "queue"
-                else:
-                    _hint_mode = "interrupt"
-                message = (
-                    f"{message}\n\n"
-                    f"{busy_input_hint_gateway(_hint_mode)}"
+                result = await adapter.send_busy_choice_prompt(
+                    event,
+                    session_key,
+                    status_detail=self._busy_status_detail(running_agent, session_key),
                 )
-                mark_seen(_hermes_home / "config.yaml", BUSY_INPUT_FLAG)
-        except Exception as _onb_err:
-            logger.debug("Failed to apply busy-input onboarding hint: %s", _onb_err)
+                if result.success:
+                    return True
+                logger.debug("Busy-choice prompt failed for session %s: %s", session_key, result.error)
+            except Exception as exc:
+                logger.debug("Busy-choice prompt failed for session %s: %s", session_key, exc)
+            # Prompt failed; fall back to interrupt so the input is not lost.
+            return await self._route_busy_input(event, session_key, "interrupt", send_ack=True)
 
-        reply_anchor = self._reply_anchor_for_event(event)
-        thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
-        try:
-            await adapter._send_with_retry(
-                chat_id=event.source.chat_id,
-                content=message,
-                reply_to=(
-                    reply_anchor
-                    if event.source.platform == Platform.TELEGRAM
-                    and event.source.chat_type == "dm"
-                    and event.source.thread_id
-                    else (None if event.source.platform == Platform.TELEGRAM and event.source.thread_id else event.message_id)
-                ),
-                metadata=thread_meta,
-            )
-        except Exception as e:
-            logger.debug("Failed to send busy-ack: %s", e)
-
-        return True
+        return await self._route_busy_input(event, session_key, self._busy_input_mode, send_ack=True)
 
     async def _drain_active_agents(self, timeout: float) -> tuple[Dict[str, Any], bool]:
         snapshot = self._snapshot_running_agents()
@@ -2799,6 +2853,36 @@ class GatewayRunner:
                 logger.debug("Interrupted running agent for session %s during shutdown", session_key)
             except Exception as e:
                 logger.debug("Failed interrupting agent during shutdown: %s", e)
+
+    def _mark_resume_pending_for_agents(self, agents: Dict[str, Any], reason: str) -> set[str]:
+        """Persist recovery markers for active agents before gateway teardown.
+
+        A self-update or self-patch often restarts the gateway from inside the
+        running agent.  If the service manager kills the process mid-drain, the
+        old "mark only after drain timeout" path never executes.  Marking before
+        drain gives the next gateway process a durable recovery handle; sessions
+        that finish cleanly during drain are unmarked below.
+        """
+        marked: set[str] = set()
+        for session_key, agent in list((agents or {}).items()):
+            if agent is _AGENT_PENDING_SENTINEL:
+                continue
+            try:
+                if self.session_store.mark_resume_pending(session_key, reason):
+                    marked.add(session_key)
+            except Exception as exc:
+                logger.debug("mark_resume_pending failed for %s: %s", session_key, exc)
+        return marked
+
+    def _clear_resume_pending_for_finished_agents(self, marked_keys: set[str]) -> None:
+        """Undo proactive recovery markers for runs that drained cleanly."""
+        for session_key in list(marked_keys or set()):
+            if session_key in self._running_agents:
+                continue
+            try:
+                self.session_store.clear_resume_pending(session_key)
+            except Exception as exc:
+                logger.debug("clear_resume_pending failed for %s: %s", session_key, exc)
 
     async def _notify_active_sessions_of_shutdown(self) -> None:
         """Send shutdown/restart notifications to active chats and home channels.
@@ -3212,10 +3296,162 @@ class GatewayRunner:
             await asyncio.sleep(0.05)
             await self.stop(restart=True, detached_restart=detached, service_restart=via_service)
 
-        task = asyncio.create_task(_run_restart())
-        self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+
+        def _schedule_on_loop(loop: asyncio.AbstractEventLoop) -> None:
+            task = loop.create_task(_run_restart())
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+
+        if running_loop is not None:
+            _schedule_on_loop(running_loop)
+        elif self._gateway_loop is not None and self._gateway_loop.is_running():
+            self._gateway_loop.call_soon_threadsafe(_schedule_on_loop, self._gateway_loop)
+        else:
+            self._restart_task_started = False
+            return False
         return True
+
+    def request_agent_restart(
+        self,
+        *,
+        session_key: Optional[str],
+        reason: str,
+        resume_current_task: bool = True,
+        cooldown_seconds: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Internal agent-facing restart gate used by the gateway_restart tool.
+
+        This deliberately does not parse assistant text as a slash command.  It
+        applies loop guards, marks the active session for restart recovery, sends
+        a short user-visible status, then reuses the normal service restart path.
+        """
+        session_key = (session_key or "").strip()
+        reason = (reason or "agent requested gateway restart").strip()[:500]
+        cooldown = int(cooldown_seconds if cooldown_seconds is not None else 300)
+        cooldown = max(60, min(cooldown, 3600))
+        now = time.time()
+
+        if self._restart_requested or self._draining:
+            return {"success": False, "error": "gateway restart is already in progress"}
+        if not session_key:
+            return {"success": False, "error": "gateway session key is unavailable"}
+        if session_key not in self._running_agents:
+            return {"success": False, "error": "self-restart is only allowed from an active gateway agent session"}
+
+        try:
+            from tools.approval import has_blocking_approval
+            approval_live = has_blocking_approval(session_key)
+        except Exception:
+            approval_live = False
+        if approval_live or session_key in getattr(self, "_pending_approvals", {}):
+            return {"success": False, "error": "restart refused while human approval is pending"}
+
+        state: Dict[str, Any] = {}
+        try:
+            if self._agent_restart_state_path.exists():
+                state = json.loads(self._agent_restart_state_path.read_text() or "{}")
+        except Exception:
+            state = {}
+        last_at = float(state.get("last_requested_at") or 0)
+        consecutive = int(state.get("consecutive") or 0)
+        if last_at and now - last_at < cooldown:
+            wait = int(cooldown - (now - last_at))
+            return {"success": False, "error": f"restart cooldown active; retry in {wait}s"}
+        if consecutive >= self._agent_restart_max_consecutive:
+            return {
+                "success": False,
+                "error": f"restart-loop guard tripped after {consecutive} consecutive agent restarts",
+            }
+
+        source = self._session_sources.get(session_key)
+        if source is None:
+            try:
+                with self.session_store._lock:  # noqa: SLF001 - existing in-file pattern
+                    self.session_store._ensure_loaded_locked()  # noqa: SLF001
+                    entry = self.session_store._entries.get(session_key)  # noqa: SLF001
+                    source = entry.origin if entry is not None else None
+            except Exception:
+                source = None
+        if source is None:
+            return {"success": False, "error": "could not resolve source for restart notification"}
+
+        marked = False
+        if resume_current_task:
+            try:
+                marked = self.session_store.mark_resume_pending(session_key, "restart_timeout")
+            except Exception as exc:
+                logger.debug("agent self-restart mark_resume_pending failed for %s: %s", session_key, exc)
+        if resume_current_task and not marked:
+            return {"success": False, "error": "could not mark current session for restart resume"}
+
+        try:
+            atomic_json_write(
+                self._agent_restart_state_path,
+                {
+                    "last_requested_at": now,
+                    "consecutive": consecutive + 1,
+                    "session_key": session_key,
+                    "reason": reason,
+                },
+                indent=None,
+            )
+        except Exception as exc:
+            logger.debug("failed to persist agent restart state: %s", exc)
+
+        try:
+            notify_data = {
+                "platform": source.platform.value if source.platform else None,
+                "chat_id": source.chat_id,
+            }
+            if source.thread_id:
+                notify_data["thread_id"] = source.thread_id
+            atomic_json_write(_hermes_home / ".restart_notify.json", notify_data, indent=None)
+        except Exception as exc:
+            logger.debug("Failed to write restart notify file: %s", exc)
+
+        async def _notify_and_restart() -> None:
+            adapter = self.adapters.get(source.platform)
+            if adapter is not None:
+                try:
+                    await adapter.send(
+                        source.chat_id,
+                        f"♻️ Делаю restart Hermes: {reason}\nПродолжу задачу автоматически после запуска.",
+                        metadata=self._thread_metadata_for_source(source),
+                    )
+                except Exception as exc:
+                    logger.debug("agent restart pre-notify failed: %s", exc)
+            if resume_current_task:
+                running_agent = self._running_agents.get(session_key)
+                if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
+                    try:
+                        running_agent.interrupt("gateway restart requested by agent; resume after restart")
+                    except Exception:
+                        pass
+                self._invalidate_session_run_generation(session_key, reason="agent_self_restart")
+            under_service = bool(os.environ.get("INVOCATION_ID"))
+            self.request_restart(detached=not under_service, via_service=under_service)
+
+        def _schedule(loop: asyncio.AbstractEventLoop) -> None:
+            task = loop.create_task(_notify_and_restart())
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+
+        if self._gateway_loop is not None and self._gateway_loop.is_running():
+            self._gateway_loop.call_soon_threadsafe(_schedule, self._gateway_loop)
+        else:
+            return {"success": False, "error": "gateway event loop is not available"}
+
+        return {
+            "success": True,
+            "status": "restart_scheduled",
+            "resume_current_task": bool(resume_current_task),
+            "session_key": session_key,
+            "reason": reason,
+        }
 
     # Drain-timeout reasons set by _stop_impl() when a still-running turn is
     # force-interrupted; "restart_interrupted" is set by
@@ -3576,6 +3812,8 @@ class GatewayRunner:
             adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
             adapter.set_session_store(self.session_store)
             adapter.set_busy_session_handler(self._handle_active_session_busy_message)
+            if hasattr(adapter, "set_busy_choice_handler"):
+                adapter.set_busy_choice_handler(self._handle_busy_choice)
             
             # Try to connect
             logger.info("Connecting to %s...", platform.value)
@@ -4873,6 +5111,8 @@ class GatewayRunner:
                     adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
                     adapter.set_session_store(self.session_store)
                     adapter.set_busy_session_handler(self._handle_active_session_busy_message)
+                    if hasattr(adapter, "set_busy_choice_handler"):
+                        adapter.set_busy_choice_handler(self._handle_busy_choice)
 
                     success = await self._connect_adapter_with_timeout(adapter, platform)
                     if success:
@@ -5024,8 +5264,18 @@ class GatewayRunner:
             )
 
             timeout = self._restart_drain_timeout
+            active_agents = self._snapshot_running_agents()
+            _resume_reason = (
+                "restart_interrupted" if self._restart_requested else "shutdown_timeout"
+            )
+            _proactive_resume_marks = self._mark_resume_pending_for_agents(
+                active_agents,
+                _resume_reason,
+            )
             _drain_started_at = time.monotonic()
-            active_agents, timed_out = await self._drain_active_agents(timeout)
+            _drain_snapshot, timed_out = await self._drain_active_agents(timeout)
+            if _drain_snapshot:
+                active_agents = _drain_snapshot
             logger.info(
                 "Shutdown phase: drain done at +%.2fs (drain took %.2fs, "
                 "timed_out=%s, active_at_start=%d, active_now=%d)",
@@ -5035,6 +5285,7 @@ class GatewayRunner:
                 len(active_agents),
                 self._running_agent_count(),
             )
+            self._clear_resume_pending_for_finished_agents(_proactive_resume_marks)
             if timed_out:
                 logger.warning(
                     "Gateway drain timed out after %.1fs with %d active agent(s); interrupting remaining work.",
@@ -7781,6 +8032,11 @@ class GatewayRunner:
             if session_key and _should_clear_resume_pending_after_turn(agent_result):
                 self._clear_restart_failure_count(session_key)
                 try:
+                    if getattr(self, "_agent_restart_state_path", None) is not None:
+                        self._agent_restart_state_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                try:
                     self.session_store.clear_resume_pending(session_key)
                 except Exception as _e:
                     logger.debug(
@@ -8360,6 +8616,12 @@ class GatewayRunner:
             if sanitized:
                 try:
                     self._session_db.set_session_title(new_entry.session_id, sanitized)
+                    if self._is_telegram_dm_topic_thread(source):
+                        await self._rename_telegram_topic_for_session_title(
+                            source,
+                            new_entry.session_id,
+                            sanitized,
+                        )
                     header = t("gateway.reset.header_titled", title=sanitized)
                 except ValueError as e:
                     _title_note = t("gateway.reset.title_error_untitled", error=str(e))
@@ -9610,6 +9872,10 @@ class GatewayRunner:
             message_type=MessageType.TEXT,
             source=source,
             raw_message=event.raw_message,
+            message_id=event.message_id,
+            reply_to_message_id=event.reply_to_message_id,
+            reply_to_text=event.reply_to_text,
+            auto_skill=event.auto_skill,
             channel_prompt=event.channel_prompt,
         )
         
@@ -10627,7 +10893,7 @@ class GatewayRunner:
 
             pr = self._provider_routing
             max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
-            reasoning_config = self._resolve_session_reasoning_config(source=source)
+            reasoning_config = self._resolve_session_reasoning_config(source=source, model=model)
             self._reasoning_config = reasoning_config
             self._service_tier = self._load_service_tier()
             turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
@@ -11308,15 +11574,36 @@ class GatewayRunner:
             logger.debug("Failed to send Telegram topic setup image", exc_info=True)
 
     def _sanitize_telegram_topic_title(self, title: str) -> str:
-        """Return a Bot API-safe forum topic name from a generated session title."""
+        """Return a compact Bot API-safe forum topic name.
+
+        Telegram's topic list only shows a very small title budget. Keep the
+        full auto-generated title in Hermes state, but rename the visible
+        Telegram topic to two information-bearing words.
+        """
         cleaned = re.sub(r"\s+", " ", str(title or "")).strip()
         if not cleaned:
             return "Hermes Chat"
-        # Telegram forum topic names are short (currently 1-128 chars). Keep
-        # extra room for multi-byte titles and avoid trailing ellipsis churn.
-        if len(cleaned) > 120:
-            cleaned = cleaned[:117].rstrip() + "..."
-        return cleaned
+        stopwords = {
+            "a", "an", "and", "for", "from", "how", "in", "of", "on", "or",
+            "the", "to", "with", "why",
+            "а", "без", "в", "во", "для", "до", "и", "из", "к", "как",
+            "мне", "на", "надо", "необходимо", "нужно", "о", "об", "от",
+            "по", "про", "с", "со", "что",
+            "аудит", "баг", "задача", "исправление", "настройка",
+            "проверка", "просмотр", "работа", "работы", "разбор",
+        }
+        words = re.findall(r"[0-9A-Za-zА-Яа-яЁё][0-9A-Za-zА-Яа-яЁё._+-]*", cleaned)
+        candidates = [
+            word.strip("._+-")
+            for word in words
+            if word.strip("._+-") and word.strip("._+-").lower() not in stopwords
+        ]
+        selected = candidates[:2] or [word.strip("._+-") for word in words[:2] if word.strip("._+-")]
+        topic_name = " ".join(selected).strip() or cleaned
+        max_chars = 28
+        if len(topic_name) > max_chars:
+            topic_name = topic_name[: max_chars - 3].rstrip(" ._-") + "..."
+        return topic_name
 
     async def _rename_telegram_topic_for_session_title(
         self,
@@ -11325,7 +11612,7 @@ class GatewayRunner:
         title: str,
     ) -> None:
         """Best-effort rename of a Telegram DM topic when Hermes auto-titles a session."""
-        if not self._is_telegram_topic_lane(source) or not source.chat_id or not source.thread_id:
+        if not self._is_telegram_dm_topic_thread(source) or not source.chat_id or not source.thread_id:
             return
 
         # Skip rename when the topic is operator-declared via
@@ -11368,6 +11655,13 @@ class GatewayRunner:
             return
         topic_name = self._sanitize_telegram_topic_title(title)
         try:
+            from agent.title_generator import generate_topic_title
+            generated_topic_name = await asyncio.to_thread(generate_topic_title, title)
+            if generated_topic_name:
+                topic_name = generated_topic_name
+        except Exception:
+            logger.debug("Failed to generate LLM Telegram topic title; using fallback", exc_info=True)
+        try:
             rename_topic = getattr(adapter, "rename_dm_topic", None)
             if rename_topic is not None:
                 await rename_topic(
@@ -11405,7 +11699,7 @@ class GatewayRunner:
         title: str,
     ) -> None:
         """Schedule a topic rename from the auto-title background thread."""
-        if not title or not self._is_telegram_topic_lane(source):
+        if not title or not self._is_telegram_dm_topic_thread(source):
             return
         try:
             loop = asyncio.get_running_loop()
@@ -11737,6 +12031,12 @@ class GatewayRunner:
             # Set the title
             try:
                 if self._session_db.set_session_title(session_id, sanitized):
+                    if self._is_telegram_dm_topic_thread(source):
+                        await self._rename_telegram_topic_for_session_title(
+                            source,
+                            session_id,
+                            sanitized,
+                        )
                     return t("gateway.title.set_to", title=sanitized)
                 else:
                     return t("gateway.title.not_found")
@@ -11919,11 +12219,36 @@ class GatewayRunner:
         return t(key, title=branch_title, count=msg_count, parent=parent_session_id, new=new_session_id)
 
     def _resolve_account_usage_context(self, event: MessageEvent, agent: Any = None) -> tuple[Optional[str], Optional[str], Optional[str]]:
-        """Resolve provider/base_url/api_key for selected model/account limits."""
+        """Resolve provider/base_url/api_key for selected model/account limits.
+
+        ``/limits`` is often run before the first model-backed message in a
+        fresh gateway session.  In that state there is no live/cached agent and
+        no persisted billing row yet, but the selected provider is still known
+        from the session override or global config.  Resolve in that order so
+        the command behaves like a standalone account/quota command instead of
+        requiring a prior chat turn.
+        """
         source = event.source
         provider = getattr(agent, "provider", None) if agent and agent is not _AGENT_PENDING_SENTINEL else None
         base_url = getattr(agent, "base_url", None) if agent and agent is not _AGENT_PENDING_SENTINEL else None
         api_key = getattr(agent, "api_key", None) if agent and agent is not _AGENT_PENDING_SENTINEL else None
+
+        # Session-scoped /model override, if present, is the user's current
+        # selection even before an AIAgent has been constructed for this chat.
+        session_key = None
+        try:
+            session_key = self._session_key_for_source(source)
+        except Exception:
+            session_key = None
+        override = None
+        if session_key:
+            override = (getattr(self, "_session_model_overrides", None) or {}).get(session_key)
+        if isinstance(override, dict):
+            provider = provider or override.get("provider")
+            base_url = base_url or override.get("base_url")
+            api_key = api_key or override.get("api_key")
+
+        # Persisted billing metadata from the most recent successful turn.
         if not provider and getattr(self, "_session_db", None) is not None:
             try:
                 _entry_for_billing = self.session_store.get_or_create_session(source)
@@ -11932,6 +12257,53 @@ class GatewayRunner:
                 persisted = {}
             provider = provider or persisted.get("billing_provider")
             base_url = base_url or persisted.get("billing_base_url")
+
+        # Global selected provider from config.yaml.  This is the important
+        # fresh-session fallback for Telegram: /limits should work immediately
+        # after restart/reset, before the first model-backed response.
+        if not provider:
+            try:
+                config = _load_gateway_config()
+                model_cfg = config.get("model", {}) if isinstance(config, dict) else {}
+                if isinstance(model_cfg, dict):
+                    provider = provider or model_cfg.get("provider")
+                    base_url = base_url or model_cfg.get("base_url")
+                    api_key = api_key or model_cfg.get("api_key")
+                # Legacy/root-level fallback, matching CLI config loading.
+                provider = provider or config.get("provider")
+                base_url = base_url or config.get("base_url")
+                api_key = api_key or config.get("api_key")
+            except Exception:
+                pass
+
+        # Last resort: ask the runtime resolver.  This handles env-selected
+        # providers and OAuth-backed defaults when config only says "auto".
+        if not provider or str(provider).strip().lower() in {"auto", "custom"}:
+            try:
+                runtime_kwargs = _resolve_runtime_agent_kwargs()
+                provider = runtime_kwargs.get("provider") or provider
+                base_url = base_url or runtime_kwargs.get("base_url")
+                api_key = api_key or runtime_kwargs.get("api_key")
+            except Exception:
+                pass
+
+        # Absolute last resort for Codex OAuth installs.  Some gateway paths can
+        # reach /limits before a model turn and before runtime resolution has a
+        # selected provider in memory.  If this profile/root has a Codex auth
+        # result file, still make the command useful instead of telling the user
+        # to send a chat message first.
+        if not provider:
+            try:
+                codex_auth_paths = (
+                    _hermes_home / "hermes-openai-codex-auth-result.json",
+                    _hermes_home.parent.parent / "hermes-openai-codex-auth-result.json",
+                )
+                if any(path.exists() for path in codex_auth_paths):
+                    provider = "openai-codex"
+                    base_url = base_url or "https://chatgpt.com/backend-api/codex"
+            except Exception:
+                pass
+
         return provider, base_url, api_key
 
     def _resolve_current_agent_for_event(self, event: MessageEvent) -> Any:
@@ -11953,7 +12325,8 @@ class GatewayRunner:
         agent = self._resolve_current_agent_for_event(event)
         provider, base_url, api_key = self._resolve_account_usage_context(event, agent)
         if not provider:
-            return "No selected provider found for this session yet. Send one model-backed message first, then run /limits."
+            provider = "openai-codex"
+            base_url = base_url or "https://chatgpt.com/backend-api/codex"
         try:
             account_snapshot = await asyncio.to_thread(
                 fetch_account_usage,
@@ -15184,6 +15557,7 @@ class GatewayRunner:
             reasoning_config = self._resolve_session_reasoning_config(
                 source=source,
                 session_key=session_key,
+                model=model,
             )
             self._reasoning_config = reasoning_config
             self._service_tier = self._load_service_tier()
@@ -15914,7 +16288,10 @@ class GatewayRunner:
                             "api_mode": getattr(agent, "api_mode", None),
                         } if agent else None,
                     }
-                    if self._is_telegram_topic_lane(source):
+                    # Telegram can deliver private-chat topic threads even when
+                    # Hermes' optional /topic lobby mode was never enabled. Still
+                    # rename those visible Telegram chats after auto-title.
+                    if self._is_telegram_dm_topic_thread(source):
                         maybe_auto_title_kwargs["title_callback"] = lambda title: self._schedule_telegram_topic_title_rename(
                             source,
                             effective_session_id,
@@ -16070,12 +16447,13 @@ class GatewayRunner:
                 if _agent_ref and hasattr(_agent_ref, "get_activity_summary"):
                     try:
                         _a = _agent_ref.get_activity_summary()
-                        _parts = [f"iteration {_a['api_call_count']}/{_a['max_iterations']}"]
+                        _parts = []
                         if _a.get("current_tool"):
                             _parts.append(f"running: {_a['current_tool']}")
-                        else:
+                        elif _a.get("last_activity_desc"):
                             _parts.append(_a.get("last_activity_desc", ""))
-                        _status_detail = " — " + ", ".join(_parts)
+                        if _parts:
+                            _status_detail = " — " + ", ".join(_parts)
                     except Exception:
                         pass
                 try:

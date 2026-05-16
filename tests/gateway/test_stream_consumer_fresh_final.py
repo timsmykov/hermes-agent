@@ -3,9 +3,9 @@
 Ported from openclaw/openclaw#72038.  When a streamed preview has been
 visible long enough that the platform's edit timestamp would be
 noticeably stale by completion time, the stream consumer delivers the
-final reply as a brand-new message and best-effort deletes the old
-preview.  This makes Telegram's visible timestamp reflect completion
-time instead of first-token time.
+final reply as a brand-new message while keeping the old preview visible.
+This makes Telegram's visible timestamp reflect completion time instead of
+first-token time without making the streamed answer disappear/reflow.
 """
 
 from __future__ import annotations
@@ -93,8 +93,9 @@ class TestFreshFinalForLongLivedPreviews:
         # Fresh send happened; no edit of the old preview.
         assert adapter.send.call_count == 2
         adapter.edit_message.assert_not_called()
-        # The old preview was deleted as cleanup.
-        adapter.delete_message.assert_awaited_once_with("chat", "initial_preview")
+        # The old preview remains visible; fresh-final is a timestamp/UX
+        # optimization, not destructive cleanup.
+        adapter.delete_message.assert_not_awaited()
         # State was updated to the new message id.
         assert consumer._message_id == "fresh_final"
         assert consumer._final_response_sent is True
@@ -136,8 +137,11 @@ class TestFreshFinalForLongLivedPreviews:
         await consumer._send_or_edit("hello")
         consumer._message_created_ts = 0.0
         ok = await consumer._send_or_edit("hello world", finalize=True)
-        # Fresh send was attempted and failed → edit happened instead.
+        # Fresh send was attempted with a short flood-control cap and failed →
+        # edit happened instead.
         assert adapter.send.call_count == 2
+        fresh_kwargs = adapter.send.call_args_list[1].kwargs
+        assert fresh_kwargs["metadata"]["_hermes_max_flood_retry_after"] == 5.0
         adapter.edit_message.assert_called_once()
         assert ok is True
 

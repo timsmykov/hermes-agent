@@ -437,6 +437,16 @@ class TelegramAdapter(BasePlatformAdapter):
         # Clarify button state: clarify_id → session_key (for the clarify tool's
         # multiple-choice prompts; see GatewayRunner clarify_callback wiring).
         self._clarify_state: Dict[str, str] = {}
+        # Busy-choice prompt state: choice_id → {event, session_key, created_at}.
+        # Used when display.busy_input_mode=ask and Telegram asks whether an
+        # active-session follow-up should be queued or steered into the current run.
+        self._busy_choice_state: Dict[str, Dict[str, Any]] = {}
+        # Overflow edit chains: (chat_id, any_visible_message_id) → [message_ids].
+        # Telegram streams long answers by editing/sending multiple messages once
+        # a reply crosses 4096 UTF-16 units. Mid-stream chunks are intentionally
+        # plain text; on finalize we need to re-edit every previously delivered
+        # chunk with MarkdownV2, not only the last visible message.
+        self._overflow_split_chains: Dict[tuple[str, str], list[str]] = {}
         # Notification mode for message sends.
         # "important" — only final responses, approvals, and slash confirmations
         #               trigger notifications; tool progress, streaming, status
@@ -598,6 +608,18 @@ class TelegramAdapter(BasePlatformAdapter):
         return "thread not found" in str(error).lower()
 
     @staticmethod
+    def _is_dm_topic_reply_fallback(metadata: Optional[Dict[str, Any]]) -> bool:
+        """Return True for Telegram private-topic sends that must fail closed.
+
+        For Bot API DM-topic lanes we intentionally send with both
+        ``message_thread_id`` and a reply anchor. If either becomes invalid,
+        retrying without the topic routes the message into the root/main chat,
+        which is worse than a failed delivery because it leaks the response into
+        the wrong visible Telegram topic.
+        """
+        return bool(metadata and metadata.get("telegram_dm_topic_reply_fallback"))
+
+    @staticmethod
     def _is_bad_request_error(error: Exception) -> bool:
         name = error.__class__.__name__.lower()
         if name == "badrequest" or name.endswith("badrequest"):
@@ -616,7 +638,7 @@ class TelegramAdapter(BasePlatformAdapter):
         reply_to_message_id: Optional[int],
     ) -> bool:
         return (
-            bool(metadata and metadata.get("telegram_dm_topic_reply_fallback"))
+            cls._is_dm_topic_reply_fallback(metadata)
             and reply_to_message_id is not None
             and cls._is_bad_request_error(error)
             and "message to be replied not found" in str(error).lower()
@@ -1527,6 +1549,12 @@ class TelegramAdapter(BasePlatformAdapter):
             
             message_ids = []
             thread_id = self._metadata_thread_id(metadata)
+            max_flood_retry_after = None
+            if isinstance(metadata, dict) and metadata.get("_hermes_max_flood_retry_after") is not None:
+                try:
+                    max_flood_retry_after = float(metadata.get("_hermes_max_flood_retry_after"))
+                except (TypeError, ValueError):
+                    max_flood_retry_after = None
             
             try:
                 from telegram.error import NetworkError as _NetErr
@@ -1600,9 +1628,19 @@ class TelegramAdapter(BasePlatformAdapter):
                         # specific cases instead of blindly retrying.
                         if _BadReq and isinstance(send_err, _BadReq):
                             if self._is_thread_not_found_error(send_err) and effective_thread_id is not None:
-                                # Thread doesn't exist — retry without
-                                # message_thread_id so the message still
-                                # reaches the chat.
+                                if self._is_dm_topic_reply_fallback(metadata):
+                                    logger.error(
+                                        "[%s] Thread %s not found for Telegram DM topic fallback; "
+                                        "refusing retry without message_thread_id to avoid wrong-topic delivery",
+                                        self.name,
+                                        effective_thread_id,
+                                    )
+                                    raise
+                                # Thread doesn't exist for a forum/group topic —
+                                # retry without message_thread_id so the message
+                                # still reaches the chat. Private DM topic sends
+                                # fail closed above because dropping the thread
+                                # leaks into the root/all-messages lane.
                                 logger.warning(
                                     "[%s] Thread %s not found, retrying without message_thread_id",
                                     self.name, effective_thread_id,
@@ -1612,26 +1650,34 @@ class TelegramAdapter(BasePlatformAdapter):
                                 continue
                             err_lower = str(send_err).lower()
                             if "message to be replied not found" in err_lower and reply_to_id is not None:
-                                # Original message was deleted before we
-                                # could reply. For private-topic fallback
-                                # sends, message_thread_id is only valid with
-                                # the reply anchor, so drop both together.
+                                # Original message was deleted before we could reply.
+                                # For Telegram DM-topic fallback, the reply anchor is
+                                # what safely identifies the visible topic lane; retry
+                                # once without both reply and topic ids so Telegram does
+                                # not keep rejecting stale anchors.
+                                if self._is_dm_topic_reply_fallback(metadata):
+                                    logger.warning(
+                                        "[%s] Reply target deleted for Telegram DM topic fallback, "
+                                        "retrying without reply/topic anchor: %s",
+                                        self.name,
+                                        send_err,
+                                    )
+                                    reply_to_id = None
+                                    thread_kwargs = {}
+                                    effective_thread_id = None
+                                    continue
                                 logger.warning(
                                     "[%s] Reply target deleted, retrying without reply_to: %s",
                                     self.name, send_err,
                                 )
                                 reply_to_id = None
-                                if metadata and metadata.get("telegram_dm_topic_reply_fallback"):
-                                    thread_kwargs = {}
-                                    effective_thread_id = None
-                                else:
-                                    thread_kwargs = self._thread_kwargs_for_send(
-                                        chat_id,
-                                        thread_id,
-                                        metadata,
-                                        reply_to_message_id=reply_to_id,
-                                    )
-                                    effective_thread_id = thread_kwargs.get("message_thread_id")
+                                thread_kwargs = self._thread_kwargs_for_send(
+                                    chat_id,
+                                    thread_id,
+                                    metadata,
+                                    reply_to_message_id=reply_to_id,
+                                )
+                                effective_thread_id = thread_kwargs.get("message_thread_id")
                                 continue
                             # Other BadRequest errors are permanent — don't retry
                             raise
@@ -1652,6 +1698,18 @@ class TelegramAdapter(BasePlatformAdapter):
                         if retry_after is not None or "retry after" in str(send_err).lower():
                             if _send_attempt < 2:
                                 wait = float(retry_after) if retry_after is not None else 1.0
+                                if max_flood_retry_after is not None and wait > max_flood_retry_after:
+                                    logger.info(
+                                        "[%s] Telegram flood control on send exceeds cap %.1fs (retry_after=%.1fs); failing fast",
+                                        self.name,
+                                        max_flood_retry_after,
+                                        wait,
+                                    )
+                                    return SendResult(
+                                        success=False,
+                                        error=f"flood_control:{wait}",
+                                        retryable=False,
+                                    )
                                 logger.warning(
                                     "[%s] Telegram flood control on send (attempt %d/3), retrying in %.1fs: %s",
                                     self.name,
@@ -1794,6 +1852,30 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             return SendResult(success=False, error=str(e))
 
+    def _overflow_chain_for(self, chat_id: str, message_id: str) -> list[str]:
+        """Return the known overflow message chain for ``message_id``."""
+        chains = getattr(self, "_overflow_split_chains", None)
+        if chains is None:
+            self._overflow_split_chains = {}
+            chains = self._overflow_split_chains
+        key = (str(chat_id), str(message_id))
+        chain = chains.get(key)
+        if chain:
+            return list(chain)
+        return [str(message_id)]
+
+    def _remember_overflow_chain(self, chat_id: str, chain: list[str]) -> None:
+        """Index an overflow chain by every visible message id in it."""
+        if not chain:
+            return
+        chains = getattr(self, "_overflow_split_chains", None)
+        if chains is None:
+            self._overflow_split_chains = {}
+            chains = self._overflow_split_chains
+        normalized = [str(mid) for mid in chain if str(mid)]
+        for mid in normalized:
+            chains[(str(chat_id), mid)] = normalized
+
     async def _edit_overflow_split(
         self,
         chat_id: str,
@@ -1802,137 +1884,148 @@ class TelegramAdapter(BasePlatformAdapter):
         *,
         finalize: bool,
     ) -> SendResult:
-        """Split an oversized edit across the existing message + continuations.
+        """Split an oversized edit across an existing overflow message chain.
 
-        Edit the original ``message_id`` with chunk 1 (with the platform's
-        usual ``(1/N)`` suffix preserved), then send the remaining chunks as
-        new messages threaded as replies to the previous chunk so the user
-        sees them grouped.  Returns ``SendResult(success=True,
-        message_id=<last-chunk-id>, continuation_message_ids=(...))`` so the
-        stream consumer can keep editing the most recent visible message
-        and the gateway has full visibility into every message id we put on
-        screen.
-
-        Falls back to ``SendResult(success=False)`` only if even the first-
-        chunk edit fails — that's a real adapter problem, not an overflow.
+        Mid-stream overflow chunks are sent as plain text because partial
+        Markdown is often syntactically incomplete.  Once ``finalize=True`` we
+        re-edit *every* previously delivered chunk with MarkdownV2.  This avoids
+        the Telegram UX bug where only the last chunk got the final formatting
+        pass while earlier chunks stayed raw with visible ``**``/``##`` markers.
         """
-        chunks = self.truncate_message(
-            content, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len,
-        )
+        if finalize:
+            # Match send(): format the complete answer first, then split the
+            # Telegram-ready MarkdownV2 payload.  Splitting raw Markdown first
+            # can cut through emphasis/link syntax and leave individual chunks
+            # unparsable or visually raw.
+            formatted = self.format_message(content)
+            chunks = self.truncate_message(
+                formatted, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len,
+            )
+            if len(chunks) > 1:
+                chunks = [
+                    re.sub(r" \((\d+)/(\d+)\)$", r" \\(\1/\2\\)", chunk)
+                    for chunk in chunks
+                ]
+        else:
+            chunks = self.truncate_message(
+                content, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len,
+            )
         if len(chunks) <= 1:
-            # Defensive: shouldn't happen given the caller's pre-flight, but
-            # if truncate_message returned a single chunk just edit normally.
-            chunks = [content]
+            chunks = [chunks[0] if chunks else content]
 
-        # Step 1 — edit the existing message with the first chunk.
-        first_chunk = chunks[0]
-        try:
-            if finalize:
-                # Use format_message + parse_mode for the final chunk;
-                # mirror edit_message's main happy-path.
-                formatted = self.format_message(first_chunk)
-                try:
-                    await self._bot.edit_message_text(
-                        chat_id=int(chat_id),
-                        message_id=int(message_id),
-                        text=formatted,
-                        parse_mode=ParseMode.MARKDOWN_V2,
-                    )
-                except Exception as fmt_err:
-                    if "not modified" not in str(fmt_err).lower():
+        existing_chain = self._overflow_chain_for(chat_id, message_id)
+        visible_chain: list[str] = []
+        prev_id: Optional[str] = None
+
+        async def _edit_one(target_id: str, text: str) -> bool:
+            try:
+                if finalize:
+                    try:
                         await self._bot.edit_message_text(
                             chat_id=int(chat_id),
-                            message_id=int(message_id),
-                            text=first_chunk,
+                            message_id=int(target_id),
+                            text=text,
+                            parse_mode=ParseMode.MARKDOWN_V2,
                         )
-            else:
-                await self._bot.edit_message_text(
-                    chat_id=int(chat_id),
-                    message_id=int(message_id),
-                    text=first_chunk,
-                )
-        except Exception as e:
-            err_str = str(e).lower()
-            if "not modified" in err_str:
-                # First chunk identical to current text — fall through to
-                # send continuations.
-                pass
-            else:
+                    except Exception as fmt_err:
+                        if "not modified" in str(fmt_err).lower():
+                            return True
+                        await self._bot.edit_message_text(
+                            chat_id=int(chat_id),
+                            message_id=int(target_id),
+                            text=_strip_mdv2(text),
+                        )
+                else:
+                    await self._bot.edit_message_text(
+                        chat_id=int(chat_id),
+                        message_id=int(target_id),
+                        text=text,
+                    )
+                return True
+            except Exception as e:
+                if "not modified" in str(e).lower():
+                    return True
                 logger.error(
-                    "[%s] Overflow split: first-chunk edit failed: %s",
-                    self.name, e, exc_info=True,
+                    "[%s] Overflow split: edit failed for chunk %s: %s",
+                    self.name, target_id, e, exc_info=True,
                 )
-                return SendResult(success=False, error=str(e))
+                return False
 
-        # Step 2 — send each remaining chunk as a continuation message,
-        # threaded as a reply to the previous so the user sees them as a
-        # contiguous block.  We call self._bot.send_message directly so the
-        # continuation skips ``self.send``'s own pre-chunking pass (chunks
-        # are already correctly sized).  Best-effort MarkdownV2 with plain
-        # fallback, mirroring send().
-        continuation_ids: list[str] = []
-        prev_id = message_id
-        for chunk in chunks[1:]:
-            sent_msg = None
+        async def _send_one(text: str, reply_to_id: Optional[str]):
             for use_markdown in (True, False) if finalize else (False,):
                 try:
-                    text = self.format_message(chunk) if use_markdown else chunk
-                    sent_msg = await self._bot.send_message(
+                    sent = await self._bot.send_message(
                         chat_id=int(chat_id),
-                        text=text,
+                        text=text if use_markdown else (_strip_mdv2(text) if finalize else text),
                         parse_mode=ParseMode.MARKDOWN_V2 if use_markdown else None,
-                        reply_to_message_id=int(prev_id) if prev_id else None,
+                        reply_to_message_id=int(reply_to_id) if reply_to_id else None,
                     )
-                    break
+                    return sent
                 except Exception as send_err:
-                    if "reply message not found" in str(send_err).lower():
-                        # Drop the reply anchor and try again.
-                        try:
-                            sent_msg = await self._bot.send_message(
-                                chat_id=int(chat_id),
-                                text=chunk,
-                            )
-                            break
-                        except Exception as _retry_err:
-                            logger.warning(
-                                "[%s] Overflow continuation no-reply retry failed: %s",
-                                self.name, _retry_err,
-                            )
-                            sent_msg = None
-                            break
+                    err_lower = str(send_err).lower()
+                    if "reply message not found" in err_lower and reply_to_id is not None:
+                        reply_to_id = None
+                        continue
                     if use_markdown:
-                        # try plain text on next loop iteration
                         continue
                     logger.warning(
                         "[%s] Overflow continuation send failed: %s",
                         self.name, send_err,
                     )
-                    sent_msg = None
-                    break
-            if sent_msg is None:
-                # Continuation failed — the user has chunk 1 + however many
-                # continuations succeeded.  Report success with what we got
-                # so the stream consumer knows the edit landed; the
-                # remaining tail is lost on this attempt and the next
-                # streaming tick may retry.
-                logger.warning(
-                    "[%s] Overflow split: stopped at %d/%d chunks delivered",
-                    self.name, 1 + len(continuation_ids), len(chunks),
-                )
-                break
-            new_id = str(getattr(sent_msg, "message_id", "")) or prev_id
-            continuation_ids.append(new_id)
-            prev_id = new_id
+                    return None
+            return None
 
-        last_id = continuation_ids[-1] if continuation_ids else message_id
+        # Reuse/edit existing visible messages first, then append only if the
+        # finalized response needs more chunks than the current chain contains.
+        for idx, chunk in enumerate(chunks):
+            if idx < len(existing_chain):
+                target_id = existing_chain[idx]
+                ok = await _edit_one(target_id, chunk)
+                if not ok:
+                    if idx == 0:
+                        return SendResult(success=False, error="overflow_first_chunk_edit_failed")
+                    break
+                visible_chain.append(str(target_id))
+                prev_id = str(target_id)
+            else:
+                sent_msg = await _send_one(chunk, prev_id)
+                if sent_msg is None:
+                    logger.warning(
+                        "[%s] Overflow split: stopped at %d/%d chunks delivered",
+                        self.name, len(visible_chain), len(chunks),
+                    )
+                    break
+                new_id = str(getattr(sent_msg, "message_id", "")) or (prev_id or str(message_id))
+                visible_chain.append(new_id)
+                prev_id = new_id
+
+        # If the new/final payload is shorter than a previous overflow chain,
+        # remove stale tail messages best-effort so raw old chunks do not remain
+        # below the finalized answer.
+        for stale_id in existing_chain[len(visible_chain):]:
+            try:
+                await self._bot.delete_message(chat_id=int(chat_id), message_id=int(stale_id))
+            except Exception:
+                logger.debug(
+                    "[%s] Overflow split: stale chunk delete failed for %s",
+                    self.name, stale_id, exc_info=True,
+                )
+
+        if not visible_chain:
+            return SendResult(success=False, error="overflow_no_chunks_delivered")
+
+        self._remember_overflow_chain(chat_id, visible_chain)
+        last_id = visible_chain[-1]
+        continuation_ids = tuple(visible_chain[1:])
         logger.debug(
-            "[%s] Overflow split delivered %d chunks; last_id=%s",
-            self.name, 1 + len(continuation_ids), last_id,
+            "[%s] Overflow split delivered/finalized %d chunks; last_id=%s",
+            self.name, len(visible_chain), last_id,
         )
         return SendResult(
             success=True,
             message_id=last_id,
-            continuation_message_ids=tuple(continuation_ids),
+            continuation_message_ids=continuation_ids,
+            raw_response={"message_ids": visible_chain},
         )
 
     async def delete_message(self, chat_id: str, message_id: str) -> bool:
@@ -2032,19 +2125,18 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=str(e))
 
     async def _send_message_with_thread_fallback(self, **kwargs):
-        """Send a Telegram message, retrying once without message_thread_id
-        if Telegram returns 'Message thread not found'.
+        """Send a Telegram control message with safe stale-thread fallback.
 
-        Used for control-style sends (approval prompts, model picker,
-        update prompts) that can carry a stale thread_id from a DM
-        reply chain.  The streaming send loop has its own equivalent
-        (PR #3390) at the body of ``send``; this helper applies the
-        same retry pattern to the non-streaming control paths.
+        Forum/group topics may retry without ``message_thread_id`` if Telegram
+        says the thread is gone. Private DM-topic fallback sends must fail
+        closed instead; dropping the thread routes the message into the root
+        chat/all-messages lane.
         """
         if not self._bot:
             raise RuntimeError("Not connected")
 
         message_thread_id = kwargs.get("message_thread_id")
+        metadata = kwargs.pop("_hermes_metadata", None)
         try:
             return await self._bot.send_message(**kwargs)
         except Exception as send_err:
@@ -2053,6 +2145,14 @@ class TelegramAdapter(BasePlatformAdapter):
                 and self._is_bad_request_error(send_err)
                 and self._is_thread_not_found_error(send_err)
             ):
+                if self._is_dm_topic_reply_fallback(metadata):
+                    logger.error(
+                        "[%s] Thread %s not found for Telegram DM topic control message; "
+                        "refusing retry without message_thread_id to avoid wrong-topic delivery",
+                        self.name,
+                        message_thread_id,
+                    )
+                    raise
                 logger.warning(
                     "[%s] Thread %s not found for control message, retrying without message_thread_id",
                     self.name,
@@ -2099,6 +2199,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     reply_to_message_id=reply_to_id,
                 ),
                 **self._link_preview_kwargs(),
+                _hermes_metadata=metadata,
             )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
@@ -2157,6 +2258,7 @@ class TelegramAdapter(BasePlatformAdapter):
             }
             reply_to_id = self._reply_to_message_id_for_send(None, metadata)
             kwargs["reply_to_message_id"] = reply_to_id
+            kwargs["_hermes_metadata"] = metadata
             kwargs.update(
                 self._thread_kwargs_for_send(
                     chat_id,
@@ -2174,6 +2276,76 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
             logger.warning("[%s] send_exec_approval failed: %s", self.name, e)
+            return SendResult(success=False, error=str(e))
+
+    async def send_busy_choice_prompt(
+        self,
+        event: MessageEvent,
+        session_key: str,
+        *,
+        status_detail: str = "",
+    ) -> SendResult:
+        """Send a Telegram inline prompt asking whether to queue or steer busy input."""
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+
+        try:
+            choice_id = os.urandom(6).hex()
+            preview = (event.text or "").strip()
+            if not preview and event.media_urls:
+                preview = "[media message]"
+            if len(preview) > 700:
+                preview = preview[:700] + "…"
+            escaped_preview = _html.escape(preview) if preview else "—"
+            detail = f"\n{_html.escape(status_detail.strip(' ()'))}" if status_detail else ""
+            text = (
+                "Агент сейчас активен. Что сделать с новым сообщением?"
+                f"{detail}\n\n"
+                f"<blockquote>{escaped_preview}</blockquote>"
+            )
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("⏳ В очередь", callback_data=f"bc:q:{choice_id}"),
+                    InlineKeyboardButton("⏩ Прямо сейчас", callback_data=f"bc:s:{choice_id}"),
+                ]
+            ])
+
+            reply_anchor = getattr(event, "message_id", None)
+            metadata = {
+                "thread_id": event.source.thread_id,
+                "notify": True,
+            }
+            if event.source.thread_id and event.source.chat_type == "dm" and reply_anchor:
+                metadata["telegram_dm_topic_reply_fallback"] = True
+                metadata["telegram_reply_to_message_id"] = str(reply_anchor)
+            thread_id = self._metadata_thread_id(metadata)
+            reply_to_id = self._reply_to_message_id_for_send(reply_anchor, metadata)
+            kwargs: Dict[str, Any] = {
+                "chat_id": int(event.source.chat_id),
+                "text": text,
+                "parse_mode": ParseMode.HTML,
+                "reply_markup": keyboard,
+                "reply_to_message_id": reply_to_id,
+                **self._thread_kwargs_for_send(
+                    event.source.chat_id,
+                    thread_id,
+                    metadata,
+                    reply_to_message_id=reply_to_id,
+                ),
+                **self._link_preview_kwargs(),
+                **self._notification_kwargs(metadata),
+                "_hermes_metadata": metadata,
+            }
+            msg = await self._send_message_with_thread_fallback(**kwargs)
+            self._busy_choice_state[choice_id] = {
+                "event": event,
+                "session_key": session_key,
+                "created_at": asyncio.get_running_loop().time(),
+                "prompt_message_id": str(msg.message_id),
+            }
+            return SendResult(success=True, message_id=str(msg.message_id))
+        except Exception as e:
+            logger.warning("[%s] send_busy_choice_prompt failed: %s", self.name, e)
             return SendResult(success=False, error=str(e))
 
     async def send_slash_confirm(
@@ -2209,6 +2381,7 @@ class TelegramAdapter(BasePlatformAdapter):
             }
             reply_to_id = self._reply_to_message_id_for_send(None, metadata)
             kwargs["reply_to_message_id"] = reply_to_id
+            kwargs["_hermes_metadata"] = metadata
             kwargs.update(
                 self._thread_kwargs_for_send(
                     chat_id,
@@ -2365,6 +2538,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     reply_to_message_id=reply_to_id,
                 ),
                 **self._link_preview_kwargs(),
+                _hermes_metadata=metadata,
             )
 
             # Store picker state keyed by chat_id
@@ -2625,8 +2799,74 @@ class TelegramAdapter(BasePlatformAdapter):
         query_thread_id = getattr(query_message, "message_thread_id", None)
         query_user_name = getattr(query.from_user, "first_name", None)
 
+        # --- Busy input choice callbacks (bc:q|s:choice_id) ---
+        if data.startswith("bc:"):
+            parts = data.split(":", 2)
+            if len(parts) != 3 or parts[1] not in {"q", "s"}:
+                await query.answer(text="Invalid busy-input choice.")
+                return
+            choice = "queue" if parts[1] == "q" else "steer"
+            choice_id = parts[2]
+
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ You are not authorized to route this message.")
+                return
+
+            state = self._busy_choice_state.pop(choice_id, None)
+            if not state:
+                await query.answer(text="This prompt has already been resolved.")
+                return
+
+            event = state.get("event")
+            session_key = state.get("session_key")
+            handler = getattr(self, "_busy_choice_handler", None)
+            if event is None or not session_key or handler is None:
+                await query.answer(text="Busy-input prompt expired.")
+                return
+
+            # Remove the inline prompt after the user chooses.  If deletion is
+            # not allowed (old message / permissions), at least remove buttons.
+            try:
+                if query.message:
+                    await query.message.delete()
+            except Exception:
+                try:
+                    await query.edit_message_reply_markup(reply_markup=None)
+                except Exception:
+                    pass
+
+            try:
+                handled = await handler(event, session_key, choice)
+            except Exception as exc:
+                logger.error("[%s] busy-choice callback failed: %s", self.name, exc, exc_info=True)
+                await query.answer(text="Failed to route the message.")
+                return
+
+            if handled:
+                await query.answer(text="Queued." if choice == "queue" else "Steered.")
+            else:
+                await query.answer(text="Could not route the message.")
+            return
+
         # --- Model picker callbacks ---
         if data.startswith(("mp:", "mm:", "mb", "mx", "mg:")):
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ You are not authorized to change models.")
+                return
             chat_id = str(query.message.chat_id) if query.message else None
             if chat_id:
                 await self._handle_model_picker_callback(query, data, chat_id)
