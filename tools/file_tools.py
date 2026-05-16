@@ -17,6 +17,7 @@ from tools.file_operations import (
 )
 from tools import file_state
 from agent.redact import redact_sensitive_text
+from tools.exfiltration_guard import is_sensitive_path, sensitive_path_block_message
 
 logger = logging.getLogger(__name__)
 
@@ -461,6 +462,13 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
             })
 
         _resolved = _resolve_path_for_task(path, task_id)
+
+        # ── Prompt-injection exfiltration guard ────────────────────────
+        # Web pages, PDFs, issues, screenshots, etc. are untrusted content.
+        # If they trick the model into reading credential paths, do not rely
+        # only on redaction after the fact — block before the file is opened.
+        if is_sensitive_path(path) or is_sensitive_path(_resolved):
+            return json.dumps({"error": sensitive_path_block_message(path)}, ensure_ascii=False)
 
         # ── Binary file guard ─────────────────────────────────────────
         # Block binary files by extension (no I/O).
