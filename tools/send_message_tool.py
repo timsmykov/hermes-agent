@@ -16,6 +16,7 @@ from email.utils import formatdate
 from typing import Dict, Optional
 
 from agent.redact import redact_sensitive_text
+from tools.exfiltration_guard import egress_block_message, message_contains_unredacted_secret
 
 logger = logging.getLogger(__name__)
 
@@ -172,6 +173,8 @@ def _handle_send(args):
     message = args.get("message", "")
     if not target or not message:
         return tool_error("Both 'target' and 'message' are required when action='send'")
+    if message_contains_unredacted_secret(message):
+        return tool_error(egress_block_message("send_message payload"))
 
     parts = target.split(":", 1)
     platform_name = parts[0].strip().lower()
