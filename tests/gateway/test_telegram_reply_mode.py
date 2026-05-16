@@ -10,6 +10,7 @@ import sys
 from unittest.mock import MagicMock, AsyncMock, patch
 
 import pytest
+from telegram.error import BadRequest
 
 from gateway.config import PlatformConfig, GatewayConfig, Platform, _apply_env_overrides, load_gateway_config
 
@@ -182,6 +183,77 @@ class TestSendWithReplyToMode:
         calls = adapter._bot.send_message.call_args_list
         assert len(calls) == 1
         assert calls[0].kwargs.get("reply_to_message_id") == 999
+
+
+class TestDmTopicFailClosed:
+    """Regression tests: Telegram DM topic fallback must not leak to root chat."""
+
+    @pytest.mark.asyncio
+    async def test_dm_topic_thread_not_found_fails_closed(self, adapter_factory):
+        adapter = adapter_factory(reply_to_mode="first")
+        adapter._bot = MagicMock()
+        adapter._bot.send_message = AsyncMock(side_effect=BadRequest("Message thread not found"))
+        adapter.truncate_message = lambda content, max_len, **kw: ["single chunk"]
+
+        result = await adapter.send(
+            "12345",
+            "test",
+            metadata={
+                "thread_id": "461780",
+                "telegram_dm_topic_reply_fallback": True,
+                "telegram_reply_to_message_id": "999",
+            },
+        )
+
+        assert result.success is False
+        assert adapter._bot.send_message.call_count == 1
+        kwargs = adapter._bot.send_message.call_args.kwargs
+        assert kwargs.get("message_thread_id") == 461780
+        assert kwargs.get("reply_to_message_id") == 999
+
+    @pytest.mark.asyncio
+    async def test_dm_topic_deleted_reply_anchor_fails_closed(self, adapter_factory):
+        adapter = adapter_factory(reply_to_mode="first")
+        adapter._bot = MagicMock()
+        adapter._bot.send_message = AsyncMock(side_effect=BadRequest("Message to be replied not found"))
+        adapter.truncate_message = lambda content, max_len, **kw: ["single chunk"]
+
+        result = await adapter.send(
+            "12345",
+            "test",
+            metadata={
+                "thread_id": "461780",
+                "telegram_dm_topic_reply_fallback": True,
+                "telegram_reply_to_message_id": "999",
+            },
+        )
+
+        assert result.success is False
+        assert adapter._bot.send_message.call_count == 1
+        kwargs = adapter._bot.send_message.call_args.kwargs
+        assert kwargs.get("message_thread_id") == 461780
+        assert kwargs.get("reply_to_message_id") == 999
+
+    @pytest.mark.asyncio
+    async def test_control_dm_topic_thread_not_found_fails_closed(self, adapter_factory):
+        adapter = adapter_factory(reply_to_mode="first")
+        adapter._bot = MagicMock()
+        adapter._bot.send_message = AsyncMock(side_effect=BadRequest("Message thread not found"))
+
+        with pytest.raises(BadRequest):
+            await adapter._send_message_with_thread_fallback(
+                chat_id=12345,
+                text="control",
+                message_thread_id=461780,
+                reply_to_message_id=999,
+                _hermes_metadata={
+                    "thread_id": "461780",
+                    "telegram_dm_topic_reply_fallback": True,
+                    "telegram_reply_to_message_id": "999",
+                },
+            )
+
+        assert adapter._bot.send_message.call_count == 1
 
 
 class TestConfigSerialization:

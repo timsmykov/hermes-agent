@@ -227,6 +227,132 @@ class TestUsageAccountSection:
         assert "📊 **Session Token Usage**" not in result
 
     @pytest.mark.asyncio
+    async def test_limits_command_uses_config_provider_before_first_model_turn(self, monkeypatch):
+        runner = _make_runner(SK)
+        runner._session_db = None
+        event = MagicMock()
+        event.source = MagicMock()
+
+        calls = {}
+
+        async def _fake_to_thread(fn, *args, **kwargs):
+            calls["args"] = args
+            calls["kwargs"] = kwargs
+            return fn(*args, **kwargs)
+
+        monkeypatch.setattr("gateway.run.asyncio.to_thread", _fake_to_thread)
+        monkeypatch.setattr(
+            "gateway.run._load_gateway_config",
+            lambda: {
+                "model": {
+                    "provider": "openai-codex",
+                    "base_url": "https://chatgpt.com/backend-api/codex",
+                }
+            },
+        )
+        monkeypatch.setattr(
+            "gateway.run.fetch_account_usage",
+            lambda provider, base_url=None, api_key=None: object(),
+        )
+        monkeypatch.setattr(
+            "gateway.run.render_account_usage_lines",
+            lambda snapshot, markdown=False: [
+                "📈 **Model limits**",
+                "Provider: openai-codex (Pro)",
+            ],
+        )
+
+        result = await runner._handle_limits_command(event)
+
+        assert calls["args"] == ("openai-codex",)
+        assert calls["kwargs"]["base_url"] == "https://chatgpt.com/backend-api/codex"
+        assert "No selected provider" not in result
+        assert "📈 **Model limits**" in result
+
+    @pytest.mark.asyncio
+    async def test_limits_command_falls_back_to_codex_auth_without_runtime_provider(self, monkeypatch, tmp_path):
+        runner = _make_runner(SK)
+        runner._session_db = None
+        event = MagicMock()
+        event.source = MagicMock()
+
+        codex_home = tmp_path / "orchestrator"
+        codex_home.mkdir()
+        (codex_home / "hermes-openai-codex-auth-result.json").write_text("{}")
+
+        calls = {}
+
+        async def _fake_to_thread(fn, *args, **kwargs):
+            calls["args"] = args
+            calls["kwargs"] = kwargs
+            return fn(*args, **kwargs)
+
+        monkeypatch.setattr("gateway.run._hermes_home", codex_home)
+        monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {})
+        monkeypatch.setattr(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            lambda: (_ for _ in ()).throw(RuntimeError("no runtime provider")),
+        )
+        monkeypatch.setattr("gateway.run.asyncio.to_thread", _fake_to_thread)
+        monkeypatch.setattr(
+            "gateway.run.fetch_account_usage",
+            lambda provider, base_url=None, api_key=None: object(),
+        )
+        monkeypatch.setattr(
+            "gateway.run.render_account_usage_lines",
+            lambda snapshot, markdown=False: [
+                "📈 **Model limits**",
+                "Provider: openai-codex (Pro)",
+            ],
+        )
+
+        result = await runner._handle_limits_command(event)
+
+        assert calls["args"] == ("openai-codex",)
+        assert calls["kwargs"]["base_url"] == "https://chatgpt.com/backend-api/codex"
+        assert "No selected provider" not in result
+        assert "model-backed message" not in result
+        assert "📈 **Model limits**" in result
+
+    @pytest.mark.asyncio
+    async def test_limits_command_never_requires_prior_model_turn_when_resolution_fails(self, monkeypatch):
+        runner = _make_runner(SK)
+        runner._session_db = None
+        event = MagicMock()
+        event.source = MagicMock()
+
+        calls = {}
+
+        async def _fake_to_thread(fn, *args, **kwargs):
+            calls["args"] = args
+            calls["kwargs"] = kwargs
+            return fn(*args, **kwargs)
+
+        monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {})
+        monkeypatch.setattr(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            lambda: (_ for _ in ()).throw(RuntimeError("no runtime provider")),
+        )
+        monkeypatch.setattr("gateway.run.asyncio.to_thread", _fake_to_thread)
+        monkeypatch.setattr(
+            "gateway.run.fetch_account_usage",
+            lambda provider, base_url=None, api_key=None: object(),
+        )
+        monkeypatch.setattr(
+            "gateway.run.render_account_usage_lines",
+            lambda snapshot, markdown=False: [
+                "📈 **Model limits**",
+                "Provider: openai-codex",
+            ],
+        )
+
+        result = await runner._handle_limits_command(event)
+
+        assert calls["args"] == ("openai-codex",)
+        assert "No selected provider" not in result
+        assert "model-backed message" not in result
+
+    @pytest.mark.asyncio
     async def test_usage_command_includes_account_section(self, monkeypatch):
         agent = _make_mock_agent(provider="openai-codex")
         agent.base_url = "https://chatgpt.com/backend-api/codex"

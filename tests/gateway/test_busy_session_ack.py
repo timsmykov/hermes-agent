@@ -81,6 +81,8 @@ def _make_adapter(platform_val="telegram"):
     adapter = MagicMock()
     adapter._pending_messages = {}
     adapter._send_with_retry = AsyncMock()
+    adapter.send_busy_choice_prompt = AsyncMock()
+    adapter.handle_message = AsyncMock()
     adapter.config = MagicMock()
     adapter.config.extra = {}
     adapter.platform = MagicMock(value=platform_val)
@@ -552,3 +554,68 @@ class TestBusySessionOnboardingHint:
         assert "/busy interrupt" in content
         # Must NOT tell the user to /busy queue when they're already on queue.
         assert "/busy queue" not in content
+
+    @pytest.mark.asyncio
+    async def test_ask_mode_sends_telegram_busy_choice_prompt(self):
+        """busy_input_mode='ask' defers routing to Telegram inline queue/steer buttons."""
+        from gateway.run import GatewayRunner
+
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "ask"
+        adapter = _make_adapter()
+        adapter.send_busy_choice_prompt.return_value = MagicMock(success=True, error=None)
+
+        event = _make_event(text="choose how to route this")
+        sk = build_session_key(event.source)
+        runner.adapters[event.source.platform] = adapter
+
+        agent = MagicMock()
+        runner._running_agents[sk] = agent
+
+        result = await GatewayRunner._handle_active_session_busy_message(runner, event, sk)
+
+        assert result is True
+        adapter.send_busy_choice_prompt.assert_called_once()
+        call = adapter.send_busy_choice_prompt.call_args
+        assert call.args[0] is event
+        assert call.args[1] == sk
+        assert "status_detail" in call.kwargs
+        agent.interrupt.assert_not_called()
+        assert sk not in adapter._pending_messages
+        adapter._send_with_retry.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_busy_choice_queue_routes_to_pending_without_ack(self):
+        """Callback queue choice parks the original message for next turn."""
+        runner, _sentinel = _make_runner()
+        adapter = _make_adapter()
+        event = _make_event(text="queue from callback")
+        sk = build_session_key(event.source)
+        runner.adapters[event.source.platform] = adapter
+        runner._running_agents[sk] = MagicMock()
+
+        result = await runner._handle_busy_choice(event, sk, "queue")
+
+        assert result is True
+        assert adapter._pending_messages[sk] is event
+        adapter._send_with_retry.assert_not_called()
+        runner._running_agents[sk].interrupt.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_busy_choice_steer_routes_to_agent_without_pending_or_ack(self):
+        """Callback steer choice injects into the active run and does not replay later."""
+        runner, _sentinel = _make_runner()
+        adapter = _make_adapter()
+        event = _make_event(text="steer from callback")
+        sk = build_session_key(event.source)
+        runner.adapters[event.source.platform] = adapter
+        agent = MagicMock()
+        agent.steer = MagicMock(return_value=True)
+        runner._running_agents[sk] = agent
+
+        result = await runner._handle_busy_choice(event, sk, "steer")
+
+        assert result is True
+        agent.steer.assert_called_once_with("steer from callback")
+        assert sk not in adapter._pending_messages
+        adapter._send_with_retry.assert_not_called()

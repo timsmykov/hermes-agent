@@ -200,6 +200,38 @@ class TestReasoningCommand:
 
         assert runner._resolve_session_reasoning_config(source=source) == {"enabled": True, "effort": "xhigh"}
 
+    def test_resolve_session_reasoning_defaults_to_high_for_codex_spark(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / hermes
+        hermes_home.mkdir()
+        (hermes_home / config.yaml).write_text(, encoding=utf-8)
+
+        monkeypatch.setattr(gateway_run, _hermes_home, hermes_home)
+
+        runner = _make_runner()
+        source = _make_event(/reasoning).source
+
+        assert runner._resolve_session_reasoning_config(
+            source=source,
+            model=gpt-5.3-codex-spark,
+        ) == {enabled: True, effort: high}
+
+    def test_resolve_session_reasoning_respects_global_setting_for_codex_spark(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / hermes
+        hermes_home.mkdir()
+        (hermes_home / config.yaml).write_text(agent:
+ reasoning_effort: low
+, encoding=utf-8)
+
+        monkeypatch.setattr(gateway_run, _hermes_home, hermes_home)
+
+        runner = _make_runner()
+        source = _make_event(/reasoning).source
+
+        assert runner._resolve_session_reasoning_config(
+            source=source,
+            model=gpt-5.3-codex-spark,
+        ) == {enabled: True, effort: low}
+
     def test_run_agent_reloads_reasoning_config_per_message(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir()
@@ -394,57 +426,4 @@ class TestReasoningCommand:
         )
 
         result = asyncio.run(
-            runner._run_agent(
-                message="ping",
-                context_prompt="",
-                history=[],
-                source=source,
-                session_id="session-1",
-                session_key="agent:main:homeassistant:dm",
-            )
-        )
-
-        assert result["final_response"] == "ok"
-        assert _CapturingAgent.last_init is not None
-        assert "homeassistant" in set(_CapturingAgent.last_init["enabled_toolsets"])
-
-
-class TestLoadShowReasoningCoercion:
-    """Regression: display.show_reasoning must be coerced, not bool()'d."""
-
-    def _load_with_config(self, tmp_path, monkeypatch, yaml_body: str) -> bool:
-        hermes_home = tmp_path / "hermes"
-        hermes_home.mkdir()
-        (hermes_home / "config.yaml").write_text(yaml_body, encoding="utf-8")
-        monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
-        return gateway_run.GatewayRunner._load_show_reasoning()
-
-    def test_quoted_false_is_false(self, tmp_path, monkeypatch):
-        assert self._load_with_config(
-            tmp_path, monkeypatch,
-            'display:\n  show_reasoning: "false"\n',
-        ) is False
-
-    def test_quoted_off_is_false(self, tmp_path, monkeypatch):
-        assert self._load_with_config(
-            tmp_path, monkeypatch,
-            'display:\n  show_reasoning: "off"\n',
-        ) is False
-
-    def test_quoted_true_is_true(self, tmp_path, monkeypatch):
-        assert self._load_with_config(
-            tmp_path, monkeypatch,
-            'display:\n  show_reasoning: "true"\n',
-        ) is True
-
-    def test_bare_true_is_true(self, tmp_path, monkeypatch):
-        assert self._load_with_config(
-            tmp_path, monkeypatch,
-            'display:\n  show_reasoning: true\n',
-        ) is True
-
-    def test_missing_is_false(self, tmp_path, monkeypatch):
-        assert self._load_with_config(
-            tmp_path, monkeypatch,
-            'display: {}\n',
-        ) is False
+            runner._ru

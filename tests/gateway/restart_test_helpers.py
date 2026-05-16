@@ -67,6 +67,8 @@ def make_restart_runner(
     runner._draining = False
     runner._restart_requested = False
     runner._restart_task_started = False
+    runner._agent_restart_state_path = None
+    runner._agent_restart_max_consecutive = 3
     runner._restart_detached = False
     runner._restart_via_service = False
     runner._restart_drain_timeout = DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
@@ -128,6 +130,7 @@ def make_restart_runner(
         runner, GatewayRunner
     )
     runner.request_restart = GatewayRunner.request_restart.__get__(runner, GatewayRunner)
+    runner.request_agent_restart = GatewayRunner.request_agent_restart.__get__(runner, GatewayRunner)
     runner._is_user_authorized = lambda _source: True
     runner.hooks = MagicMock()
     runner.hooks.emit = AsyncMock()
