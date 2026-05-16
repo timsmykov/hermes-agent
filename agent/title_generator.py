@@ -5,6 +5,7 @@ adds latency to the user-facing reply.
 """
 
 import logging
+import re
 import threading
 from typing import Callable, Optional
 
@@ -24,6 +25,32 @@ _TITLE_PROMPT = (
     "following exchange. The title should capture the main topic or intent. "
     "Return ONLY the title text, nothing else. No quotes, no punctuation at the end, no prefixes."
 )
+
+_TELEGRAM_TOPIC_TITLE_PROMPT = (
+    "Generate a Telegram topic name for the conversation title below. "
+    "Return EXACTLY TWO words. Use the same language as the title when possible. "
+    "Use only meaningful nouns/adjectives. No quotes, emoji, punctuation, prefixes, numbering, or explanation."
+)
+
+
+def normalize_two_word_topic_title(text: str, *, max_chars: int = 28) -> Optional[str]:
+    """Normalize model output into a compact two-word Telegram topic title.
+
+    Returns ``None`` when the output cannot provide two usable words; callers
+    should fall back to the deterministic title sanitizer in that case.
+    """
+    cleaned = str(text or "").strip().strip('"\'`“”‘’')
+    cleaned = re.sub(r"(?i)^\s*(title|topic|name)\s*[:\-–—]\s*", "", cleaned)
+    cleaned = cleaned.splitlines()[0] if cleaned else ""
+    cleaned = re.sub(r"^[\s\-–—*•#0-9.)]+", "", cleaned).strip()
+    words = re.findall(r"[0-9A-Za-zА-Яа-яЁё][0-9A-Za-zА-Яа-яЁё._+-]*", cleaned)
+    selected = [word.strip("._+-") for word in words if word.strip("._+-")]
+    if len(selected) < 2:
+        return None
+    topic_title = " ".join(selected[:2]).strip()
+    if len(topic_title) > max_chars:
+        return None
+    return topic_title or None
 
 
 def generate_title(
@@ -81,6 +108,44 @@ def generate_title(
                 failure_callback("title generation", e)
             except Exception:
                 logger.debug("Title generation failure_callback raised", exc_info=True)
+        return None
+
+
+def generate_topic_title(
+    title: str,
+    timeout: float = 12.0,
+    failure_callback: Optional[FailureCallback] = None,
+    main_runtime: dict = None,
+) -> Optional[str]:
+    """Generate an exact two-word Telegram topic title from a session title."""
+    title_snippet = str(title or "")[:300]
+    if not title_snippet.strip():
+        return None
+
+    messages = [
+        {"role": "system", "content": _TELEGRAM_TOPIC_TITLE_PROMPT},
+        {"role": "user", "content": f"Conversation title: {title_snippet}"},
+    ]
+
+    try:
+        response = call_llm(
+            task="title_generation",
+            messages=messages,
+            max_tokens=24,
+            temperature=0.1,
+            timeout=timeout,
+            main_runtime=main_runtime,
+        )
+        raw_title = (response.choices[0].message.content or "").strip()
+        return normalize_two_word_topic_title(raw_title)
+    except Exception as e:
+        logger.warning("Telegram topic title generation failed: %s", e)
+        logger.debug("Telegram topic title generation traceback", exc_info=True)
+        if failure_callback is not None:
+            try:
+                failure_callback("telegram topic title generation", e)
+            except Exception:
+                logger.debug("Topic title generation failure_callback raised", exc_info=True)
         return None
 
 

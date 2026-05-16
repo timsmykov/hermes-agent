@@ -7,6 +7,8 @@ import pytest
 
 from agent.title_generator import (
     generate_title,
+    generate_topic_title,
+    normalize_two_word_topic_title,
     auto_title_session,
     maybe_auto_title,
 )
@@ -112,6 +114,45 @@ class TestGenerateTitle:
         # The user content in the messages should be truncated
         user_content = captured_kwargs["messages"][1]["content"]
         assert len(user_content) < 1100  # 500 + 500 + formatting
+
+
+class TestGenerateTopicTitle:
+    """Unit tests for Telegram two-word topic title generation."""
+
+    def test_normalizes_exact_two_words(self):
+        assert normalize_two_word_topic_title('Title: "Ошибки Импорта"') == "Ошибки Импорта"
+
+    def test_takes_first_two_words_from_verbose_model_output(self):
+        assert normalize_two_word_topic_title("Docker Setup Guide") == "Docker Setup"
+
+    def test_rejects_single_word_output_for_fallback(self):
+        assert normalize_two_word_topic_title("Docker") is None
+
+    def test_generates_two_word_topic_title_on_success(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "Telegram Темы"
+
+        with patch("agent.title_generator.call_llm", return_value=mock_response) as mock_call:
+            title = generate_topic_title("Настройка названий топиков Telegram")
+
+        assert title == "Telegram Темы"
+        kwargs = mock_call.call_args.kwargs
+        assert kwargs["task"] == "title_generation"
+        assert kwargs["max_tokens"] == 24
+        assert "EXACTLY TWO words" in kwargs["messages"][0]["content"]
+
+    def test_returns_none_for_invalid_model_output(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "Однослово"
+
+        with patch("agent.title_generator.call_llm", return_value=mock_response):
+            assert generate_topic_title("Some title") is None
+
+    def test_returns_none_on_exception(self):
+        with patch("agent.title_generator.call_llm", side_effect=RuntimeError("no provider")):
+            assert generate_topic_title("Some title") is None
 
 
 class TestAutoTitleSession:
