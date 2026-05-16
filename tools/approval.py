@@ -309,6 +309,19 @@ def _sudo_stdin_block_result(description: str) -> dict:
     }
 
 
+def _exfiltration_block_result(description: str) -> dict:
+    """Build the standard block result for prompt-injection exfil attempts."""
+    return {
+        "approved": False,
+        "message": (
+            f"BLOCKED: possible prompt-injection exfiltration ({description}). "
+            "The agent may not move credential material from local files or "
+            "command lines to network/external sinks. If this was truly intended, "
+            "perform it manually outside the agent."
+        ),
+    }
+
+
 # =========================================================================
 # Dangerous command patterns
 # =========================================================================
@@ -1072,6 +1085,20 @@ def check_all_command_guards(command: str, env_type: str,
         logger.warning("Sudo stdin guard block: %s (command: %s)",
                        sudo_guess_desc, command[:200])
         return _sudo_stdin_block_result(sudo_guess_desc)
+
+    # == Prompt-injection exfiltration guard ==
+    # This is also unconditional and runs before yolo/approvals.mode=off:
+    # external content must not be able to trick the agent into reading
+    # credential paths and POSTing/curling/scp'ing them elsewhere.
+    try:
+        from tools.exfiltration_guard import detect_sensitive_terminal_exfil
+        exfil_desc = detect_sensitive_terminal_exfil(command)
+    except Exception:
+        exfil_desc = None
+    if exfil_desc:
+        logger.warning("Exfiltration guard block: %s (command: %s)",
+                       exfil_desc, command[:200])
+        return _exfiltration_block_result(exfil_desc)
 
     # --yolo or approvals.mode=off: bypass all approval prompts.
     # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.

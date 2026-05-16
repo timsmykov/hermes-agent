@@ -871,9 +871,16 @@ async def web_extract_tool(
     # Block URLs containing embedded secrets (exfiltration prevention).
     # URL-decode first so percent-encoded secrets (%73k- = sk-) are caught.
     from agent.redact import _PREFIX_RE
+    from tools.exfiltration_guard import egress_block_message, message_contains_unredacted_secret
     from urllib.parse import unquote
     for _url in urls:
-        if _PREFIX_RE.search(_url) or _PREFIX_RE.search(unquote(_url)):
+        _url_decoded = unquote(_url)
+        if message_contains_unredacted_secret(_url) or message_contains_unredacted_secret(_url_decoded):
+            return json.dumps({
+                "success": False,
+                "error": egress_block_message("web_extract URL"),
+            })
+        if _PREFIX_RE.search(_url) or _PREFIX_RE.search(_url_decoded):
             return json.dumps({
                 "success": False,
                 "error": "Blocked: URL contains what appears to be an API key or token. "

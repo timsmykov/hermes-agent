@@ -2181,7 +2181,13 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
     # Also check URL-decoded form to catch %2D encoding tricks (e.g. sk%2Dant%2D...).
     import urllib.parse
     from agent.redact import _PREFIX_RE
+    from tools.exfiltration_guard import egress_block_message, message_contains_unredacted_secret
     url_decoded = urllib.parse.unquote(url)
+    if message_contains_unredacted_secret(url) or message_contains_unredacted_secret(url_decoded):
+        return json.dumps({
+            "success": False,
+            "error": egress_block_message("browser navigation URL"),
+        })
     if _PREFIX_RE.search(url) or _PREFIX_RE.search(url_decoded):
         return json.dumps({
             "success": False,
