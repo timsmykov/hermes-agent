@@ -750,7 +750,10 @@ async def test_topic_root_command_creates_and_pins_system_topic(tmp_path, monkey
 
 
 @pytest.mark.asyncio
-async def test_auto_generated_title_renames_bound_telegram_topic(tmp_path):
+async def test_auto_generated_title_renames_bound_telegram_topic(tmp_path, monkeypatch):
+    import agent.title_generator as title_generator
+
+    monkeypatch.setattr(title_generator, "generate_topic_title", lambda title: None)
     db = SessionDB(db_path=tmp_path / "state.db")
     db.apply_telegram_topic_migration()
     db.create_session("sess-topic", source="telegram", user_id="208214988")
@@ -773,8 +776,55 @@ async def test_auto_generated_title_renames_bound_telegram_topic(tmp_path):
     runner.adapters[Platform.TELEGRAM].rename_dm_topic.assert_awaited_once_with(
         chat_id="208214988",
         thread_id="42",
-        name="Build Telegram Topic UX",
+        name="Build Telegram",
     )
+
+
+@pytest.mark.asyncio
+async def test_auto_generated_title_renames_topic_even_without_topic_mode_table(tmp_path, monkeypatch):
+    import agent.title_generator as title_generator
+
+    monkeypatch.setattr(title_generator, "generate_topic_title", lambda title: None)
+    runner = _make_runner(session_db=None)
+
+    await runner._rename_telegram_topic_for_session_title(
+        _make_source(thread_id="42"),
+        "sess-topic",
+        "MCP gbrain schema debugging",
+    )
+
+    runner.adapters[Platform.TELEGRAM].rename_dm_topic.assert_awaited_once_with(
+        chat_id="208214988",
+        thread_id="42",
+        name="MCP gbrain",
+    )
+
+
+@pytest.mark.asyncio
+async def test_auto_generated_title_prefers_llm_two_word_topic_name(tmp_path, monkeypatch):
+    import agent.title_generator as title_generator
+
+    monkeypatch.setattr(title_generator, "generate_topic_title", lambda title: "Топики Telegram")
+    runner = _make_runner(session_db=None)
+
+    await runner._rename_telegram_topic_for_session_title(
+        _make_source(thread_id="42"),
+        "sess-topic",
+        "Build Telegram Topic UX",
+    )
+
+    runner.adapters[Platform.TELEGRAM].rename_dm_topic.assert_awaited_once_with(
+        chat_id="208214988",
+        thread_id="42",
+        name="Топики Telegram",
+    )
+
+
+def test_telegram_topic_title_is_compact_and_skips_generic_words(tmp_path):
+    runner = _make_runner(session_db=None)
+
+    assert runner._sanitize_telegram_topic_title("Проверка работы MCP gbrain") == "MCP gbrain"
+    assert runner._sanitize_telegram_topic_title("Скачивание и сортировка видео") == "Скачивание сортировка"
 
 
 @pytest.mark.asyncio
@@ -822,7 +872,7 @@ async def test_operator_declared_topic_is_not_auto_renamed(tmp_path):
     # actually finds it (a MagicMock auto-attr would be skipped).
     class _FakeAdapter:
         def _get_dm_topic_info(self, chat_id, thread_id):
-            return {"name": "Research", "skill": "arxiv"}
+            return {"name": "Research", "skill": "arxiv", "_source": "config"}
 
         async def rename_dm_topic(self, **kwargs):
             return None
@@ -857,6 +907,16 @@ def test_general_topic_is_treated_as_root_lobby(tmp_path):
     real_topic = _make_source(thread_id="17585")
     assert runner._is_telegram_topic_root_lobby(real_topic) is False
     assert runner._is_telegram_topic_lane(real_topic) is True
+
+
+def test_telegram_dm_topic_thread_detects_visible_topics_without_lobby_mode(tmp_path):
+    """Auto-title rename should still run for real Telegram topic chats without /topic mode."""
+    runner = _make_runner(session_db=None)
+
+    assert runner._is_telegram_topic_lane(_make_source(thread_id="17585")) is False
+    assert runner._is_telegram_dm_topic_thread(_make_source(thread_id="17585")) is True
+    assert runner._is_telegram_dm_topic_thread(_make_source(thread_id="1")) is False
+    assert runner._is_telegram_dm_topic_thread(_make_source(thread_id=None)) is False
 
 
 def test_lobby_reminder_is_debounced_per_chat(tmp_path):
@@ -1048,7 +1108,5 @@ async def test_topic_refuses_unauthorized_user(tmp_path, monkeypatch):
         ).fetchall()
     }
     assert tables == set()
-
-
 
 

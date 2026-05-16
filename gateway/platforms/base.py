@@ -1280,6 +1280,7 @@ class BasePlatformAdapter(ABC):
         self.config = config
         self.platform = platform
         self._message_handler: Optional[MessageHandler] = None
+        self._busy_choice_handler: Optional[Callable[[MessageEvent, str, str], Awaitable[bool]]] = None
         self._running = False
         self._fatal_error_code: Optional[str] = None
         self._fatal_error_message: Optional[str] = None
@@ -1527,6 +1528,10 @@ class BasePlatformAdapter(ABC):
     def set_busy_session_handler(self, handler: Optional[Callable[[MessageEvent, str], Awaitable[bool]]]) -> None:
         """Set an optional handler for messages arriving during active sessions."""
         self._busy_session_handler = handler
+
+    def set_busy_choice_handler(self, handler: Optional[Callable[[MessageEvent, str, str], Awaitable[bool]]]) -> None:
+        """Set a handler for deferred queue/steer choices from platform UI callbacks."""
+        self._busy_choice_handler = handler
     
     def set_session_store(self, session_store: Any) -> None:
         """
@@ -1716,6 +1721,21 @@ class BasePlatformAdapter(ABC):
             # path).  Close the coroutine cleanly so Python doesn't warn
             # about it never being awaited, then drop silently.
             coro.close()
+
+    async def send_busy_choice_prompt(
+        self,
+        event: MessageEvent,
+        session_key: str,
+        *,
+        status_detail: str = "",
+    ) -> SendResult:
+        """Ask the user how to route a message received while an agent is busy.
+
+        Platforms with inline-button support may override this.  The base
+        implementation reports unsupported so the runner falls back to the
+        configured busy-input mode.
+        """
+        return SendResult(success=False, error="Not supported")
 
     async def send_slash_confirm(
         self,

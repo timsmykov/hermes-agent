@@ -756,6 +756,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     tool_call_id=tool_call.id,
                     session_id=agent.session_id or "",
                     enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
+                    gateway_session_key=agent._gateway_session_key,
                     skip_pre_tool_call_hook=True,
                 )
                 _spinner_result = function_result
@@ -776,6 +777,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     tool_call_id=tool_call.id,
                     session_id=agent.session_id or "",
                     enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
+                    gateway_session_key=agent._gateway_session_key,
                     skip_pre_tool_call_hook=True,
                 )
             except Exception as tool_error:

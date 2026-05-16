@@ -393,12 +393,17 @@ class TestTelegramApprovalCallback:
     async def test_model_picker_callback_not_affected(self):
         """Ensure model picker callbacks still route correctly."""
         adapter = _make_adapter()
+        runner = _AuthRunner(authorized=True)
+        adapter._message_handler = runner._handle_message
 
         query = AsyncMock()
         query.data = "mp:some_provider"
         query.message = MagicMock()
         query.message.chat_id = 12345
+        query.message.chat = MagicMock()
+        query.message.chat.type = "private"
         query.from_user = MagicMock()
+        query.from_user.id = "12345"
 
         update = MagicMock()
         update.callback_query = query
@@ -411,6 +416,35 @@ class TestTelegramApprovalCallback:
                 await adapter._handle_callback_query(update, context)
 
         mock_resolve.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_model_picker_callback_rejects_unauthorized_user(self):
+        """Unauthorized Telegram users must not drive model-picker callbacks."""
+        adapter = _make_adapter()
+        runner = _AuthRunner(authorized=False)
+        adapter._message_handler = runner._handle_message
+
+        query = AsyncMock()
+        query.data = "mp:some_provider"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.message.chat = MagicMock()
+        query.message.chat.type = "private"
+        query.from_user = MagicMock()
+        query.from_user.id = "999999"
+        query.from_user.first_name = "Mallory"
+
+        update = MagicMock()
+        update.callback_query = query
+        context = MagicMock()
+
+        with patch.object(adapter, "_handle_model_picker_callback", new_callable=AsyncMock) as mock_picker:
+            await adapter._handle_callback_query(update, context)
+
+        mock_picker.assert_not_called()
+        query.answer.assert_called_once()
+        assert "not authorized" in query.answer.call_args[1]["text"].lower()
+        assert runner.last_source.user_id == "999999"
 
     @pytest.mark.asyncio
     async def test_update_prompt_callback_not_affected(self, tmp_path):

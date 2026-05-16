@@ -816,14 +816,14 @@ async def test_drain_timeout_uses_restart_reason_when_restarting():
 
     calls = session_store.mark_resume_pending.call_args_list
     assert calls, "expected at least one mark_resume_pending call"
-    for args in calls:
-        assert args[0][1] == "restart_timeout"
+    reasons = [args[0][1] for args in calls]
+    assert "restart_interrupted" in reasons
+    assert "restart_timeout" in reasons
 
 
 @pytest.mark.asyncio
-async def test_clean_drain_does_not_mark_resume_pending():
-    """If the drain completes within timeout (no force-interrupt), no
-    sessions should be flagged — the normal shutdown path is unchanged."""
+async def test_clean_drain_clears_proactive_resume_marker():
+    """A clean drain may pre-mark for crash safety, but must unmark before exit."""
     runner, adapter = make_restart_runner()
     adapter.disconnect = AsyncMock()
 
@@ -839,6 +839,7 @@ async def test_clean_drain_does_not_mark_resume_pending():
 
     session_store = MagicMock()
     session_store.mark_resume_pending = MagicMock(return_value=True)
+    session_store.clear_resume_pending = MagicMock(return_value=True)
     runner.session_store = session_store
 
     with patch("gateway.status.remove_pid_file"), patch(
@@ -846,7 +847,13 @@ async def test_clean_drain_does_not_mark_resume_pending():
     ):
         await runner.stop()
 
-    session_store.mark_resume_pending.assert_not_called()
+    session_store.mark_resume_pending.assert_called_once_with(
+        "agent:main:telegram:dm:A",
+        "shutdown_timeout",
+    )
+    session_store.clear_resume_pending.assert_called_once_with(
+        "agent:main:telegram:dm:A"
+    )
     running_agent.interrupt.assert_not_called()
 
 
@@ -881,6 +888,7 @@ async def test_drain_timeout_only_marks_still_running_sessions():
 
     session_store = MagicMock()
     session_store.mark_resume_pending = MagicMock(return_value=True)
+    session_store.clear_resume_pending = MagicMock(return_value=True)
     runner.session_store = session_store
 
     with patch("gateway.status.remove_pid_file"), patch(
@@ -888,10 +896,15 @@ async def test_drain_timeout_only_marks_still_running_sessions():
     ):
         await runner.stop()
 
-    calls = session_store.mark_resume_pending.call_args_list
-    marked = {args[0][0] for args in calls}
-    # Only the session still running at timeout is marked; the finisher is not.
-    assert marked == {session_key_stuck}
+    session_store.clear_resume_pending.assert_called_once_with(session_key_finisher)
+    timeout_marks = [
+        args[0][0]
+        for args in session_store.mark_resume_pending.call_args_list
+        if args[0][1] == "shutdown_timeout"
+    ]
+    # The finisher can be pre-marked for crash safety, but it is cleared once it
+    # drains cleanly. The stuck session remains marked for recovery.
+    assert session_key_stuck in timeout_marks
 
 
 @pytest.mark.asyncio

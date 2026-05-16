@@ -1063,3 +1063,27 @@ async def test_send_retries_retry_after_errors():
     assert result.success is True
     assert result.message_id == "300"
     assert attempt[0] == 2
+
+
+@pytest.mark.asyncio
+async def test_send_honors_max_flood_retry_after_metadata():
+    """Fresh-final can cap RetryAfter waits and fail fast instead of freezing."""
+    adapter = _make_adapter()
+    attempt = [0]
+
+    async def mock_send_message(**kwargs):
+        attempt[0] += 1
+        raise FakeRetryAfter(30)
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message)
+
+    result = await adapter.send(
+        chat_id="123",
+        content="test message",
+        metadata={"_hermes_max_flood_retry_after": 5.0},
+    )
+
+    assert result.success is False
+    assert result.retryable is False
+    assert result.error == "flood_control:30.0"
+    assert attempt[0] == 1

@@ -736,6 +736,7 @@ def handle_function_call(
     session_id: Optional[str] = None,
     user_task: Optional[str] = None,
     enabled_tools: Optional[List[str]] = None,
+    gateway_session_key: Optional[str] = None,
     skip_pre_tool_call_hook: bool = False,
 ) -> str:
     """
@@ -833,6 +834,7 @@ def handle_function_call(
                 function_name, function_args,
                 task_id=task_id,
                 user_task=user_task,
+                gateway_session_key=gateway_session_key,
             )
         duration_ms = int((time.monotonic() - _dispatch_start) * 1000)
 

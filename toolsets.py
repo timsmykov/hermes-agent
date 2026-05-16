@@ -70,6 +70,8 @@ _HERMES_CORE_TOOLS = [
     "kanban_unblock",
     # Computer use (macOS, gated on cua-driver being installed via check_fn)
     "computer_use",
+    # Gateway lifecycle control (only exposed inside a live gateway process)
+    "gateway_restart",
 ]
 
 
@@ -136,6 +138,12 @@ TOOLSETS = {
             "or keyboard focus. Works with any tool-capable model."
         ),
         "tools": ["computer_use"],
+        "includes": []
+    },
+
+    "gateway_control": {
+        "description": "Hermes gateway lifecycle control tools (available only inside a live gateway process)",
+        "tools": ["gateway_restart"],
         "includes": []
     },
 

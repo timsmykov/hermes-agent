@@ -1552,6 +1552,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             tool_call_id=tool_call_id,
             session_id=agent.session_id or "",
             enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
+            gateway_session_key=agent._gateway_session_key,
             skip_pre_tool_call_hook=True,
         )
 
