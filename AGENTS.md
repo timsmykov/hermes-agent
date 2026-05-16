@@ -9,6 +9,29 @@ Instructions for AI coding assistants and developers working on the hermes-agent
 source .venv/bin/activate   # or: source venv/bin/activate
 ```
 
+## Tim's Live-Repo Commit Discipline
+
+This live checkout is used by Tim's Telegram Hermes gateway. Any agent or
+session that edits this repo must finish with the working tree either clean or
+intentionally committed. Do not leave source edits uncommitted for the next
+session to rediscover.
+
+Before ending a coding/ops session that touched this repo, run:
+
+```bash
+/usr/local/bin/hermes-repo-checkpoint status --repo /opt/hermes-live-current/src
+```
+
+If the changes are intentional, commit them as a small topical checkpoint:
+
+```bash
+/usr/local/bin/hermes-repo-checkpoint commit --repo /opt/hermes-live-current/src -m "chore: checkpoint <short reason>"
+```
+
+If the checkpoint tool refuses because files look like secrets, runtime state,
+logs, DBs, caches, venvs, build outputs, or media, move/ignore those artifacts
+instead of bypassing the guard. Use `--allow-blocked` only after manual review.
+
 `scripts/run_tests.sh` probes `.venv` first, then `venv`, then
 `$HOME/.hermes/hermes-agent/venv` (for worktrees that share a venv with the
 main checkout).
