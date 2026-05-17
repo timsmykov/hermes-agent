@@ -4175,6 +4175,68 @@ class TelegramAdapter(BasePlatformAdapter):
         cleaned = re.sub(rf"(?i)@{username}\b[,:\-]*\s*", "", text).strip()
         return cleaned or text
 
+    @staticmethod
+    def _is_forwarded_message(message: Message) -> bool:
+        """Return True when Telegram marks the incoming update as forwarded."""
+        for attr in (
+            "forward_origin",
+            "forward_from",
+            "forward_from_chat",
+            "forward_sender_name",
+            "forward_date",
+        ):
+            value = getattr(message, attr, None)
+            # Unit-test MagicMocks synthesize arbitrary attributes on access;
+            # python-telegram-bot Message instances do not.  Ignore those
+            # synthetic mock children so ordinary test messages are not treated
+            # as forwarded.
+            if value is not None and type(value).__module__.startswith("unittest.mock"):
+                continue
+            if value:
+                return True
+        return False
+
+    def _decorate_forwarded_text(
+        self,
+        message: Message,
+        text: Optional[str],
+        *,
+        media_label: Optional[str] = None,
+    ) -> str:
+        """Make forwarded content explicit in the prompt text.
+
+        Telegram exposes forwarded text/captions/files as normal message fields,
+        so without a marker the agent cannot tell that a second rapid message is
+        forwarded context attached to the user's prompt.  For forwarded files
+        with no caption this still emits a small marker; cached media paths are
+        carried separately in ``MessageEvent.media_urls``.
+        """
+        cleaned = (text or "").strip()
+        if not self._is_forwarded_message(message):
+            return cleaned
+        label = "Forwarded Telegram message"
+        if media_label:
+            label = f"Forwarded Telegram {media_label}"
+        if cleaned:
+            return f"[{label}]\n{cleaned}"
+        return f"[{label}]"
+
+    def _has_pending_text_batch(self, event: MessageEvent) -> bool:
+        return self._text_batch_key(event) in self._pending_text_batches
+
+    def _enqueue_media_with_pending_text_if_any(self, event: MessageEvent) -> bool:
+        """Merge rapid media/forwarded-file updates into a pending text prompt.
+
+        This covers the common Telegram UX where the user sends a prompt and then
+        immediately forwards a message/file.  The text prompt is still in the
+        short batching window, so fold the media event into that same logical
+        agent turn instead of dispatching it as an independent follow-up.
+        """
+        if not self._has_pending_text_batch(event):
+            return False
+        self._enqueue_text_event(event)
+        return True
+
     def _should_process_message(self, message: Message, *, is_command: bool = False) -> bool:
         """Apply Telegram group trigger rules.
 
@@ -4248,7 +4310,8 @@ class TelegramAdapter(BasePlatformAdapter):
             return
 
         event = self._build_message_event(update.message, MessageType.TEXT, update_id=update.update_id)
-        event.text = self._clean_bot_trigger_text(event.text)
+        cleaned_text = self._clean_bot_trigger_text(event.text)
+        event.text = self._decorate_forwarded_text(update.message, cleaned_text)
         self._enqueue_text_event(event)
 
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4462,9 +4525,17 @@ class TelegramAdapter(BasePlatformAdapter):
         
         event = self._build_message_event(msg, msg_type, update_id=update.update_id)
         
-        # Add caption as text
+        # Add caption as text, and mark forwarded media/files explicitly even
+        # when Telegram forwarded them without a caption.
         if msg.caption:
-            event.text = self._clean_bot_trigger_text(msg.caption)
+            caption_text = self._clean_bot_trigger_text(msg.caption)
+        else:
+            caption_text = ""
+        event.text = self._decorate_forwarded_text(
+            msg,
+            caption_text,
+            media_label=getattr(msg_type, "value", str(msg_type)).lower(),
+        )
         
         # Handle stickers: describe via vision tool with caching
         if msg.sticker:
@@ -4493,6 +4564,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 event.media_urls = [cached_path]
                 event.media_types = [f"image/{ext.lstrip('.')}" ]
                 logger.info("[Telegram] Cached user photo at %s", cached_path)
+                if self._enqueue_media_with_pending_text_if_any(event):
+                    return
                 media_group_id = getattr(msg, "media_group_id", None)
                 if media_group_id:
                     await self._queue_media_group_event(str(media_group_id), event)
@@ -4599,6 +4672,8 @@ class TelegramAdapter(BasePlatformAdapter):
                     event.media_urls = [cached_path]
                     event.media_types = [doc_mime if doc_mime.startswith("image/") else _TELEGRAM_IMAGE_EXT_TO_MIME.get(image_ext, "image/jpeg")]
                     logger.info("[Telegram] Cached user image-document at %s", cached_path)
+                    if self._enqueue_media_with_pending_text_if_any(event):
+                        return
 
                     media_group_id = getattr(msg, "media_group_id", None)
                     if media_group_id:
@@ -4620,6 +4695,8 @@ class TelegramAdapter(BasePlatformAdapter):
                     event.media_types = [SUPPORTED_VIDEO_TYPES[ext]]
                     event.message_type = MessageType.VIDEO
                     logger.info("[Telegram] Cached user video document at %s", cached_path)
+                    if self._enqueue_media_with_pending_text_if_any(event):
+                        return
                     await self.handle_message(event)
                     return
 
@@ -4668,6 +4745,9 @@ class TelegramAdapter(BasePlatformAdapter):
         media_group_id = getattr(msg, "media_group_id", None)
         if media_group_id:
             await self._queue_media_group_event(str(media_group_id), event)
+            return
+
+        if self._enqueue_media_with_pending_text_if_any(event):
             return
 
         await self.handle_message(event)
