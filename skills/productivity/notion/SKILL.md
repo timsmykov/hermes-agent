@@ -1,7 +1,7 @@
 ---
 name: notion
-description: "Notion API + ntn CLI: pages, databases, markdown, Workers."
-version: 2.0.0
+description: "Notion MCP/API-first operations: pages, databases, blocks, search; browser only for UI-only Notion AI flows."
+version: 2.1.0
 author: community
 license: MIT
 platforms: [linux, macos, windows]
@@ -9,16 +9,49 @@ prerequisites:
   env_vars: [NOTION_API_KEY]
 metadata:
   hermes:
-    tags: [Notion, Productivity, Notes, Database, API, CLI, Workers]
+    tags: [Notion, Productivity, Notes, Database, API, MCP, CLI, Workers]
     homepage: https://developers.notion.com
+    trigger_phrases:
+      - "Notion"
+      - "ноушен"
+      - "страница в Notion"
+      - "база Notion"
+      - "найди в Notion"
+      - "добавь в Notion"
+      - "обнови страницу"
+      - "комментарии Notion"
+      - "Notion MCP"
+      - "Notion API"
+      - "Notion AI"
+      - "Notion Agent"
 ---
 
 # Notion
 
-Talk to Notion two ways. Same integration token works for both — pick by what's available.
+## Resolver / routing policy
 
-◆ **`ntn` CLI** — Notion's official CLI. Shorter syntax, one-line file uploads, required for Workers. macOS + Linux only as of May 2026 (Windows support "coming soon"). **Default when installed.**
-◆ **HTTP + curl** — works everywhere including Windows. **Default fallback** when `ntn` isn't installed.
+Use this skill proactively for Tim's Notion work: search/read/create/update Notion pages, databases/data sources, blocks, comments, and Notion AI/Agent workflows.
+
+**Priority order on Tim's orchestrator:**
+
+1. **First choice: first-class Notion MCP tools** (`mcp_notion_*`). Use these for ordinary search, page metadata, block/page content, append/edit, comments, and lightweight health checks.
+2. **Second choice: direct Notion REST API** with `NOTION_API_KEY` via Python/requests or curl. Use this when MCP lacks a needed endpoint, a richer payload is required, pagination/recursion is easier in code, or legacy compatibility is needed.
+3. **Third choice: official `ntn` CLI** only when installed and useful for Notion-specific ergonomics such as Workers, file uploads, or markdown endpoints.
+4. **Last resort: browser/UI automation.** Use browser automation only for login/permission sharing, Notion AI UI, custom-agent UI, model picker, database view/filter UI, or features not exposed by MCP/API. Do **not** open Notion in browser for normal CRUD/search/page analysis.
+
+**Failure handling:** do not shotgun unrelated tools after the first Notion error. If MCP fails, diagnose in this order: `notion_health`/`hermes mcp test notion` → check target page/database is shared with the integration → retry with direct REST API → only then consider UI if the missing operation is genuinely UI-only. A Notion API 404 usually means the integration lacks access or the object ID/endpoint version is wrong; it is not a reason to start clicking around the UI.
+
+**Hard boundaries:** do not use `browser_use` or generic web extraction as a substitute for the Notion API. Do not use custom Notion agents unless Tim explicitly names one. Do not expose Notion private content unnecessarily in Telegram summaries.
+
+Tim's local Notion MCP server is registered as `notion` in the orchestrator profile and served by `/usr/local/bin/notion-hermes-mcp` from `/usr/local/share/hermesbytim/notion-mcp/server.py`. Validate with `hermes mcp test notion`; a gateway `/restart` is required before newly added MCP tools appear in active Telegram sessions.
+
+See `references/notion-routing-matrix.md` for the full routing matrix and escalation rules.
+
+Talk to Notion through MCP/API first. Same integration token works for direct API and `ntn` — pick by what's available only after respecting the priority order above.
+
+◆ **MCP tools** — default in Telegram/gateway when available.
+◆ **HTTP + curl/Python** — default fallback when MCP lacks a needed operation or for batch/pagination.
+◆ **`ntn` CLI** — Notion's official CLI. Use when installed and materially helpful, especially Workers/file uploads/markdown.
 
 ## Setup
 
