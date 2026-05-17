@@ -3,7 +3,7 @@
 import asyncio
 import sys
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -98,6 +98,80 @@ async def test_forwarded_file_event_merges_into_pending_text_prompt():
     assert pending.text == "что в этом файле?\n[Forwarded Telegram document]"
     assert pending.media_urls == ["/tmp/forwarded.pdf"]
     assert pending.media_types == ["application/pdf"]
+
+    for task in list(adapter._pending_text_batch_tasks.values()):
+        task.cancel()
+    await asyncio.gather(*adapter._pending_text_batch_tasks.values(), return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_forwarded_file_first_waits_for_sibling_prompt_update():
+    adapter = _make_adapter()
+    source = _source(adapter)
+
+    forwarded_file = MessageEvent(
+        text="[Forwarded Telegram document]",
+        message_type=MessageType.DOCUMENT,
+        source=source,
+        raw_message=SimpleNamespace(forward_origin=object()),
+        message_id="10",
+        media_urls=["/tmp/forwarded.pdf"],
+        media_types=["application/pdf"],
+    )
+
+    merged = adapter._enqueue_media_with_text_batch_if_needed(forwarded_file)
+    assert merged is True
+
+    prompt = MessageEvent(
+        text="что в этом файле?",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="11",
+    )
+    adapter._enqueue_text_event(prompt)
+
+    pending = adapter._pending_text_batches[adapter._text_batch_key(prompt)]
+    assert pending.text == "[Forwarded Telegram document]\nчто в этом файле?"
+    assert pending.media_urls == ["/tmp/forwarded.pdf"]
+    assert pending.media_types == ["application/pdf"]
+
+    for task in list(adapter._pending_text_batch_tasks.values()):
+        task.cancel()
+    await asyncio.gather(*adapter._pending_text_batch_tasks.values(), return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_media_group_flush_merges_with_pending_prompt():
+    adapter = _make_adapter()
+    adapter.MEDIA_GROUP_WAIT_SECONDS = 0.01
+    adapter.handle_message = AsyncMock()
+    source = _source(adapter)
+
+    prompt = MessageEvent(
+        text="сравни эти картинки",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="20",
+    )
+    adapter._enqueue_text_event(prompt)
+
+    album = MessageEvent(
+        text="[Forwarded Telegram photo]",
+        message_type=MessageType.PHOTO,
+        source=source,
+        raw_message=SimpleNamespace(forward_origin=object()),
+        message_id="21",
+        media_urls=["/tmp/one.jpg", "/tmp/two.jpg"],
+        media_types=["image/jpeg", "image/jpeg"],
+    )
+    adapter._media_group_events["album-1"] = album
+
+    await adapter._flush_media_group_event("album-1")
+
+    adapter.handle_message.assert_not_awaited()
+    pending = adapter._pending_text_batches[adapter._text_batch_key(prompt)]
+    assert pending.text == "сравни эти картинки\n[Forwarded Telegram photo]"
+    assert pending.media_urls == ["/tmp/one.jpg", "/tmp/two.jpg"]
 
     for task in list(adapter._pending_text_batch_tasks.values()):
         task.cancel()
