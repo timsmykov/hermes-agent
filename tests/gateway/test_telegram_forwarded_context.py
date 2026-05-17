@@ -161,6 +161,58 @@ async def test_forwarded_text_document_marker_precedes_injected_content():
 
 
 @pytest.mark.asyncio
+async def test_pending_prompt_waits_for_forwarded_document_download_before_flush():
+    adapter = _make_adapter()
+    adapter._text_batch_delay_seconds = 0.1
+    adapter._TEXT_BATCH_FAST_DELAY_S = 0.1
+    adapter._TEXT_BATCH_SHORT_DELAY_S = 0.1
+    adapter._media_batch_delay_seconds = 0.5
+    adapter.handle_message = AsyncMock()
+    source = _source(adapter)
+
+    prompt = MessageEvent(
+        text="А вот так",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="10",
+    )
+    adapter._enqueue_text_event(prompt)
+
+    async def delayed_file():
+        await asyncio.sleep(0.2)
+        return SimpleNamespace(download_as_bytearray=AsyncMock(return_value=bytearray(b"docx bytes")))
+
+    doc = SimpleNamespace(
+        file_name="Отчет.docx",
+        mime_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        file_size=1024,
+        get_file=AsyncMock(side_effect=delayed_file),
+    )
+    update = SimpleNamespace(message=_telegram_message(doc), update_id=123)
+
+    media_task = asyncio.create_task(adapter._handle_media_message(update, None))
+    await asyncio.sleep(0.15)
+
+    adapter.handle_message.assert_not_awaited()
+    pending = adapter._pending_text_batches[adapter._text_batch_key(prompt)]
+    assert pending.text == "А вот так\n[Forwarded Telegram document]"
+    assert getattr(pending, "_awaiting_media_download") is True
+
+    await media_task
+    pending = adapter._pending_text_batches[adapter._text_batch_key(prompt)]
+    assert pending.text == "А вот так\n[Forwarded Telegram document]"
+    assert len(pending.media_urls) == 1
+    assert pending.media_types == [
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    ]
+    assert getattr(pending, "_awaiting_media_download") is False
+
+    for task in list(adapter._pending_text_batch_tasks.values()):
+        task.cancel()
+    await asyncio.gather(*adapter._pending_text_batch_tasks.values(), return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_forwarded_file_event_merges_into_pending_text_prompt():
     adapter = _make_adapter()
     source = _source(adapter)
