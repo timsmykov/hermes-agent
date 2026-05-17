@@ -4234,6 +4234,23 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not self._has_pending_text_batch(event):
             return False
+        event._awaiting_media_download = False  # type: ignore[attr-defined]
+        event._media_download_complete = True  # type: ignore[attr-defined]
+        self._enqueue_text_event(event)
+        return True
+
+    def _reserve_pending_text_batch_for_media_download(self, event: MessageEvent) -> bool:
+        """Reserve an existing prompt batch while Telegram media is downloading.
+
+        Document/file updates may arrive within the text batch window but finish
+        downloading after the very short fast flush delay.  Add the forwarded
+        marker/caption immediately and extend that one batch long enough for the
+        cached file path to merge.  If there is no pending prompt, do nothing so
+        standalone forwards remain immediate.
+        """
+        if not self._has_pending_text_batch(event):
+            return False
+        event._awaiting_media_download = True  # type: ignore[attr-defined]
         self._enqueue_text_event(event)
         return True
 
@@ -4391,16 +4408,23 @@ class TelegramAdapter(BasePlatformAdapter):
         chunk_len = len(event.text or "")
         if existing is None:
             event._last_chunk_len = chunk_len  # type: ignore[attr-defined]
+            if getattr(event, "_awaiting_media_download", False):
+                event._awaiting_media_download = True  # type: ignore[attr-defined]
             self._pending_text_batches[key] = event
         else:
             # Append text from the follow-up chunk
             if event.text:
                 existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
             existing._last_chunk_len = chunk_len  # type: ignore[attr-defined]
+            if getattr(event, "_awaiting_media_download", False):
+                existing._awaiting_media_download = True  # type: ignore[attr-defined]
+            if getattr(event, "_media_download_complete", False):
+                existing._awaiting_media_download = False  # type: ignore[attr-defined]
             # Merge any media that might be attached
             if event.media_urls:
                 existing.media_urls.extend(event.media_urls)
                 existing.media_types.extend(event.media_types)
+                existing._awaiting_media_download = False  # type: ignore[attr-defined]
 
         # Cancel any pending flush and restart the timer
         prior_task = self._pending_text_batch_tasks.get(key)
@@ -4441,6 +4465,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 delay = min(self._text_batch_delay_seconds, self._TEXT_BATCH_SHORT_DELAY_S)
             else:
                 delay = self._text_batch_delay_seconds
+            if getattr(pending, "_awaiting_media_download", False):
+                # A sibling media/document update reached us and is still being
+                # downloaded/cached.  Keep the prompt in the text lane long
+                # enough for the cached path to merge, but only after a real
+                # media update touched this batch — standalone text stays fast.
+                delay = max(delay, self._media_batch_delay_seconds)
             await asyncio.sleep(delay)
             event = self._pending_text_batches.pop(key, None)
             if not event:
@@ -4623,6 +4653,8 @@ class TelegramAdapter(BasePlatformAdapter):
         # Download document files to cache for agent processing
         elif msg.document:
             doc = msg.document
+            reserved_media_context = False
+            reserved_media_text = event.text or ""
             try:
                 # Determine file extension
                 ext = ""
@@ -4659,6 +4691,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 # payload is actually an image, route it through the image cache
                 # and batching path instead of rejecting it as a document.
                 if ext in _TELEGRAM_IMAGE_EXTENSIONS or doc_mime.startswith("image/"):
+                    reserved_media_context = self._reserve_pending_text_batch_for_media_download(event)
                     file_obj = await doc.get_file()
                     image_bytes = await file_obj.download_as_bytearray()
                     image_ext = ext if ext in _TELEGRAM_IMAGE_EXTENSIONS else _TELEGRAM_IMAGE_MIME_TO_EXT.get(doc_mime, ".jpg")
@@ -4676,6 +4709,8 @@ class TelegramAdapter(BasePlatformAdapter):
                     event.message_type = MessageType.PHOTO
                     event.media_urls = [cached_path]
                     event.media_types = [doc_mime if doc_mime.startswith("image/") else _TELEGRAM_IMAGE_EXT_TO_MIME.get(image_ext, "image/jpeg")]
+                    if reserved_media_context:
+                        event.text = ""
                     logger.info("[Telegram] Cached user image-document at %s", cached_path)
                     if self._enqueue_media_with_text_batch_if_needed(event):
                         return
@@ -4693,12 +4728,15 @@ class TelegramAdapter(BasePlatformAdapter):
                     ext = video_mime_to_ext.get(doc.mime_type, "")
 
                 if ext in SUPPORTED_VIDEO_TYPES:
+                    reserved_media_context = self._reserve_pending_text_batch_for_media_download(event)
                     file_obj = await doc.get_file()
                     video_bytes = await file_obj.download_as_bytearray()
                     cached_path = cache_video_from_bytes(bytes(video_bytes), ext=ext)
                     event.media_urls = [cached_path]
                     event.media_types = [SUPPORTED_VIDEO_TYPES[ext]]
                     event.message_type = MessageType.VIDEO
+                    if reserved_media_context:
+                        event.text = ""
                     logger.info("[Telegram] Cached user video document at %s", cached_path)
                     if self._enqueue_media_with_text_batch_if_needed(event):
                         return
@@ -4718,6 +4756,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     return
 
                 # Download and cache
+                reserved_media_context = self._reserve_pending_text_batch_for_media_download(event)
                 file_obj = await doc.get_file()
                 doc_bytes = await file_obj.download_as_bytearray()
                 raw_bytes = bytes(doc_bytes)
@@ -4744,9 +4783,16 @@ class TelegramAdapter(BasePlatformAdapter):
                             "[Telegram] Could not decode text file as UTF-8, skipping content injection",
                             exc_info=True,
                         )
+                if reserved_media_context:
+                    if reserved_media_text and event.text.startswith(reserved_media_text):
+                        event.text = event.text[len(reserved_media_text):].lstrip("\n")
+                    else:
+                        event.text = ""
 
             except Exception as e:
                 logger.warning("[Telegram] Failed to cache document: %s", e, exc_info=True)
+                if reserved_media_context:
+                    event.text = ""
 
         media_group_id = getattr(msg, "media_group_id", None)
         if media_group_id:
