@@ -4222,18 +4222,27 @@ class TelegramAdapter(BasePlatformAdapter):
     def _has_pending_text_batch(self, event: MessageEvent) -> bool:
         return self._text_batch_key(event) in self._pending_text_batches
 
-    def _enqueue_media_with_pending_text_if_any(self, event: MessageEvent) -> bool:
-        """Merge rapid media/forwarded-file updates into a pending text prompt.
+    def _enqueue_media_with_text_batch_if_needed(self, event: MessageEvent) -> bool:
+        """Merge rapid media/forwarded-file updates into the text batch lane.
 
-        This covers the common Telegram UX where the user sends a prompt and then
-        immediately forwards a message/file.  The text prompt is still in the
-        short batching window, so fold the media event into that same logical
-        agent turn instead of dispatching it as an independent follow-up.
+        Telegram forward-with-comment can arrive in either order: comment first
+        then forwarded payload, or forwarded payload first then comment.  If a
+        text prompt is already pending, fold the media into it.  If the media is
+        itself forwarded, hold it briefly in the text batch lane so a sibling
+        comment update can attach before the agent turn starts.
         """
-        if not self._has_pending_text_batch(event):
-            return False
-        self._enqueue_text_event(event)
-        return True
+        if self._has_pending_text_batch(event):
+            self._enqueue_text_event(event)
+            return True
+        raw_message = getattr(event, "raw_message", None)
+        if raw_message is not None and self._is_forwarded_message(raw_message):
+            self._enqueue_text_event(event)
+            return True
+        return False
+
+    # Backward-compatible alias for older tests/extensions.
+    def _enqueue_media_with_pending_text_if_any(self, event: MessageEvent) -> bool:
+        return self._enqueue_media_with_text_batch_if_needed(event)
 
     def _should_process_message(self, message: Message, *, is_command: bool = False) -> bool:
         """Apply Telegram group trigger rules.
@@ -4562,7 +4571,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 event.media_urls = [cached_path]
                 event.media_types = [f"image/{ext.lstrip('.')}" ]
                 logger.info("[Telegram] Cached user photo at %s", cached_path)
-                if self._enqueue_media_with_pending_text_if_any(event):
+                if self._enqueue_media_with_text_batch_if_needed(event):
                     return
                 media_group_id = getattr(msg, "media_group_id", None)
                 if media_group_id:
@@ -4670,7 +4679,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     event.media_urls = [cached_path]
                     event.media_types = [doc_mime if doc_mime.startswith("image/") else _TELEGRAM_IMAGE_EXT_TO_MIME.get(image_ext, "image/jpeg")]
                     logger.info("[Telegram] Cached user image-document at %s", cached_path)
-                    if self._enqueue_media_with_pending_text_if_any(event):
+                    if self._enqueue_media_with_text_batch_if_needed(event):
                         return
 
                     media_group_id = getattr(msg, "media_group_id", None)
@@ -4693,7 +4702,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     event.media_types = [SUPPORTED_VIDEO_TYPES[ext]]
                     event.message_type = MessageType.VIDEO
                     logger.info("[Telegram] Cached user video document at %s", cached_path)
-                    if self._enqueue_media_with_pending_text_if_any(event):
+                    if self._enqueue_media_with_text_batch_if_needed(event):
                         return
                     await self.handle_message(event)
                     return
@@ -4745,7 +4754,7 @@ class TelegramAdapter(BasePlatformAdapter):
             await self._queue_media_group_event(str(media_group_id), event)
             return
 
-        if self._enqueue_media_with_pending_text_if_any(event):
+        if self._enqueue_media_with_text_batch_if_needed(event):
             return
 
         await self.handle_message(event)
@@ -4780,6 +4789,8 @@ class TelegramAdapter(BasePlatformAdapter):
             await asyncio.sleep(self.MEDIA_GROUP_WAIT_SECONDS)
             event = self._media_group_events.pop(media_group_id, None)
             if event is not None:
+                if self._enqueue_media_with_text_batch_if_needed(event):
+                    return
                 await self.handle_message(event)
         except asyncio.CancelledError:
             return
