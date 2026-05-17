@@ -15081,6 +15081,12 @@ class GatewayRunner:
             _cleanup_progress = False
             _cleanup_adapter = None
         _cleanup_msg_ids: List[str] = []
+        _status_delete_adapter = self.adapters.get(source.platform)
+        if _status_delete_adapter is not None and (
+            type(_status_delete_adapter).delete_message is BasePlatformAdapter.delete_message
+        ):
+            _status_delete_adapter = None
+        _status_futures_by_key: Dict[str, List[Any]] = {}
         # First-touch onboarding latch: fires at most once per run, even if
         # several tools exceed the threshold.
         long_tool_hint_fired = [False]
@@ -15478,6 +15484,38 @@ class GatewayRunner:
         def _status_callback_sync(event_type: str, message: str) -> None:
             if not _status_adapter or not _run_still_current():
                 return
+
+            def _delete_status_future(fut) -> None:
+                if _status_delete_adapter is None:
+                    return
+                try:
+                    res = fut.result()
+                except Exception:
+                    return
+                mid = getattr(res, "message_id", None)
+                if not (getattr(res, "success", False) and mid):
+                    return
+
+                async def _delete_one() -> None:
+                    try:
+                        await _status_delete_adapter.delete_message(
+                            _status_chat_id, str(mid)
+                        )
+                    except Exception:
+                        pass
+
+                safe_schedule_threadsafe(
+                    _delete_one(),
+                    _loop_for_step,
+                    logger=logger,
+                    log_message="status_callback transient cleanup scheduling error",
+                )
+
+            if event_type == "lifecycle.clear":
+                for _fut in _status_futures_by_key.pop(message, []):
+                    _fut.add_done_callback(_delete_status_future)
+                return
+
             _fut = safe_schedule_threadsafe(
                 _status_adapter.send(
                     _status_chat_id,
@@ -15490,6 +15528,8 @@ class GatewayRunner:
             )
             if _fut is None:
                 return
+            if event_type == "lifecycle" and message.startswith("🗜️ Compacting context"):
+                _status_futures_by_key.setdefault("context_compaction", []).append(_fut)
             if _cleanup_progress:
                 def _track_status_id(fut) -> None:
                     try:
