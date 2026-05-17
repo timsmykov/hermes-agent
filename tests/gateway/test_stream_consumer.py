@@ -177,6 +177,64 @@ class TestStreamingRateLimit:
         assert adapter.edit_message.await_count == 1
 
 
+class TestStreamingOverflowFinalFormatting:
+    """Detached overflow chunks must all get a final formatting pass."""
+
+    @pytest.mark.asyncio
+    async def test_finalizes_plain_chunks_flushed_before_last_message(self):
+        adapter = MagicMock()
+        send_ids = iter(["msg_1", "msg_2"])
+
+        async def _send(**kwargs):
+            return SimpleNamespace(success=True, message_id=next(send_ids))
+
+        adapter.send = AsyncMock(side_effect=_send)
+        adapter.edit_message = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id=None)
+        )
+        adapter.MAX_MESSAGE_LENGTH = 600
+
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            StreamConsumerConfig(edit_interval=0.0, buffer_threshold=1, cursor=""),
+        )
+        task = asyncio.create_task(consumer.run())
+
+        consumer.on_delta("seed")
+        for _ in range(100):
+            if adapter.send.await_count >= 1:
+                break
+            await asyncio.sleep(0.01)
+        assert adapter.send.await_count == 1
+
+        # This forces the stream overflow loop to finalize msg_1 as a plain
+        # non-final chunk, reset _message_id, and continue the tail in msg_2.
+        consumer.on_delta("\n" + ("**bold** overflow content. " * 80))
+        for _ in range(100):
+            if adapter.send.await_count >= 2 and any(
+                call.kwargs.get("finalize") is False
+                and call.kwargs.get("message_id") == "msg_1"
+                for call in adapter.edit_message.await_args_list
+            ):
+                break
+            await asyncio.sleep(0.01)
+
+        consumer.finish()
+        await asyncio.wait_for(task, timeout=2.0)
+
+        finalize_calls = [
+            call.kwargs for call in adapter.edit_message.await_args_list
+            if call.kwargs.get("finalize") is True
+        ]
+        finalized_ids = {call["message_id"] for call in finalize_calls}
+        assert "msg_1" in finalized_ids, (
+            "the early overflow chunk must be re-edited with finalize=True, "
+            "not left as raw streamed Markdown"
+        )
+        assert "msg_2" in finalized_ids
+
+
 class TestFreshFinalPreviewRetention:
     """Fresh-final must not delete user-visible assistant previews."""
 
