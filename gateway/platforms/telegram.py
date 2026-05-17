@@ -4190,7 +4190,7 @@ class TelegramAdapter(BasePlatformAdapter):
             # as forwarded.
             if value is not None and type(value).__module__.startswith("unittest.mock"):
                 continue
-            if value:
+            if value is not None:
                 return True
         return False
 
@@ -4644,10 +4644,11 @@ class TelegramAdapter(BasePlatformAdapter):
                 # document size limit by taking the image path.
                 MAX_DOC_BYTES = 20 * 1024 * 1024
                 if not doc.file_size or doc.file_size > MAX_DOC_BYTES:
-                    event.text = (
+                    too_large_text = (
                         "The document is too large or its size could not be verified. "
                         "Maximum: 20 MB."
                     )
+                    event.text = f"{event.text}\n\n{too_large_text}" if event.text else too_large_text
                     logger.info("[Telegram] Document too large: %s bytes", doc.file_size)
                     await self.handle_message(event)
                     return
@@ -4705,10 +4706,11 @@ class TelegramAdapter(BasePlatformAdapter):
                 # Check if supported
                 if ext not in SUPPORTED_DOCUMENT_TYPES:
                     supported_list = ", ".join(sorted(SUPPORTED_DOCUMENT_TYPES.keys()))
-                    event.text = (
+                    unsupported_text = (
                         f"Unsupported document type '{ext or 'unknown'}'. "
                         f"Supported types: {supported_list}"
                     )
+                    event.text = f"{event.text}\n\n{unsupported_text}" if event.text else unsupported_text
                     logger.info("[Telegram] Unsupported document type: %s", ext or "unknown")
                     await self.handle_message(event)
                     return
@@ -4732,7 +4734,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         display_name = re.sub(r'[^\w.\- ]', '_', display_name)
                         injection = f"[Content of {display_name}]:\n{text_content}"
                         if event.text:
-                            event.text = f"{injection}\n\n{event.text}"
+                            event.text = f"{event.text}\n\n{injection}"
                         else:
                             event.text = injection
                     except UnicodeDecodeError:
