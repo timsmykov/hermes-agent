@@ -105,7 +105,7 @@ async def test_forwarded_file_event_merges_into_pending_text_prompt():
 
 
 @pytest.mark.asyncio
-async def test_forwarded_file_first_waits_for_sibling_prompt_update():
+async def test_forwarded_file_without_pending_prompt_is_not_delayed():
     adapter = _make_adapter()
     source = _source(adapter)
 
@@ -120,24 +120,9 @@ async def test_forwarded_file_first_waits_for_sibling_prompt_update():
     )
 
     merged = adapter._enqueue_media_with_text_batch_if_needed(forwarded_file)
-    assert merged is True
 
-    prompt = MessageEvent(
-        text="что в этом файле?",
-        message_type=MessageType.TEXT,
-        source=source,
-        message_id="11",
-    )
-    adapter._enqueue_text_event(prompt)
-
-    pending = adapter._pending_text_batches[adapter._text_batch_key(prompt)]
-    assert pending.text == "[Forwarded Telegram document]\nчто в этом файле?"
-    assert pending.media_urls == ["/tmp/forwarded.pdf"]
-    assert pending.media_types == ["application/pdf"]
-
-    for task in list(adapter._pending_text_batch_tasks.values()):
-        task.cancel()
-    await asyncio.gather(*adapter._pending_text_batch_tasks.values(), return_exceptions=True)
+    assert merged is False
+    assert adapter._pending_text_batches == {}
 
 
 @pytest.mark.asyncio

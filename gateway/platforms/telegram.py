@@ -4223,22 +4223,17 @@ class TelegramAdapter(BasePlatformAdapter):
         return self._text_batch_key(event) in self._pending_text_batches
 
     def _enqueue_media_with_text_batch_if_needed(self, event: MessageEvent) -> bool:
-        """Merge rapid media/forwarded-file updates into the text batch lane.
+        """Merge rapid media/forwarded-file updates into an existing text batch.
 
-        Telegram forward-with-comment can arrive in either order: comment first
-        then forwarded payload, or forwarded payload first then comment.  If a
-        text prompt is already pending, fold the media into it.  If the media is
-        itself forwarded, hold it briefly in the text batch lane so a sibling
-        comment update can attach before the agent turn starts.
+        Telegram forward-with-comment is delivered as sibling updates.  We only
+        merge media when the comment/prompt is already in the normal text-batch
+        window; a forwarded payload without a pending prompt must be processed
+        immediately instead of being held just in case a comment appears later.
         """
-        if self._has_pending_text_batch(event):
-            self._enqueue_text_event(event)
-            return True
-        raw_message = getattr(event, "raw_message", None)
-        if raw_message is not None and self._is_forwarded_message(raw_message):
-            self._enqueue_text_event(event)
-            return True
-        return False
+        if not self._has_pending_text_batch(event):
+            return False
+        self._enqueue_text_event(event)
+        return True
 
     # Backward-compatible alias for older tests/extensions.
     def _enqueue_media_with_pending_text_if_any(self, event: MessageEvent) -> bool:
