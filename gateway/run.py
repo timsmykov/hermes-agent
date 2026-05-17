@@ -779,6 +779,24 @@ def _build_media_placeholder(event) -> str:
     return "\n".join(parts)
 
 
+def _prepend_reply_context(message_text: str, event) -> str:
+    """Attach full replied-message text to the user's prompt.
+
+    Reply context is an explicit pointer selected by the user in the chat UI.
+    Keep the complete text/caption provided by the platform instead of a snippet
+    so references to earlier assistant/user messages preserve all details.
+    """
+    if not (getattr(event, "reply_to_text", None) and getattr(event, "reply_to_message_id", None)):
+        return message_text
+    reply_context = str(event.reply_to_text)
+    return (
+        f"[Reply context: full text of replied-to message {event.reply_to_message_id}]\n"
+        f"{reply_context}\n"
+        f"[End reply context]\n\n"
+        f"{message_text}"
+    )
+
+
 def _dequeue_pending_event(adapter, session_key: str) -> MessageEvent | None:
     """Consume and return the full pending event for a session.
 
@@ -7282,15 +7300,7 @@ class GatewayRunner:
                     )
                 message_text = f"{context_note}\n\n{message_text}"
 
-        if getattr(event, "reply_to_text", None) and event.reply_to_message_id:
-            # Always inject the reply-to pointer — even when the quoted text
-            # already appears in history. The prefix isn't deduplication, it's
-            # disambiguation: it tells the agent *which* prior message the user
-            # is referencing. History can contain the same or similar text
-            # multiple times, and without an explicit pointer the agent has to
-            # guess (or answer for both subjects). Token overhead is minimal.
-            reply_snippet = event.reply_to_text[:500]
-            message_text = f'[Replying to: "{reply_snippet}"]\n\n{message_text}'
+        message_text = _prepend_reply_context(message_text, event)
 
         if "@" in message_text:
             try:
