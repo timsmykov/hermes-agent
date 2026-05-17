@@ -432,6 +432,7 @@ def compress_context(
         agent.session_id or "none", _pre_msg_count, len(compressed),
         f"{_compressed_est:,}",
     )
+    agent._clear_status("context_compaction")
     return compressed, new_system_prompt
 
 

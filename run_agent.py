@@ -699,6 +699,19 @@ class AIAgent:
             except Exception:
                 logger.debug("status_callback error in _emit_status", exc_info=True)
 
+    def _clear_status(self, key: str) -> None:
+        """Ask gateway renderers to clear a transient lifecycle status.
+
+        CLI output is append-only, so this intentionally does not print
+        anything. Gateway adapters that can delete messages may remove the
+        corresponding temporary bubble.
+        """
+        if self.status_callback:
+            try:
+                self.status_callback("lifecycle.clear", key)
+            except Exception:
+                logger.debug("status_callback error in _clear_status", exc_info=True)
+
     def _emit_warning(self, message: str) -> None:
         """Emit a user-visible warning through the same status plumbing.
 

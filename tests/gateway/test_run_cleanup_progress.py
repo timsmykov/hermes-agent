@@ -131,6 +131,21 @@ class FailingAgent:
         }
 
 
+class CompactingAgent:
+    """Emits the context-compaction lifecycle bubble and then clears it."""
+
+    def __init__(self, **kwargs):
+        self.status_callback = kwargs.get("status_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        cb = self.status_callback
+        if cb is not None:
+            cb("lifecycle", "🗜️ Compacting context — summarizing earlier conversation so I can continue...")
+            cb("lifecycle.clear", "context_compaction")
+        return {"final_response": "done", "messages": [], "api_calls": 1}
+
+
 def _make_runner(adapter):
     gateway_run = importlib.import_module("gateway.run")
     GatewayRunner = gateway_run.GatewayRunner
@@ -186,6 +201,36 @@ def _install_fakes(monkeypatch, agent_cls, *, cleanup_on: bool):
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_compaction_status_clears_when_compaction_finishes_even_without_cleanup_flag(monkeypatch, tmp_path):
+    """The context-compaction bubble is operation-scoped, not final-response-scoped."""
+    adapter = CleanupCaptureAdapter()
+    runner = _make_runner(adapter)
+    gateway_run = _install_fakes(monkeypatch, CompactingAgent, cleanup_on=False)
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="-1001")
+    session_key = "agent:main:telegram:group:-1001"
+
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-1",
+        session_key=session_key,
+    )
+
+    assert result["final_response"] == "done"
+    for _ in range(20):
+        await asyncio.sleep(0.01)
+        if adapter.deleted:
+            break
+
+    assert len(adapter.sent) == 1
+    assert adapter.deleted == [{"chat_id": "-1001", "message_id": adapter.sent[0]["message_id"]}]
 
 
 @pytest.mark.asyncio
