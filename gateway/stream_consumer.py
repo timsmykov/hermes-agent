@@ -147,6 +147,13 @@ class GatewayStreamConsumer:
         self._last_sent_text = ""   # Track last-sent text to skip redundant edits
         self._fallback_final_send = False
         self._fallback_prefix = ""
+        # When a streamed reply grows past the platform limit, run() may
+        # flush early chunks as non-final plain edits, reset _message_id, and
+        # continue below with a new message.  The final edit only targets the
+        # current tail message, so remember those detached plain chunks and
+        # re-finalize them too.  Otherwise long Telegram replies can leave raw
+        # Markdown markers in every chunk except the last chain.
+        self._plain_overflow_chunks: list[tuple[str, str]] = []
         self._flood_strikes = 0         # Consecutive flood-control edit failures
         self._current_edit_interval = self.cfg.edit_interval  # Adaptive backoff
         self._final_response_sent = False
@@ -225,6 +232,7 @@ class GatewayStreamConsumer:
         self._last_sent_text = ""
         self._fallback_final_send = False
         self._fallback_prefix = ""
+        self._plain_overflow_chunks = []
         # Native draft streaming: bump the draft_id so the next text segment
         # animates as a fresh preview below the tool-progress bubbles, not
         # over the prior segment's already-finalized draft.  This is how
@@ -235,6 +243,52 @@ class GatewayStreamConsumer:
         if self._use_draft_streaming:
             type(self)._draft_id_counter += 1
             self._draft_id = type(self)._draft_id_counter
+
+    def _remember_plain_overflow_chunk(self, message_id: Optional[str], text: str) -> None:
+        """Remember a non-final overflow chunk that must be formatted later."""
+        if not message_id or message_id == "__no_edit__" or not text.strip():
+            return
+        mid = str(message_id)
+        # A chunk can be updated repeatedly while streaming.  Keep the latest
+        # text for that visible message id, but preserve original order.
+        for idx, (known_mid, _) in enumerate(self._plain_overflow_chunks):
+            if known_mid == mid:
+                self._plain_overflow_chunks[idx] = (mid, text)
+                return
+        self._plain_overflow_chunks.append((mid, text))
+
+    async def _finalize_plain_overflow_chunks(self) -> bool:
+        """Best-effort final Markdown/design pass for detached overflow chunks."""
+        pending = list(self._plain_overflow_chunks)
+        self._plain_overflow_chunks = []
+        if not pending:
+            return True
+
+        all_ok = True
+        for message_id, text in pending:
+            try:
+                result = await self.adapter.edit_message(
+                    chat_id=self.chat_id,
+                    message_id=message_id,
+                    content=text,
+                    finalize=True,
+                )
+                if not getattr(result, "success", False):
+                    all_ok = False
+                    logger.debug(
+                        "Final overflow formatting failed for %s: %s",
+                        message_id,
+                        getattr(result, "error", None),
+                    )
+            except Exception as exc:
+                all_ok = False
+                logger.debug(
+                    "Final overflow formatting raised for %s: %s",
+                    message_id,
+                    exc,
+                    exc_info=True,
+                )
+        return all_ok
 
     def on_delta(self, text: str) -> None:
         """Thread-safe callback — called from the agent's worker thread.
@@ -503,6 +557,7 @@ class GatewayStreamConsumer:
                             split_at = _safe_limit
                         chunk = self._accumulated[:split_at]
                         ok = await self._send_or_edit(chunk)
+                        delivered_chunk_id = self._message_id
                         if self._fallback_final_send or not ok:
                             # Edit failed (or backed off due to flood control)
                             # while attempting to split an oversized message.
@@ -510,6 +565,7 @@ class GatewayStreamConsumer:
                             # fallback final-send path can deliver the remaining
                             # continuation without dropping content.
                             break
+                        self._remember_plain_overflow_chunk(delivered_chunk_id, chunk)
                         self._accumulated = self._accumulated[split_at:].lstrip("\n")
                         self._message_id = None
                         self._last_sent_text = ""
@@ -531,6 +587,7 @@ class GatewayStreamConsumer:
                     self._last_edit_time = time.monotonic()
 
                 if got_done:
+                    await self._finalize_plain_overflow_chunks()
                     # Record that the final content reached the user even
                     # if the cosmetic final edit below fails.
                     if current_update_visible and self._accumulated:
@@ -599,6 +656,7 @@ class GatewayStreamConsumer:
                         and self._message_id != "__no_edit__"
                     ):
                         await self._flush_segment_tail_on_edit_failure()
+                    await self._finalize_plain_overflow_chunks()
                     self._reset_segment_state(preserve_no_edit=True)
 
                 await asyncio.sleep(0.05)  # Small yield to not busy-loop
