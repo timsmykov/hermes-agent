@@ -1,7 +1,7 @@
 ---
 name: notion
 description: "Notion MCP/API-first operations: pages, databases, blocks, search; browser only for UI-only Notion AI flows."
-version: 2.1.0
+version: 2.2.0
 author: community
 license: MIT
 platforms: [linux, macos, windows]
@@ -34,12 +34,14 @@ Use this skill proactively for Tim's Notion work: search/read/create/update Noti
 
 **Priority order on Tim's orchestrator:**
 
-1. **First choice: first-class Notion MCP tools** (`mcp_notion_*`). Use these for ordinary search, page metadata, block/page content, append/edit, comments, and lightweight health checks.
-2. **Second choice: direct Notion REST API** with `NOTION_API_KEY` via Python/requests or curl. Use this when MCP lacks a needed endpoint, a richer payload is required, pagination/recursion is easier in code, or legacy compatibility is needed.
-3. **Third choice: official `ntn` CLI** only when installed and useful for Notion-specific ergonomics such as Workers, file uploads, or markdown endpoints.
-4. **Last resort: browser/UI automation.** Use browser automation only for login/permission sharing, Notion AI UI, custom-agent UI, model picker, database view/filter UI, or features not exposed by MCP/API. Do **not** open Notion in browser for normal CRUD/search/page analysis.
+1. **First choice: first-class Notion MCP tools** (`mcp_notion_*`). Use these for ordinary search, page metadata, block/page content, append/edit, comments, media uploads, image insertion, covers, and lightweight health checks.
+2. **Second choice: official `ntn` CLI** when installed. On Tim's server `ntn 0.14.0` is installed at `/usr/local/bin/ntn`, with `/usr/local/bin/ntn-hermes` as the preferred wrapper that loads Hermes `.env` and maps `NOTION_API_KEY` to `NOTION_API_TOKEN` without printing secrets. It can call API endpoints, create/update pages from Markdown, manage Workers, and upload files (`ntn-hermes files create < image.png`). Use it for file uploads/markdown/Workers and when its self-documenting commands are clearer than raw curl.
+3. **Third choice: direct Notion REST API** with `NOTION_API_KEY` via Python/requests or curl. Use this when MCP/CLI lacks a needed endpoint, a richer payload is required, pagination/recursion is easier in code, or legacy compatibility is needed.
+4. **Last resort: browser/UI automation.** Use browser automation only for login/permission sharing, Notion AI UI, custom-agent UI, model picker, database view/filter UI, or features not exposed by MCP/API/CLI. Do **not** open Notion in browser for normal CRUD/search/page analysis or image insertion unless API/CLI upload paths fail for a concrete reason.
 
-**Failure handling:** do not shotgun unrelated tools after the first Notion error. If MCP fails, diagnose in this order: `notion_health`/`hermes mcp test notion` → check target page/database is shared with the integration → retry with direct REST API → only then consider UI if the missing operation is genuinely UI-only. A Notion API 404 usually means the integration lacks access or the object ID/endpoint version is wrong; it is not a reason to start clicking around the UI.
+**Failure handling:** do not shotgun unrelated tools after the first Notion error. If MCP fails, diagnose in this order: `notion_health`/`hermes mcp test notion` → check target page/database is shared with the integration → retry with `ntn` or direct REST API → only then consider UI if the missing operation is genuinely UI-only. A Notion API 404 usually means the integration lacks access or the object ID/endpoint version is wrong; it is not a reason to start clicking around the UI.
+
+**Media rule:** images/files are API-supported. Do not assume images require UI. Preferred paths are MCP upload tools, then `ntn files create < image.png` + attach via API, then direct File Uploads API (`/v1/file_uploads` + `/send` + append `image`/`file` block). UI upload is allowed only if API/CLI upload is unavailable or blocked by an observed limitation.
 
 **Hard boundaries:** do not use `browser_use` or generic web extraction as a substitute for the Notion API. Do not use custom Notion agents unless Tim explicitly names one. Do not expose Notion private content unnecessarily in Telegram summaries.
 
@@ -99,9 +101,43 @@ Windows users: skip step 2 entirely until native `ntn` ships — Path B works fi
 
 ## API Basics
 
-`Notion-Version: 2025-09-03` is required on all HTTP requests. `ntn` handles this for you. In this version, what users call "databases" are called **data sources** in the API.
+`Notion-Version: 2026-03-11` is required on all HTTP requests. `ntn` handles this for you. In this version, what users call "databases" are called **data sources** in the API.
 
-## Path A — `ntn` CLI (preferred, macOS / Linux)
+## Common Operations
+
+### Media/image uploads
+
+Images and files **do not require browser UI by default**. The Notion API supports uploading and attaching files/media.
+
+Preferred order:
+
+1. MCP upload tools on Tim's server:
+   - `mcp_notion_notion_upload_file(local_file_path)` → returns `file_upload_id`
+   - `mcp_notion_notion_upload_and_append_file_block(parent_block_id, local_file_path, block_type="image", caption="...")`
+   - `mcp_notion_notion_append_uploaded_file_block(parent_block_id, file_upload_id, block_type="image")`
+   - `mcp_notion_notion_set_page_cover_from_file(page_id, local_file_path)`
+2. `ntn` CLI:
+   - `ntn-hermes files create < image.png`
+   - `ntn-hermes files create --external-url https://example.com/photo.png`
+   - use the returned file upload id in an image/file block via `ntn-hermes api` or REST.
+3. Direct REST File Uploads API:
+   - `POST /v1/file_uploads`
+   - `POST /v1/file_uploads/{id}/send` with `multipart/form-data`
+   - `PATCH /v1/blocks/{page_or_block_id}/children` with an `image`/`file`/`pdf`/`audio`/`video` block using `{ "type": "file_upload", "file_upload": {"id": "..."} }`
+   - or `PATCH /v1/pages/{page_id}` to set page `cover` / `icon` or a database `files` property.
+
+Supported media targets include media blocks (`image`, `file`, `pdf`, `audio`, `video`), database `files` properties, page `icon`, and page `cover`. API direct upload handles small files up to 20 MB in one request; larger files require multipart upload. UI upload is a last resort only after these paths fail.
+
+### Raw API self-inspection with ntn
+
+When exact syntax is uncertain, prefer the self-documenting CLI instead of guessing:
+
+```bash
+ntn-hermes api ls
+ntn-hermes api v1/file_uploads --help
+ntn-hermes api v1/file_uploads --docs
+ntn-hermes api v1/file_uploads --spec
+```
 
 ### Raw API calls (shorthand for curl)
 ```bash
@@ -190,7 +226,7 @@ All requests share this pattern:
 ```bash
 curl -s -X GET "https://api.notion.com/v1/..." \
   -H "Authorization: Bearer $NOTION_API_KEY" \
-  -H "Notion-Version: 2025-09-03" \
+  -H "Notion-Version: 2026-03-11" \
   -H "Content-Type: application/json"
 ```
 
@@ -200,7 +236,7 @@ On Windows the `curl` shipped with Windows 10+ works as-is. PowerShell users can
 ```bash
 curl -s -X POST "https://api.notion.com/v1/search" \
   -H "Authorization: Bearer $NOTION_API_KEY" \
-  -H "Notion-Version: 2025-09-03" \
+  -H "Notion-Version: 2026-03-11" \
   -H "Content-Type: application/json" \
   -d '{"query": "page title"}'
 ```
@@ -209,7 +245,7 @@ curl -s -X POST "https://api.notion.com/v1/search" \
 ```bash
 curl -s "https://api.notion.com/v1/pages/{page_id}" \
   -H "Authorization: Bearer $NOTION_API_KEY" \
-  -H "Notion-Version: 2025-09-03"
+  -H "Notion-Version: 2026-03-11"
 ```
 
 ### Read page as Markdown (agent-friendly)
@@ -219,14 +255,14 @@ Easier to feed to a model than block JSON.
 ```bash
 curl -s "https://api.notion.com/v1/pages/{page_id}/markdown" \
   -H "Authorization: Bearer $NOTION_API_KEY" \
-  -H "Notion-Version: 2025-09-03"
+  -H "Notion-Version: 2026-03-11"
 ```
 
 ### Read page content as blocks (when you need structure)
 ```bash
 curl -s "https://api.notion.com/v1/blocks/{page_id}/children" \
   -H "Authorization: Bearer $NOTION_API_KEY" \
-  -H "Notion-Version: 2025-09-03"
+  -H "Notion-Version: 2026-03-11"
 ```
 
 ### Create page from Markdown
@@ -236,7 +272,7 @@ curl -s "https://api.notion.com/v1/blocks/{page_id}/children" \
 ```bash
 curl -s -X POST "https://api.notion.com/v1/pages" \
   -H "Authorization: Bearer $NOTION_API_KEY" \
-  -H "Notion-Version: 2025-09-03" \
+  -H "Notion-Version: 2026-03-11" \
   -H "Content-Type: application/json" \
   -d '{
     "parent": {"page_id": "xxx"},
@@ -249,7 +285,7 @@ curl -s -X POST "https://api.notion.com/v1/pages" \
 ```bash
 curl -s -X PATCH "https://api.notion.com/v1/pages/{page_id}/markdown" \
   -H "Authorization: Bearer $NOTION_API_KEY" \
-  -H "Notion-Version: 2025-09-03" \
+  -H "Notion-Version: 2026-03-11" \
   -H "Content-Type: application/json" \
   -d '{"markdown": "## Update\n\nShipped the prototype."}'
 ```
@@ -258,7 +294,7 @@ curl -s -X PATCH "https://api.notion.com/v1/pages/{page_id}/markdown" \
 ```bash
 curl -s -X POST "https://api.notion.com/v1/pages" \
   -H "Authorization: Bearer $NOTION_API_KEY" \
-  -H "Notion-Version: 2025-09-03" \
+  -H "Notion-Version: 2026-03-11" \
   -H "Content-Type: application/json" \
   -d '{
     "parent": {"database_id": "xxx"},
@@ -273,7 +309,7 @@ curl -s -X POST "https://api.notion.com/v1/pages" \
 ```bash
 curl -s -X POST "https://api.notion.com/v1/data_sources/{data_source_id}/query" \
   -H "Authorization: Bearer $NOTION_API_KEY" \
-  -H "Notion-Version: 2025-09-03" \
+  -H "Notion-Version: 2026-03-11" \
   -H "Content-Type: application/json" \
   -d '{
     "filter": {"property": "Status", "select": {"equals": "Active"}},
@@ -285,7 +321,7 @@ curl -s -X POST "https://api.notion.com/v1/data_sources/{data_source_id}/query" 
 ```bash
 curl -s -X POST "https://api.notion.com/v1/data_sources" \
   -H "Authorization: Bearer $NOTION_API_KEY" \
-  -H "Notion-Version: 2025-09-03" \
+  -H "Notion-Version: 2026-03-11" \
   -H "Content-Type: application/json" \
   -d '{
     "parent": {"page_id": "xxx"},
@@ -302,7 +338,7 @@ curl -s -X POST "https://api.notion.com/v1/data_sources" \
 ```bash
 curl -s -X PATCH "https://api.notion.com/v1/pages/{page_id}" \
   -H "Authorization: Bearer $NOTION_API_KEY" \
-  -H "Notion-Version: 2025-09-03" \
+  -H "Notion-Version: 2026-03-11" \
   -H "Content-Type: application/json" \
   -d '{"properties": {"Status": {"select": {"name": "Done"}}}}'
 ```
@@ -311,7 +347,7 @@ curl -s -X PATCH "https://api.notion.com/v1/pages/{page_id}" \
 ```bash
 curl -s -X PATCH "https://api.notion.com/v1/blocks/{page_id}/children" \
   -H "Authorization: Bearer $NOTION_API_KEY" \
-  -H "Notion-Version: 2025-09-03" \
+  -H "Notion-Version: 2026-03-11" \
   -H "Content-Type: application/json" \
   -d '{
     "children": [
@@ -325,7 +361,7 @@ curl -s -X PATCH "https://api.notion.com/v1/blocks/{page_id}/children" \
 # 1. Create upload
 curl -s -X POST "https://api.notion.com/v1/file_uploads" \
   -H "Authorization: Bearer $NOTION_API_KEY" \
-  -H "Notion-Version: 2025-09-03" \
+  -H "Notion-Version: 2026-03-11" \
   -H "Content-Type: application/json" \
   -d '{"filename": "photo.png", "content_type": "image/png"}'
 
@@ -350,7 +386,7 @@ Common property formats for database items:
 - **Email:** `{"email": "user@example.com"}`
 - **Relation:** `{"relation": [{"id": "page_id"}]}`
 
-## API Version 2025-09-03 — Databases vs Data Sources
+## API Version 2026-03-11 — Databases vs Data Sources
 
 - **Databases became data sources.** Use `/data_sources/` endpoints for queries and retrieval.
 - **Two IDs per database:** `database_id` and `data_source_id`.
