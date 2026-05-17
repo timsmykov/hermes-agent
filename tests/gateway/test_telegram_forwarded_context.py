@@ -69,6 +69,97 @@ def test_forwarded_file_without_caption_gets_context_marker():
     assert result == "[Forwarded Telegram document]"
 
 
+def test_falsy_forward_origin_still_counts_as_forwarded():
+    class FalsyForwardOrigin:
+        def __bool__(self):
+            return False
+
+    adapter = _make_adapter()
+    msg = SimpleNamespace(forward_origin=FalsyForwardOrigin())
+
+    result = adapter._decorate_forwarded_text(msg, "context")
+
+    assert result == "[Forwarded Telegram message]\ncontext"
+
+
+def _telegram_message(document, *, caption=None, forwarded=True):
+    return SimpleNamespace(
+        chat=SimpleNamespace(id=111, type="private", title=None, full_name="Tim", is_forum=False),
+        from_user=SimpleNamespace(id=42, full_name="Tim"),
+        message_thread_id=None,
+        is_topic_message=False,
+        reply_to_message=None,
+        text=None,
+        caption=caption,
+        date=None,
+        message_id=10,
+        sticker=None,
+        photo=None,
+        video=None,
+        audio=None,
+        voice=None,
+        document=document,
+        media_group_id=None,
+        forward_origin=object() if forwarded else None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_forwarded_too_large_document_preserves_context_marker():
+    adapter = _make_adapter()
+    adapter.handle_message = AsyncMock()
+    doc = SimpleNamespace(
+        file_name="large.pdf",
+        mime_type="application/pdf",
+        file_size=25 * 1024 * 1024,
+    )
+    update = SimpleNamespace(message=_telegram_message(doc), update_id=123)
+
+    await adapter._handle_media_message(update, None)
+
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text.startswith("[Forwarded Telegram document]")
+    assert "too large" in event.text
+
+
+@pytest.mark.asyncio
+async def test_forwarded_unsupported_document_preserves_context_marker():
+    adapter = _make_adapter()
+    adapter.handle_message = AsyncMock()
+    doc = SimpleNamespace(
+        file_name="payload.exe",
+        mime_type="application/x-msdownload",
+        file_size=1024,
+    )
+    update = SimpleNamespace(message=_telegram_message(doc), update_id=123)
+
+    await adapter._handle_media_message(update, None)
+
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text.startswith("[Forwarded Telegram document]")
+    assert "Unsupported document type '.exe'" in event.text
+
+
+@pytest.mark.asyncio
+async def test_forwarded_text_document_marker_precedes_injected_content():
+    adapter = _make_adapter()
+    adapter.handle_message = AsyncMock()
+    file_obj = SimpleNamespace(download_as_bytearray=AsyncMock(return_value=bytearray(b"hello from file")))
+    doc = SimpleNamespace(
+        file_name="note.txt",
+        mime_type="text/plain",
+        file_size=15,
+        get_file=AsyncMock(return_value=file_obj),
+    )
+    update = SimpleNamespace(message=_telegram_message(doc), update_id=123)
+
+    await adapter._handle_media_message(update, None)
+
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text.startswith("[Forwarded Telegram document]\n\n[Content of note.txt]:")
+    assert "hello from file" in event.text
+
+
 @pytest.mark.asyncio
 async def test_forwarded_file_event_merges_into_pending_text_prompt():
     adapter = _make_adapter()
