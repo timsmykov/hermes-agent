@@ -1,11 +1,9 @@
-"""Tests for Telegram native partial-quote handling in _build_message_event.
+"""Tests for Telegram reply context handling in _build_message_event.
 
-When a Telegram user replies using Telegram's native quote feature to
-select only part of a prior message, the adapter must use ``message.quote.text``
-(the user-selected substring) rather than ``message.reply_to_message.text``
-(the entire replied-to message). Otherwise the agent receives the full prior
-message as ``reply_to_text``, which can cause it to act on unrelated
-actionable-looking text the user did not quote (#22619).
+Replying to a Telegram message is treated as an explicit context pointer for
+Hermes. Even when Telegram provides a native selected quote substring, Hermes
+must attach the full replied-to message text/caption so the next prompt sees the
+complete tagged message.
 """
 
 import sys
@@ -75,27 +73,26 @@ def _make_message(
     )
 
 
-def test_native_partial_quote_used_as_reply_to_text():
-    """When ``message.quote`` is present, prefer the selected substring."""
+def test_native_partial_quote_does_not_truncate_reply_to_text():
+    """message.quote is ignored; full replied message becomes reply_to_text."""
     from gateway.platforms.base import MessageType
 
     adapter = _make_adapter()
+    full_text = "Briefing:\n- Item A: deploy fix\n- Item B: rotate keys\n- Item C: update docs"
     msg = _make_message(
         text="mark this one as done",
-        reply_to_text=(
-            "Briefing:\n- Item A: deploy fix\n- Item B: rotate keys\n- Item C: update docs"
-        ),
+        reply_to_text=full_text,
         quote_text="Item B: rotate keys",
     )
 
     event = adapter._build_message_event(msg, MessageType.TEXT)
 
-    assert event.reply_to_text == "Item B: rotate keys"
+    assert event.reply_to_text == full_text
     assert event.reply_to_message_id == "42"
 
 
 def test_full_reply_text_used_when_no_native_quote():
-    """No ``message.quote`` → fall back to the whole replied-to message text."""
+    """No message.quote → use the whole replied-to message text."""
     from gateway.platforms.base import MessageType
 
     adapter = _make_adapter()
@@ -111,7 +108,7 @@ def test_full_reply_text_used_when_no_native_quote():
     assert event.reply_to_message_id == "42"
 
 
-def test_caption_fallback_when_no_quote_and_no_text():
+def test_caption_fallback_when_no_text():
     """Replied-to media message: caption is used when text is absent."""
     from gateway.platforms.base import MessageType
 
@@ -128,8 +125,8 @@ def test_caption_fallback_when_no_quote_and_no_text():
     assert event.reply_to_text == "Photo caption from earlier"
 
 
-def test_empty_quote_text_falls_back_to_full_reply():
-    """Defensive: a present-but-empty quote.text shouldn't blank the prefix."""
+def test_empty_quote_text_still_uses_full_reply():
+    """Defensive: a present-but-empty quote.text should not affect full reply context."""
     from gateway.platforms.base import MessageType
 
     adapter = _make_adapter()
