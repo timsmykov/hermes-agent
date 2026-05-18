@@ -133,7 +133,7 @@ class FailingAgent:
 
 
 class CompactingAgent:
-    """Emits the context-compaction lifecycle bubble and then clears it."""
+    """Emits context-compaction lifecycle bubbles and then clears them."""
 
     def __init__(self, **kwargs):
         self.status_callback = kwargs.get("status_callback")
@@ -142,6 +142,10 @@ class CompactingAgent:
     def run_conversation(self, message, conversation_history=None, task_id=None):
         cb = self.status_callback
         if cb is not None:
+            cb(
+                "lifecycle",
+                "📦 Preflight compression: ~181,272 tokens >= 176,800 threshold. This may take a moment.",
+            )
             cb("lifecycle", "🗜️ Compacting context — summarizing earlier conversation so I can continue...")
             cb("lifecycle.clear", "context_compaction")
         return {"final_response": "done", "messages": [], "api_calls": 1}
@@ -254,8 +258,12 @@ async def test_compaction_status_clears_when_compaction_finishes_even_without_cl
         if adapter.deleted:
             break
 
-    assert len(adapter.sent) == 1
-    assert adapter.deleted == [{"chat_id": "-1001", "message_id": adapter.sent[0]["message_id"]}]
+    assert len(adapter.sent) == 2
+    expected_deleted = [
+        {"chat_id": "-1001", "message_id": sent["message_id"]}
+        for sent in adapter.sent
+    ]
+    assert adapter.deleted == expected_deleted
 
 
 @pytest.mark.asyncio

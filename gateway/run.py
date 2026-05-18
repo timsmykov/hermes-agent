@@ -16924,7 +16924,10 @@ class GatewayRunner:
             )
             if _fut is None:
                 return
-            if event_type == "lifecycle" and message.startswith("🗜️ Compacting context"):
+            if event_type == "lifecycle" and (
+                message.startswith("🗜️ Compacting context")
+                or message.startswith("📦 Preflight compression:")
+            ):
                 _status_futures_by_key.setdefault("context_compaction", []).append(_fut)
             if event_type == "lifecycle" and (
                 message.startswith("⏳ Retrying in ")
