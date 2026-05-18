@@ -1788,6 +1788,11 @@ def run_conversation(
                         )
                 
                 has_retried_429 = False  # Reset on success
+                # Retry/backoff status bubbles are transient.  If the next API
+                # call succeeds, ask gateway renderers to delete the earlier
+                # "Retrying in …" / rate-limit wait messages so recovered
+                # provider hiccups don't leave chat clutter behind.
+                agent._clear_status("api_retry")
                 # Clear Nous rate limit state on successful request —
                 # proves the limit has reset and other sessions can
                 # resume hitting Nous.
