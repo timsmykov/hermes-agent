@@ -32,6 +32,13 @@ _ensure_telegram_mock()
 from gateway.platforms.telegram import TelegramAdapter  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _isolated_document_cache(monkeypatch, tmp_path):
+    from gateway.platforms import base
+
+    monkeypatch.setattr(base, "DOCUMENT_CACHE_DIR", tmp_path / "documents")
+
+
 def _make_adapter():
     adapter = TelegramAdapter(PlatformConfig(enabled=True, extra={}))
     adapter._text_batch_delay_seconds = 10
