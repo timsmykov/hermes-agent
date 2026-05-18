@@ -439,7 +439,8 @@ class TelegramAdapter(BasePlatformAdapter):
         self._clarify_state: Dict[str, str] = {}
         # Busy-choice prompt state: choice_id → {event, session_key, created_at}.
         # Used when display.busy_input_mode=ask and Telegram asks whether an
-        # active-session follow-up should be queued or steered into the current run.
+        # active-session follow-up should be queued, steered into the current run,
+        # or discarded so it never reaches agent context.
         self._busy_choice_state: Dict[str, Dict[str, Any]] = {}
         # Overflow edit chains: (chat_id, any_visible_message_id) → [message_ids].
         # Telegram streams long answers by editing/sending multiple messages once
@@ -2295,7 +2296,7 @@ class TelegramAdapter(BasePlatformAdapter):
         *,
         status_detail: str = "",
     ) -> SendResult:
-        """Send a Telegram inline prompt asking whether to queue or steer busy input."""
+        """Send a Telegram inline prompt asking how to handle busy input."""
         if not self._bot:
             return SendResult(success=False, error="Not connected")
 
@@ -2307,6 +2308,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 [
                     InlineKeyboardButton("⏳ В очередь", callback_data=f"bc:q:{choice_id}"),
                     InlineKeyboardButton("⏩ Прямо сейчас", callback_data=f"bc:s:{choice_id}"),
+                ],
+                [
+                    InlineKeyboardButton("🗑 Удалить", callback_data=f"bc:d:{choice_id}"),
                 ]
             ])
 
@@ -2799,13 +2803,13 @@ class TelegramAdapter(BasePlatformAdapter):
         query_thread_id = getattr(query_message, "message_thread_id", None)
         query_user_name = getattr(query.from_user, "first_name", None)
 
-        # --- Busy input choice callbacks (bc:q|s:choice_id) ---
+        # --- Busy input choice callbacks (bc:q|s|d:choice_id) ---
         if data.startswith("bc:"):
             parts = data.split(":", 2)
-            if len(parts) != 3 or parts[1] not in {"q", "s"}:
+            if len(parts) != 3 or parts[1] not in {"q", "s", "d"}:
                 await query.answer(text="Invalid busy-input choice.")
                 return
-            choice = "queue" if parts[1] == "q" else "steer"
+            choice = {"q": "queue", "s": "steer", "d": "discard"}[parts[1]]
             choice_id = parts[2]
 
             caller_id = str(getattr(query.from_user, "id", ""))
@@ -2849,8 +2853,22 @@ class TelegramAdapter(BasePlatformAdapter):
                 await query.answer(text="Failed to route the message.")
                 return
 
+            if handled and choice == "discard":
+                # Best-effort cleanup of the accidental original Telegram
+                # message as UI hygiene.  Even if Telegram refuses deletion
+                # (age/permissions/private-chat constraints), the event has
+                # already been discarded from Hermes' internal context path.
+                try:
+                    await self.delete_message(event.source.chat_id, event.message_id)
+                except Exception:
+                    pass
+
             if handled:
-                await query.answer(text="Queued." if choice == "queue" else "Steered.")
+                await query.answer(text={
+                    "queue": "Queued.",
+                    "steer": "Steered.",
+                    "discard": "Deleted.",
+                }.get(choice, "Done."))
             else:
                 await query.answer(text="Could not route the message.")
             return
