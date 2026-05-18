@@ -16530,6 +16530,11 @@ class GatewayRunner:
                 return
             if event_type == "lifecycle" and message.startswith("🗜️ Compacting context"):
                 _status_futures_by_key.setdefault("context_compaction", []).append(_fut)
+            if event_type == "lifecycle" and (
+                message.startswith("⏳ Retrying in ")
+                or message.startswith("⏱️ Rate limited. Waiting ")
+            ):
+                _status_futures_by_key.setdefault("api_retry", []).append(_fut)
             if _cleanup_progress:
                 def _track_status_id(fut) -> None:
                     try:
