@@ -34,7 +34,21 @@ def _make_event(text: str) -> MessageEvent:
 
 
 @pytest.mark.asyncio
-async def test_busy_choice_prompt_does_not_repeat_user_message():
+async def test_busy_choice_prompt_does_not_repeat_user_message(monkeypatch):
+    import gateway.platforms.telegram as tg_mod
+
+    class _Button:
+        def __init__(self, text, callback_data=None):
+            self.text = text
+            self.callback_data = callback_data
+
+    class _Markup:
+        def __init__(self, inline_keyboard):
+            self.inline_keyboard = inline_keyboard
+
+    monkeypatch.setattr(tg_mod, "InlineKeyboardButton", _Button)
+    monkeypatch.setattr(tg_mod, "InlineKeyboardMarkup", _Markup)
+
     adapter = _make_adapter()
     event = _make_event("это длинный prompt, который не должен повторяться в меню")
 
@@ -52,3 +66,10 @@ async def test_busy_choice_prompt_does_not_repeat_user_message():
     assert "это длинный prompt" not in text
     assert "<blockquote>" not in text
     assert kwargs["reply_markup"] is not None
+    rows = kwargs["reply_markup"].inline_keyboard
+    labels = [button.text for row in rows for button in row]
+    callback_data = [button.callback_data for row in rows for button in row]
+    assert "⏳ В очередь" in labels
+    assert "⏩ Прямо сейчас" in labels
+    assert "🗑 Удалить" in labels
+    assert any(data.startswith("bc:d:") for data in callback_data)
