@@ -13,6 +13,7 @@ Adapters without ``delete_message`` silently no-op.
 import asyncio
 import importlib
 import sys
+import threading
 import time
 import types
 from types import SimpleNamespace
@@ -166,6 +167,30 @@ def _make_runner(adapter):
         group_sessions_per_user=False,
         stt_enabled=False,
     )
+
+    async def _run_threaded(func, *args):
+        result = {}
+
+        def _target():
+            try:
+                result["value"] = func(*args)
+            except BaseException as exc:  # pragma: no cover - re-raised below
+                result["error"] = exc
+
+        thread = threading.Thread(target=_target)
+        thread.start()
+        while thread.is_alive():
+            await asyncio.sleep(0.01)
+        thread.join()
+        if "error" in result:
+            raise result["error"]
+        return result.get("value")
+
+    # These tests use tiny fake agents and only exercise callback wiring.
+    # Use a plain thread instead of the loop's default executor so callback
+    # scheduling still crosses a thread boundary without making
+    # pytest-asyncio tear down executor workers for every test case.
+    runner._run_in_executor_with_context = _run_threaded
     return runner
 
 

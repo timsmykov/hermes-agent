@@ -157,6 +157,10 @@ def _make_runner(session_db=None):
     return runner
 
 
+async def _inline_to_thread(func, /, *args, **kwargs):
+    return func(*args, **kwargs)
+
+
 @pytest.mark.asyncio
 async def test_root_telegram_dm_prompt_is_system_lobby_when_topic_mode_enabled(monkeypatch):
     import gateway.run as gateway_run
@@ -752,8 +756,10 @@ async def test_topic_root_command_creates_and_pins_system_topic(tmp_path, monkey
 @pytest.mark.asyncio
 async def test_auto_generated_title_renames_bound_telegram_topic(tmp_path, monkeypatch):
     import agent.title_generator as title_generator
+    import gateway.run as gateway_run
 
     monkeypatch.setattr(title_generator, "generate_topic_title", lambda title: None)
+    monkeypatch.setattr(gateway_run.asyncio, "to_thread", _inline_to_thread)
     db = SessionDB(db_path=tmp_path / "state.db")
     db.apply_telegram_topic_migration()
     db.create_session("sess-topic", source="telegram", user_id="208214988")
@@ -783,8 +789,10 @@ async def test_auto_generated_title_renames_bound_telegram_topic(tmp_path, monke
 @pytest.mark.asyncio
 async def test_auto_generated_title_renames_topic_even_without_topic_mode_table(tmp_path, monkeypatch):
     import agent.title_generator as title_generator
+    import gateway.run as gateway_run
 
     monkeypatch.setattr(title_generator, "generate_topic_title", lambda title: None)
+    monkeypatch.setattr(gateway_run.asyncio, "to_thread", _inline_to_thread)
     runner = _make_runner(session_db=None)
 
     await runner._rename_telegram_topic_for_session_title(
@@ -803,8 +811,10 @@ async def test_auto_generated_title_renames_topic_even_without_topic_mode_table(
 @pytest.mark.asyncio
 async def test_auto_generated_title_prefers_llm_two_word_topic_name(tmp_path, monkeypatch):
     import agent.title_generator as title_generator
+    import gateway.run as gateway_run
 
     monkeypatch.setattr(title_generator, "generate_topic_title", lambda title: "Топики Telegram")
+    monkeypatch.setattr(gateway_run.asyncio, "to_thread", _inline_to_thread)
     runner = _make_runner(session_db=None)
 
     await runner._rename_telegram_topic_for_session_title(
@@ -1108,5 +1118,4 @@ async def test_topic_refuses_unauthorized_user(tmp_path, monkeypatch):
         ).fetchall()
     }
     assert tables == set()
-
 
