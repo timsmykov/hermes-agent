@@ -331,6 +331,81 @@ async def _send_or_update_status_coro(adapter, chat_id, status_key, content, met
     return await adapter.send(chat_id, content, metadata=metadata)
 
 
+_SUBAGENT_PROGRESS_EVENTS = {
+    "subagent.start",
+    "subagent.tool",
+    "subagent.progress",
+    "subagent.thinking",
+    "subagent.complete",
+}
+
+
+def _format_subagent_progress_line(
+    event_type: str,
+    tool_name: Optional[str] = None,
+    preview: Optional[str] = None,
+    args: Optional[dict] = None,
+    *,
+    progress_mode: str = "all",
+    preview_cap: int = 40,
+    **kwargs,
+) -> Optional[str]:
+    """Return a Telegram-readable progress line for delegated subagent events.
+
+    ``delegate_task`` relays child-agent lifecycle/tool events up through the
+    parent's ``tool_progress_callback``.  The gateway's normal progress path
+    historically displayed only top-level ``tool.started`` events, so Tim could
+    see the orchestrator call ``delegate_task`` but not what the child agents
+    were doing.  This helper keeps that relay compact and deterministic.
+    """
+    if event_type not in _SUBAGENT_PROGRESS_EVENTS:
+        return None
+
+    def _short(text: Any, cap: int = preview_cap) -> str:
+        s = str(text or "").replace("\n", " ").strip()
+        if cap > 0 and len(s) > cap:
+            return s[: max(0, cap - 3)] + "..."
+        return s
+
+    goal = _short(kwargs.get("goal") or preview or "subtask", 72)
+    task_index = kwargs.get("task_index")
+    task_count = kwargs.get("task_count")
+    try:
+        label = f"agent {int(task_index) + 1}"
+        if task_count and int(task_count) > 1:
+            label += f"/{int(task_count)}"
+    except Exception:
+        label = "agent"
+
+    if event_type == "subagent.start":
+        return f"🤖 {label} start: \"{goal}\""
+
+    if event_type == "subagent.complete":
+        status = _short(kwargs.get("status") or preview or "done", 56)
+        return f"✅ {label} done: {status}"
+
+    if event_type == "subagent.thinking":
+        thought = _short(preview or tool_name or "thinking", 72)
+        return f"💭 {label}: \"{thought}\""
+
+    if event_type == "subagent.progress":
+        summary = _short(preview or tool_name or "progress", 96)
+        return f"🔀 {label}: {summary}"
+
+    if event_type == "subagent.tool":
+        from agent.display import get_tool_emoji
+
+        emoji = get_tool_emoji(tool_name or "", default="⚙️")
+        tool = tool_name or "tool"
+        if progress_mode == "verbose" and args:
+            arg_keys = list(args.keys())
+            return f"  ↳ {emoji} {label} {tool}({arg_keys})"
+        detail = _short(preview or "", preview_cap)
+        return f"  ↳ {emoji} {label} {tool}: \"{detail}\"" if detail else f"  ↳ {emoji} {label} {tool}"
+
+    return None
+
+
 def _telegramize_command_mentions(text: str, platform: Any) -> str:
     """Rewrite slash-command mentions to Telegram-valid command names.
 
@@ -16289,6 +16364,29 @@ class GatewayRunner:
                     logger.debug("tool-progress onboarding hint failed: %s", _hint_err)
                 return
 
+
+            # Relay delegated child-agent activity into the same progress bubble
+            # as top-level tools, so Telegram shows what spawned agents are doing
+            # without exposing raw child transcripts/reasoning.
+            if event_type in _SUBAGENT_PROGRESS_EVENTS:
+                try:
+                    from agent.display import get_tool_preview_max_len
+                    _pl = get_tool_preview_max_len()
+                    _cap = _pl if _pl > 0 else 40
+                except Exception:
+                    _cap = 40
+                msg = _format_subagent_progress_line(
+                    event_type,
+                    tool_name,
+                    preview,
+                    args,
+                    progress_mode=progress_mode,
+                    preview_cap=_cap,
+                    **kwargs,
+                )
+                if msg:
+                    progress_queue.put(msg)
+                return
 
             # Only act on tool.started events (ignore tool.completed, reasoning.available, etc.)
             if event_type not in {"tool.started",}:
