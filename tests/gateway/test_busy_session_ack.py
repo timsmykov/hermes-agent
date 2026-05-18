@@ -619,3 +619,24 @@ class TestBusySessionOnboardingHint:
         agent.steer.assert_called_once_with("steer from callback")
         assert sk not in adapter._pending_messages
         adapter._send_with_retry.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_busy_choice_discard_drops_without_pending_steer_interrupt_or_ack(self):
+        """Callback discard choice keeps accidental input out of agent context."""
+        runner, _sentinel = _make_runner()
+        adapter = _make_adapter()
+        event = _make_event(text="wrong topic accidental prompt")
+        sk = build_session_key(event.source)
+        runner.adapters[event.source.platform] = adapter
+        agent = MagicMock()
+        agent.steer = MagicMock(return_value=True)
+        runner._running_agents[sk] = agent
+
+        result = await runner._handle_busy_choice(event, sk, "discard")
+
+        assert result is True
+        agent.steer.assert_not_called()
+        agent.interrupt.assert_not_called()
+        assert sk not in adapter._pending_messages
+        adapter.handle_message.assert_not_called()
+        adapter._send_with_retry.assert_not_called()

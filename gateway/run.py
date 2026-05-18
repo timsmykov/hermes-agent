@@ -2759,7 +2759,13 @@ class GatewayRunner:
         return True
 
     async def _handle_busy_choice(self, event: MessageEvent, session_key: str, choice: str) -> bool:
-        """Route a Telegram busy-choice callback into queue/steer semantics."""
+        """Route a Telegram busy-choice callback into queue/steer/discard semantics."""
+        if choice == "discard":
+            # The original message was held out of pending context while the
+            # Telegram choice prompt was visible.  Discarding intentionally does
+            # nothing: no queue, no steer, no interrupt, and no normal replay if
+            # the active run already finished before the callback arrived.
+            return True
         mode = "steer" if choice == "steer" else "queue"
         return await self._route_busy_input(event, session_key, mode, send_ack=False)
 
