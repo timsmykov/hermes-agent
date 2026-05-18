@@ -2291,18 +2291,8 @@ class TelegramAdapter(BasePlatformAdapter):
 
         try:
             choice_id = os.urandom(6).hex()
-            preview = (event.text or "").strip()
-            if not preview and event.media_urls:
-                preview = "[media message]"
-            if len(preview) > 700:
-                preview = preview[:700] + "…"
-            escaped_preview = _html.escape(preview) if preview else "—"
             detail = f"\n{_html.escape(status_detail.strip(' ()'))}" if status_detail else ""
-            text = (
-                "Агент сейчас активен. Что сделать с новым сообщением?"
-                f"{detail}\n\n"
-                f"<blockquote>{escaped_preview}</blockquote>"
-            )
+            text = f"Агент сейчас активен. Что сделать с новым сообщением?{detail}"
             keyboard = InlineKeyboardMarkup([
                 [
                     InlineKeyboardButton("⏳ В очередь", callback_data=f"bc:q:{choice_id}"),
