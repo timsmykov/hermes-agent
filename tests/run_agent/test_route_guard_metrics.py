@@ -6,6 +6,7 @@ from agent.route_guard_metrics import (
     maintenance_criteria,
     next_mode,
     append_metric_event,
+    scorecard_from_events,
 )
 
 
@@ -137,3 +138,17 @@ def test_metric_jsonl_roundtrip_skips_corrupt_lines(tmp_path):
     events = load_metric_events(path)
 
     assert events == [{"event_type": "routed_turn_finalized", "payload": {"ordinary_success": True}}]
+
+
+def test_scorecard_from_events_counts_runtime_route_progress():
+    score = scorecard_from_events([
+        {"event_type": "route_detected", "route": "notion_page_analysis"},
+        {"event_type": "route_decision", "route": "notion_page_analysis", "action": "observe", "code": "wrong_route_observed"},
+        {"event_type": "tool_result", "route": "notion_page_analysis", "tool_class": "browser_ui", "failed": False},
+    ])
+
+    assert score.total_routed_turns_since_v2 == 1
+    assert score.routed_turns_window == 1
+    assert score.wrong_tool_first_call_count_window == 1
+    assert score.token_budget_status == "ok"
+    assert score.thin_harness_status == "pass"

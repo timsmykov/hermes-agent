@@ -19,6 +19,34 @@ Status = Literal["pass", "warning", "fail", "unknown"]
 
 
 @dataclass(frozen=True)
+class RouteGuardMetricsConfig:
+    enabled: bool = True
+    path: str = ".hermes/routeguard/metrics.jsonl"
+    dashboard_path: str = ".hermes/routeguard/dashboard.json"
+    incidents_dir: str = ".hermes/routeguard/incidents"
+    window_size: int = 100
+    scorecard_every_routed_turns: int = 25
+    scorecard_every_incidents: int = 10
+    dashboard_llm_summary: bool = False
+
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, Any] | None) -> "RouteGuardMetricsConfig":
+        defaults = cls()
+        if not isinstance(data, Mapping):
+            return defaults
+        return cls(
+            enabled=_as_bool(data.get("enabled"), defaults.enabled),
+            path=str(data.get("path") or defaults.path),
+            dashboard_path=str(data.get("dashboard_path") or defaults.dashboard_path),
+            incidents_dir=str(data.get("incidents_dir") or defaults.incidents_dir),
+            window_size=max(1, _as_int(data.get("window_size"), defaults.window_size)),
+            scorecard_every_routed_turns=max(1, _as_int(data.get("scorecard_every_routed_turns"), defaults.scorecard_every_routed_turns)),
+            scorecard_every_incidents=max(1, _as_int(data.get("scorecard_every_incidents"), defaults.scorecard_every_incidents)),
+            dashboard_llm_summary=_as_bool(data.get("dashboard_llm_summary"), defaults.dashboard_llm_summary),
+        )
+
+
+@dataclass(frozen=True)
 class RouteGuardScorecard:
     mode: LearningMode = "learning"
     total_routed_turns_since_v2: int = 0
@@ -214,6 +242,73 @@ def load_metric_events(path: str | Path) -> list[dict[str, Any]]:
     return events
 
 
+def scorecard_from_events(
+    events: Iterable[Mapping[str, Any]],
+    *,
+    window_size: int = 100,
+    mode: LearningMode = "learning",
+) -> RouteGuardScorecard:
+    """Build a deterministic scorecard from compact runtime events.
+
+    Events intentionally omit private user content and tool results. The scorecard
+    only needs route/tool/action counters for launch-mode progress visibility.
+    """
+    normalized = [dict(event) for event in events if isinstance(event, Mapping)]
+    route_turns = [event for event in normalized if event.get("event_type") == "route_detected"]
+    decision_events = [event for event in normalized if event.get("event_type") == "route_decision"]
+    window_decisions = decision_events[-max(1, int(window_size)):]
+    routed_window = route_turns[-max(1, int(window_size)):]
+    routejudge_latencies = []
+    for event in normalized:
+        sample = event.get("latency_ms")
+        if event.get("event_type") == "route_judge" and isinstance(sample, int):
+            routejudge_latencies.append(sample)
+    wrong_tool = [
+        event for event in window_decisions
+        if event.get("code") in {"wrong_route_observed", "block_wrong_route"}
+    ]
+    blocked_or_warn = [event for event in window_decisions if event.get("action") in {"warn", "block"}]
+    actionable = [event for event in blocked_or_warn if event.get("required_next_tools")]
+    return RouteGuardScorecard(
+        mode=mode,
+        total_routed_turns_since_v2=len(route_turns),
+        routed_turns_window=len(routed_window),
+        covered_routed_turns_window=len(routed_window),
+        wrong_tool_first_call_count_window=len(wrong_tool),
+        routejudge_latency_samples_ms=tuple(routejudge_latencies[-max(1, int(window_size)):]),
+        routejudge_uncached_calls_window=sum(1 for event in normalized[-max(1, int(window_size)):] if event.get("event_type") == "route_judge" and not event.get("cached")),
+        recovery_actionable_count_window=len(actionable),
+        recovery_block_warn_count_window=len(blocked_or_warn),
+        thin_harness_status="pass",
+    )
+
+
+class RouteGuardMetricsSink:
+    """Tiny deterministic sink for RouteGuard runtime metrics.
+
+    It writes compact JSONL events and refreshes dashboard.json without any LLM
+    calls. Failures are swallowed by callers so metrics never break tool dispatch.
+    """
+
+    def __init__(self, config: RouteGuardMetricsConfig | None = None):
+        self.config = config or RouteGuardMetricsConfig()
+
+    def emit(self, event_type: str, **payload: Any) -> None:
+        if not self.config.enabled:
+            return
+        event = {
+            "event_type": event_type,
+            "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            **{k: v for k, v in payload.items() if v is not None},
+        }
+        append_metric_event(self.config.path, event)
+        events = load_metric_events(self.config.path)
+        write_dashboard(
+            self.config.dashboard_path,
+            scorecard_from_events(events, window_size=self.config.window_size),
+        )
+
+
 def scorecard_to_json(score: RouteGuardScorecard) -> dict[str, Any]:
     data = asdict(score)
     data["fixture_accuracy"] = score.fixture_accuracy
@@ -224,6 +319,31 @@ def scorecard_to_json(score: RouteGuardScorecard) -> dict[str, Any]:
     data["recovery_quality"] = score.recovery_quality
     data["token_budget_status"] = score.token_budget_status
     return data
+
+
+def _as_bool(value: Any, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on", "enabled"}:
+            return True
+        if lowered in {"0", "false", "no", "off", "disabled"}:
+            return False
+    return default
+
+
+def _as_int(value: Any, default: int) -> int:
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _rate(numerator: int, denominator: int) -> float:

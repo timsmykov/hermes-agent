@@ -21,6 +21,7 @@ from agent.route_judge import (
     validate_route_judge,
 )
 from agent.route_policies import BUILTIN_ROUTE_POLICIES, NOTION_PAGE_ANALYSIS_POLICY, ROUTE_NOTION_PAGE_ANALYSIS
+from agent.route_guard_metrics import RouteGuardMetricsConfig, RouteGuardMetricsSink
 
 
 _ROUTE_NOTION_PAGE_ANALYSIS = ROUTE_NOTION_PAGE_ANALYSIS
@@ -32,6 +33,7 @@ class RouteGuardConfig:
     mode: str = "observe"  # observe | warn | enforce
     trace_enabled: bool = True
     judge: RouteJudgeConfig = field(default_factory=RouteJudgeConfig)
+    metrics: RouteGuardMetricsConfig = field(default_factory=RouteGuardMetricsConfig)
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any] | None) -> "RouteGuardConfig":
@@ -43,6 +45,7 @@ class RouteGuardConfig:
             mode=_mode(data.get("mode"), defaults.mode),
             trace_enabled=_as_bool(data.get("trace_enabled"), defaults.trace_enabled),
             judge=RouteJudgeConfig.from_mapping(data.get("judge") if isinstance(data.get("judge"), Mapping) else None),
+            metrics=RouteGuardMetricsConfig.from_mapping(data.get("metrics") if isinstance(data.get("metrics"), Mapping) else None),
         )
 
 
@@ -104,6 +107,7 @@ class RouteGuardController:
         self._route_judge = route_judge
         self._judge_cache: dict[str, RouteJudgeEnvelope] = {}
         self._judge_calls_this_turn = 0
+        self._metrics = RouteGuardMetricsSink(self.config.metrics)
 
     def reset_for_turn(self, user_message: str | None = None) -> None:
         text = user_message or ""
@@ -119,6 +123,23 @@ class RouteGuardController:
             user_explicit_browser=_user_explicitly_requested_browser(text),
             judge_envelope=judge_envelope,
         )
+        if self.config.enabled and route:
+            self._emit_metric(
+                "route_detected",
+                route=route,
+                judge_status=judge_envelope.status,
+                judge_accepted=judge_envelope.accepted,
+            )
+            if judge_envelope.status != "not_called":
+                self._emit_metric(
+                    "route_judge",
+                    route=judge_envelope.route,
+                    status=judge_envelope.status,
+                    accepted=judge_envelope.accepted,
+                    confidence=judge_envelope.confidence,
+                    latency_ms=judge_envelope.latency_ms,
+                    cached=judge_envelope.cached,
+                )
 
     @property
     def active_route(self) -> str:
@@ -132,6 +153,7 @@ class RouteGuardController:
 
         decision = self._notion_before_call(tool_name, args, tool_class)
         self._trace(decision)
+        self._emit_metric("route_decision", **decision.to_metadata())
         return decision
 
     def after_call(
@@ -151,6 +173,16 @@ class RouteGuardController:
                 self.state.notion_api_failed = True
             else:
                 self.state.notion_content_available = True
+        self._emit_metric(
+            "tool_result",
+            route=self.state.route,
+            tool_name=tool_name,
+            tool_class=tool_class,
+            failed=bool(failed),
+            notion_api_attempted=self.state.notion_api_attempted,
+            notion_api_failed=self.state.notion_api_failed,
+            notion_content_available=self.state.notion_content_available,
+        )
 
     def _judge_for_turn(self, text: str) -> RouteJudgeEnvelope:
         if not self.config.enabled or not self.config.judge.enabled or self._route_judge is None or not text.strip():
@@ -275,6 +307,13 @@ class RouteGuardController:
     def _trace(self, decision: RouteGuardDecision) -> None:
         if self.config.trace_enabled and decision.route:
             self.state.trace.append(decision.to_metadata())
+
+    def _emit_metric(self, event_type: str, **payload: Any) -> None:
+        try:
+            self._metrics.emit(event_type, **payload)
+        except Exception:
+            # Metrics are observability only; never break routing/tool dispatch.
+            return
 
 
 def classify_tool(tool_name: str, args: Mapping[str, Any] | None = None) -> str:
