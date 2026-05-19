@@ -11129,7 +11129,6 @@ class GatewayRunner:
         if state is None:
             return "🎯 Цель\n\nАктивной цели нет. Поставь новую: /goal <текст>"
 
-        turns = f"{getattr(state, 'turns_used', 0)}/{getattr(state, 'max_turns', 0)}"
         status = self._goal_status_label(getattr(state, "status", ""))
         lines = [
             headline,
@@ -11138,7 +11137,6 @@ class GatewayRunner:
             str(getattr(state, "goal", "") or "").strip(),
             "",
             f"Статус: {status}",
-            f"Ходы: {turns}",
         ]
         subgoals = list(getattr(state, "subgoals", None) or [])
         if subgoals:
