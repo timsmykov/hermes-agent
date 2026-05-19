@@ -52,11 +52,29 @@ class _RecordingAdapter:
         self.sends: list[dict] = []
 
     async def send(self, chat_id: str, content: str, reply_to=None, metadata=None):
-        self.sends.append({"chat_id": chat_id, "content": content, "metadata": metadata})
+        self.sends.append({"chat_id": chat_id, "content": content, "metadata": metadata, "kind": "send"})
 
         class _R:
             success = True
             message_id = "mock-msg"
+
+        return _R()
+
+    async def send_goal_card(self, chat_id: str, content: str, metadata=None):
+        self.sends.append({"chat_id": chat_id, "content": content, "metadata": metadata, "kind": "goal_card"})
+
+        class _R:
+            success = True
+            message_id = "goal-card-msg"
+
+        return _R()
+
+    async def edit_goal_card(self, chat_id: str, message_id: str, content: str, metadata=None):
+        self.sends.append({"chat_id": chat_id, "message_id": message_id, "content": content, "metadata": metadata, "kind": "goal_card_edit"})
+
+        class _R:
+            success = True
+            message_id = message_id
 
         return _R()
 
@@ -116,8 +134,10 @@ async def test_goal_verdict_done_sent_via_adapter_send(hermes_home):
         # fire-and-forget create_task — give the loop a tick
         await asyncio.sleep(0.05)
 
-    assert len(adapter.sends) == 1, f"expected 1 send, got {len(adapter.sends)}: {adapter.sends}"
-    msg = adapter.sends[0]
+    assert len(adapter.sends) == 2, f"expected card + done send, got {len(adapter.sends)}: {adapter.sends}"
+    assert adapter.sends[0]["kind"] == "goal_card"
+    assert "Цель выполнена" in adapter.sends[0]["content"]
+    msg = adapter.sends[1]
     assert msg["chat_id"] == "c1"
     assert "Goal achieved" in msg["content"]
     assert "the feature shipped" in msg["content"]
@@ -144,9 +164,11 @@ async def test_goal_verdict_continue_enqueues_continuation(hermes_home):
         )
         await asyncio.sleep(0.05)
 
-    # Status line sent back
+    # Status card updated back; the per-turn continuation notice stays inside
+    # the card to avoid noisy Telegram messages on every forced turn.
     assert len(adapter.sends) == 1
-    assert "Continuing toward goal" in adapter.sends[0]["content"]
+    assert adapter.sends[0]["kind"] == "goal_card"
+    assert "Форсирую следующий ход" in adapter.sends[0]["content"]
     # Continuation prompt enqueued for next turn
     assert adapter._pending_messages, "continuation prompt must be enqueued in pending_messages"
 
@@ -172,8 +194,10 @@ async def test_goal_verdict_budget_exhausted_sends_pause(hermes_home):
         )
         await asyncio.sleep(0.05)
 
-    assert len(adapter.sends) == 1
-    content = adapter.sends[0]["content"]
+    assert len(adapter.sends) == 2
+    assert adapter.sends[0]["kind"] == "goal_card"
+    assert "Цель на паузе" in adapter.sends[0]["content"]
+    content = adapter.sends[1]["content"]
     assert "paused" in content.lower()
     assert "turns used" in content.lower()
     # No continuation enqueued when budget is exhausted
@@ -219,3 +243,45 @@ async def test_goal_verdict_survives_adapter_without_send(hermes_home):
             final_response="whatever",
         )
         await asyncio.sleep(0.05)
+
+
+@pytest.mark.asyncio
+async def test_goal_set_sends_control_card_and_queues_kickoff(hermes_home):
+    runner, adapter, session_entry, src = _make_runner_with_adapter()
+
+    from gateway.platforms.base import MessageEvent, MessageType
+
+    result = await runner._handle_goal_command(MessageEvent(
+        text="/goal make Telegram goals visible",
+        message_type=MessageType.TEXT,
+        source=src,
+        message_id="incoming-1",
+    ))
+
+    assert result == ""
+    assert len(adapter.sends) == 1
+    card = adapter.sends[0]
+    assert card["kind"] == "goal_card"
+    assert "Цель активирована" in card["content"]
+    assert "make Telegram goals visible" in card["content"]
+    assert card["metadata"]["goal_status"] == "active"
+    assert card["metadata"].get("goal_control_id")
+    assert adapter._pending_messages, "goal text should be queued as kickoff turn"
+
+
+@pytest.mark.asyncio
+async def test_goal_pause_button_updates_card_and_clears_continuation(hermes_home):
+    runner, adapter, session_entry, src = _make_runner_with_adapter()
+
+    from hermes_cli.goals import GoalManager
+
+    GoalManager(session_entry.session_id).set("pause me")
+    adapter._pending_messages[build_session_key(src)] = "[Continuing toward your standing goal]\nGoal: pause me"
+    metadata = runner._goal_card_metadata_for_source(src, GoalManager(session_entry.session_id).state)
+
+    result = await runner._handle_goal_button_action("p", metadata)
+
+    assert "пауз" in result.lower()
+    assert not adapter._pending_messages
+    assert adapter.sends[-1]["kind"] == "goal_card"
+    assert "Цель на паузе" in adapter.sends[-1]["content"]

@@ -26,6 +26,7 @@ except ModuleNotFoundError:
 
 import asyncio
 import dataclasses
+import hashlib
 import inspect
 import json
 import logging
@@ -10838,6 +10839,184 @@ class GatewayRunner:
         max_turns = self._goal_max_turns_from_config()
         return GoalManager(session_id=sid, default_max_turns=max_turns), session_entry
 
+    @staticmethod
+    def _goal_status_label(status: str) -> str:
+        labels = {
+            "active": "работаю",
+            "paused": "на паузе",
+            "done": "выполнена",
+            "cleared": "снята",
+        }
+        return labels.get(str(status or "").lower(), str(status or "unknown"))
+
+    @staticmethod
+    def _goal_short_reason(reason: Any, *, cap: int = 220) -> str:
+        text = str(reason or "").strip()
+        if len(text) > cap:
+            return text[: max(0, cap - 1)].rstrip() + "…"
+        return text
+
+    def _render_goal_card(self, state: Any, *, headline: str = "🎯 Активная цель") -> str:
+        """Render the durable Telegram-visible /goal control card."""
+        if state is None:
+            return "🎯 Цель\n\nАктивной цели нет. Поставь новую: /goal <текст>"
+
+        turns = f"{getattr(state, 'turns_used', 0)}/{getattr(state, 'max_turns', 0)}"
+        status = self._goal_status_label(getattr(state, "status", ""))
+        lines = [
+            headline,
+            "",
+            "Цель:",
+            str(getattr(state, "goal", "") or "").strip(),
+            "",
+            f"Статус: {status}",
+            f"Ходы: {turns}",
+        ]
+        subgoals = list(getattr(state, "subgoals", None) or [])
+        if subgoals:
+            lines.append(f"Критерии: {len(subgoals)}")
+        reason = self._goal_short_reason(getattr(state, "last_reason", None) or getattr(state, "paused_reason", None))
+        if reason:
+            lines.extend(["", f"Последний verdict: {reason}"])
+        lines.extend(["", "Управление: кнопки ниже или /goal status · /goal pause · /goal resume · /goal clear"])
+        return "\n".join(lines)
+
+    def _goal_control_id_for_source(self, source: Any) -> str:
+        try:
+            session_key = self._session_key_for_source(source)
+        except Exception:
+            session_key = str(getattr(source, "chat_id", "") or "goal")
+        return hashlib.sha1(str(session_key).encode("utf-8")).hexdigest()[:12]
+
+    def _goal_card_metadata_for_source(self, source: Any, state: Any = None) -> Dict[str, Any]:
+        metadata = self._thread_metadata_for_source(source) if source is not None else {}
+        metadata = dict(metadata or {})
+        metadata["notify"] = True
+        metadata["goal_control_id"] = self._goal_control_id_for_source(source)
+        metadata["goal_status"] = getattr(state, "status", "active") if state is not None else "none"
+        if source is not None:
+            metadata["goal_source"] = {
+                "platform": getattr(getattr(source, "platform", None), "value", getattr(source, "platform", None)),
+                "chat_id": str(getattr(source, "chat_id", "") or ""),
+                "chat_type": str(getattr(source, "chat_type", "") or ""),
+                "user_id": str(getattr(source, "user_id", "") or ""),
+                "user_name": getattr(source, "user_name", None),
+                "thread_id": str(getattr(source, "thread_id", "") or "") if getattr(source, "thread_id", None) is not None else None,
+            }
+        return metadata
+
+    def _goal_card_store(self) -> Dict[str, str]:
+        store = getattr(self, "_goal_card_message_ids", None)
+        if not isinstance(store, dict):
+            store = {}
+            self._goal_card_message_ids = store
+        return store
+
+    async def _send_or_update_goal_card(self, source: Any, state: Any, *, headline: str) -> None:
+        if source is None:
+            return
+        adapter = self.adapters.get(source.platform)
+        if not adapter:
+            return
+        text = self._render_goal_card(state, headline=headline)
+        metadata = self._goal_card_metadata_for_source(source, state)
+        try:
+            session_key = self._session_key_for_source(source)
+        except Exception:
+            session_key = self._goal_control_id_for_source(source)
+        store = self._goal_card_store()
+        message_id = store.get(session_key)
+
+        try:
+            if message_id and hasattr(adapter, "edit_goal_card"):
+                result = await adapter.edit_goal_card(
+                    chat_id=source.chat_id,
+                    message_id=message_id,
+                    content=text,
+                    metadata=metadata,
+                )
+                if result is not None and getattr(result, "success", False):
+                    return
+            if hasattr(adapter, "send_goal_card"):
+                result = await adapter.send_goal_card(
+                    chat_id=source.chat_id,
+                    content=text,
+                    metadata=metadata,
+                )
+            else:
+                result = await adapter.send(source.chat_id, text, metadata=metadata)
+            new_message_id = getattr(result, "message_id", None) if result is not None else None
+            if new_message_id:
+                store[session_key] = str(new_message_id)
+        except Exception as exc:
+            logger.debug("goal card update failed: %s", exc, exc_info=True)
+
+    async def _handle_goal_button_action(self, action: str, callback_info: Dict[str, Any]) -> str:
+        """Handle Telegram goal-card inline buttons."""
+        try:
+            from gateway.session import SessionSource
+        except Exception:
+            return "Goal controls unavailable."
+        source_info = (callback_info or {}).get("goal_source") or {}
+        platform_value = source_info.get("platform") or "telegram"
+        try:
+            platform = Platform(platform_value)
+        except Exception:
+            platform = Platform.TELEGRAM
+        source = SessionSource(
+            platform=platform,
+            chat_id=str(source_info.get("chat_id") or ""),
+            chat_type=str(source_info.get("chat_type") or "dm"),
+            user_id=str(source_info.get("user_id") or ""),
+            user_name=source_info.get("user_name"),
+            thread_id=source_info.get("thread_id"),
+        )
+        mgr, _session_entry = self._get_goal_manager_for_event(MessageEvent(text="/goal", source=source))
+        if mgr is None:
+            return t("gateway.goal.unavailable")
+
+        action = (action or "").lower()
+        if action in {"status", "s"}:
+            state = mgr.state
+            await self._send_or_update_goal_card(source, state, headline="🎯 Активная цель" if state else "🎯 Цель")
+            return "Статус обновлён."
+        if action in {"pause", "p"}:
+            state = mgr.pause(reason="user-paused")
+            if state is None:
+                await self._send_or_update_goal_card(source, None, headline="🎯 Цель")
+                return t("gateway.goal.no_goal_set")
+            try:
+                adapter = self.adapters.get(source.platform)
+                _quick_key = self._session_key_for_source(source)
+                if adapter and _quick_key:
+                    self._clear_goal_pending_continuations(_quick_key, adapter)
+            except Exception:
+                pass
+            await self._send_or_update_goal_card(source, state, headline="⏸ Цель на паузе")
+            return "Цель поставлена на паузу."
+        if action in {"resume", "r"}:
+            state = mgr.resume()
+            if state is None:
+                return t("gateway.goal.no_resume")
+            await self._send_or_update_goal_card(source, state, headline="▶ Цель возобновлена")
+            return "Цель возобновлена."
+        if action in {"clear", "c"}:
+            had = mgr.has_goal()
+            old_state = mgr.state
+            mgr.clear()
+            try:
+                adapter = self.adapters.get(source.platform)
+                _quick_key = self._session_key_for_source(source)
+                if adapter and _quick_key:
+                    self._clear_goal_pending_continuations(_quick_key, adapter)
+            except Exception:
+                pass
+            if old_state is not None:
+                old_state.status = "cleared"
+            await self._send_or_update_goal_card(source, old_state, headline="✅ Цель снята" if had else "🎯 Цель")
+            return "Цель снята." if had else t("gateway.no_active_goal")
+        return "Неизвестное действие цели."
+
     async def _handle_goal_command(self, event: "MessageEvent") -> str:
         """Handle /goal for gateway platforms.
 
@@ -10857,7 +11036,12 @@ class GatewayRunner:
             return t("gateway.goal.unavailable")
 
         if not args or lower == "status":
-            return mgr.status_line()
+            await self._send_or_update_goal_card(
+                event.source,
+                mgr.state,
+                headline="🎯 Активная цель" if mgr.state else "🎯 Цель",
+            )
+            return ""
 
         if lower == "pause":
             state = mgr.pause(reason="user-paused")
@@ -10870,17 +11054,22 @@ class GatewayRunner:
                     self._clear_goal_pending_continuations(_quick_key, adapter)
             except Exception as exc:
                 logger.debug("goal pause: pending continuation cleanup failed: %s", exc)
-            return t("gateway.goal.paused", goal=state.goal)
+            await self._send_or_update_goal_card(event.source, state, headline="⏸ Цель на паузе")
+            return ""
 
         if lower == "resume":
             state = mgr.resume()
             if state is None:
                 return t("gateway.goal.no_resume")
-            return t("gateway.goal.resumed", goal=state.goal)
+            await self._send_or_update_goal_card(event.source, state, headline="▶ Цель возобновлена")
+            return ""
 
         if lower in {"clear", "stop", "done"}:
             had = mgr.has_goal()
+            old_state = mgr.state
             mgr.clear()
+            if old_state is not None:
+                old_state.status = "cleared"
             try:
                 adapter = self.adapters.get(event.source.platform) if event.source else None
                 _quick_key = self._session_key_for_source(event.source) if event.source else None
@@ -10888,7 +11077,8 @@ class GatewayRunner:
                     self._clear_goal_pending_continuations(_quick_key, adapter)
             except Exception as exc:
                 logger.debug("goal clear: pending continuation cleanup failed: %s", exc)
-            return t("gateway.goal_cleared") if had else t("gateway.no_active_goal")
+            await self._send_or_update_goal_card(event.source, old_state, headline="✅ Цель снята" if had else "🎯 Цель")
+            return ""
 
         # Otherwise — treat the remaining text as the new goal.
         try:
@@ -10913,7 +11103,8 @@ class GatewayRunner:
             except Exception as exc:
                 logger.debug("goal kickoff enqueue failed: %s", exc)
 
-        return t("gateway.goal.set", budget=state.max_turns, goal=state.goal)
+        await self._send_or_update_goal_card(event.source, state, headline="🎯 Цель активирована")
+        return ""
 
     async def _handle_subgoal_command(self, event: "MessageEvent") -> str:
         """Handle /subgoal for gateway platforms (mirror of CLI handler).
@@ -11063,6 +11254,17 @@ class GatewayRunner:
 
         decision = mgr.evaluate_after_turn(final_response or "", user_initiated=True)
         msg = decision.get("message") or ""
+        state = mgr.state
+        if source is not None and state is not None:
+            if decision.get("verdict") == "done" or decision.get("status") == "done":
+                headline = "✅ Цель выполнена"
+            elif decision.get("status") == "paused":
+                headline = "⏸ Цель на паузе"
+            elif decision.get("should_continue"):
+                headline = "↪️ Форсирую следующий ход"
+            else:
+                headline = "🎯 Активная цель"
+            await self._send_or_update_goal_card(source, state, headline=headline)
 
         # Defer the status line until after the adapter has delivered the
         # agent's visible final response. The judge runs after the response is
@@ -11070,7 +11272,7 @@ class GatewayRunner:
         # would show "✓ Goal achieved" before the answer itself. Registering
         # an awaited post-delivery callback preserves delivery reliability
         # without reversing the user-visible ordering.
-        if msg and source is not None:
+        if msg and source is not None and not decision.get("should_continue"):
             await self._defer_goal_status_notice_after_delivery(source, msg)
 
         if not decision.get("should_continue"):
