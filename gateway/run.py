@@ -243,7 +243,6 @@ _SUBAGENT_PROGRESS_EVENTS = {
     "subagent.start",
     "subagent.tool",
     "subagent.progress",
-    "subagent.thinking",
     "subagent.complete",
 }
 
@@ -384,10 +383,6 @@ def _format_subagent_progress_line(
     if event_type == "subagent.complete":
         status = _short(kwargs.get("status") or preview or "done", 56)
         return f"✅ {label} done: {status}"
-
-    if event_type == "subagent.thinking":
-        thought = _short(preview or tool_name or "thinking", 72)
-        return f"💭 {label}: \"{thought}\""
 
     if event_type == "subagent.progress":
         summary = _short(preview or tool_name or "progress", 96)
@@ -16397,7 +16392,7 @@ class GatewayRunner:
                             block_title,
                             msg,
                             event_type in {"subagent.start", "subagent.complete"},
-                            "thinking" if event_type == "subagent.thinking" else None,
+                            None,
                         )
                     )
                 return
