@@ -28,25 +28,47 @@ _ROUTE_NOTION_PAGE_ANALYSIS = ROUTE_NOTION_PAGE_ANALYSIS
 
 
 @dataclass(frozen=True)
+class RouteGuardSelfImprovementConfig:
+    enabled: bool = False
+    ordinary_success_llm_calls_allowed: int = 0
+    max_synthesis_per_routed_turn_window: int = 1
+    synthesis_window_routed_turns: int = 25
+
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, Any] | None) -> "RouteGuardSelfImprovementConfig":
+        defaults = cls()
+        if not isinstance(data, Mapping):
+            return defaults
+        return cls(
+            enabled=_as_bool(data.get("enabled"), defaults.enabled),
+            ordinary_success_llm_calls_allowed=max(0, _as_int(data.get("ordinary_success_llm_calls_allowed"), defaults.ordinary_success_llm_calls_allowed)),
+            max_synthesis_per_routed_turn_window=max(0, _as_int(data.get("max_synthesis_per_routed_turn_window"), defaults.max_synthesis_per_routed_turn_window)),
+            synthesis_window_routed_turns=max(1, _as_int(data.get("synthesis_window_routed_turns"), defaults.synthesis_window_routed_turns)),
+        )
+
+
+@dataclass(frozen=True)
 class RouteGuardConfig:
     enabled: bool = False
     mode: str = "observe"  # observe | warn | enforce
     trace_enabled: bool = True
     judge: RouteJudgeConfig = field(default_factory=RouteJudgeConfig)
     metrics: RouteGuardMetricsConfig = field(default_factory=RouteGuardMetricsConfig)
+    self_improvement: RouteGuardSelfImprovementConfig = field(default_factory=RouteGuardSelfImprovementConfig)
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any] | None) -> "RouteGuardConfig":
-        defaults = cls()
         if not isinstance(data, Mapping):
-            return defaults
+            return cls()
         return cls(
-            enabled=_as_bool(data.get("enabled"), defaults.enabled),
-            mode=_mode(data.get("mode"), defaults.mode),
-            trace_enabled=_as_bool(data.get("trace_enabled"), defaults.trace_enabled),
+            enabled=_as_bool(data.get("enabled"), False),
+            mode=str(data.get("mode", "observe")),
+            trace_enabled=_as_bool(data.get("trace_enabled"), True),
             judge=RouteJudgeConfig.from_mapping(data.get("judge") if isinstance(data.get("judge"), Mapping) else None),
             metrics=RouteGuardMetricsConfig.from_mapping(data.get("metrics") if isinstance(data.get("metrics"), Mapping) else None),
+            self_improvement=RouteGuardSelfImprovementConfig.from_mapping(data.get("self_improvement") if isinstance(data.get("self_improvement"), Mapping) else None),
         )
+
 
 
 @dataclass(frozen=True)
@@ -455,6 +477,15 @@ def _as_bool(value: Any, default: bool) -> bool:
         if lowered in {"0", "false", "no", "off", "disabled"}:
             return False
     return default
+
+
+def _as_int(value: Any, default: int) -> int:
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _mode(value: Any, default: str) -> str:
