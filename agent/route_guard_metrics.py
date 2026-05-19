@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -302,11 +303,47 @@ class RouteGuardMetricsSink:
             **{k: v for k, v in payload.items() if v is not None},
         }
         append_metric_event(self.config.path, event)
+        self._maybe_write_incident(event)
         events = load_metric_events(self.config.path)
         write_dashboard(
             self.config.dashboard_path,
             scorecard_from_events(events, window_size=self.config.window_size),
         )
+
+    def _maybe_write_incident(self, event: Mapping[str, Any]) -> None:
+        if event.get("event_type") != "route_decision":
+            return
+        action = str(event.get("action") or "")
+        code = str(event.get("code") or "")
+        if action not in {"warn", "block"} and code != "wrong_route_observed":
+            return
+        incidents_dir = Path(self.config.incidents_dir)
+        incidents_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        route = _slug(str(event.get("route") or "unknown"))
+        filename = f"{stamp}-{route}-{_slug(code or action)}.json"
+        incident = {
+            "schema_version": 1,
+            "severity": "P2" if action != "block" else "P1",
+            "status": "captured",
+            "source": "route_guard",
+            "captured_at": event.get("timestamp"),
+            "route": event.get("route"),
+            "action": action,
+            "code": code,
+            "tool": event.get("tool"),
+            "tool_class": event.get("tool_class"),
+            "reason": event.get("reason"),
+            "required_next_tools": event.get("required_next_tools") or [],
+            "escalation_allowed_if": event.get("escalation_allowed_if") or [],
+            "raw_user_text_stored": False,
+            "promotion": {
+                "fixture_required": True,
+                "auto_promote": False,
+                "review_required": True,
+            },
+        }
+        (incidents_dir / filename).write_text(json.dumps(incident, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
 def scorecard_to_json(score: RouteGuardScorecard) -> dict[str, Any]:
@@ -319,6 +356,11 @@ def scorecard_to_json(score: RouteGuardScorecard) -> dict[str, Any]:
     data["recovery_quality"] = score.recovery_quality
     data["token_budget_status"] = score.token_budget_status
     return data
+
+
+def _slug(value: str) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9_.-]+", "-", value.strip().lower()).strip("-")
+    return slug[:80] or "unknown"
 
 
 def _as_bool(value: Any, default: bool) -> bool:

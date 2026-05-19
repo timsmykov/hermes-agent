@@ -7,6 +7,8 @@ from agent.route_guard_metrics import (
     next_mode,
     append_metric_event,
     scorecard_from_events,
+    RouteGuardMetricsConfig,
+    RouteGuardMetricsSink,
 )
 
 
@@ -152,3 +154,33 @@ def test_scorecard_from_events_counts_runtime_route_progress():
     assert score.wrong_tool_first_call_count_window == 1
     assert score.token_budget_status == "ok"
     assert score.thin_harness_status == "pass"
+
+
+def test_routeguard_metrics_sink_captures_incident_without_raw_text(tmp_path):
+    metrics_path = tmp_path / "metrics.jsonl"
+    dashboard_path = tmp_path / "dashboard.json"
+    incidents_dir = tmp_path / "incidents"
+    sink = RouteGuardMetricsSink(RouteGuardMetricsConfig(
+        enabled=True,
+        path=str(metrics_path),
+        dashboard_path=str(dashboard_path),
+        incidents_dir=str(incidents_dir),
+    ))
+
+    sink.emit(
+        "route_decision",
+        route="notion_page_analysis",
+        action="warn",
+        code="wrong_route_observed",
+        tool="mcp_browser_use_browser_navigate",
+        tool_class="browser_ui",
+        reason="Use Notion API before browser.",
+        required_next_tools=["mcp_notion_notion_get_page"],
+    )
+
+    incident_files = list(incidents_dir.glob("*.json"))
+    assert len(incident_files) == 1
+    incident = __import__("json").loads(incident_files[0].read_text())
+    assert incident["source"] == "route_guard"
+    assert incident["raw_user_text_stored"] is False
+    assert incident["promotion"]["review_required"] is True
