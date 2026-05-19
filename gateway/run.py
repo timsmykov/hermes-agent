@@ -246,6 +246,99 @@ _SUBAGENT_PROGRESS_EVENTS = {
     "subagent.complete",
 }
 
+_PROGRESS_BLOCK_EVENT = "__progress_block__"
+_PROGRESS_MAIN_BLOCK_ID = "main"
+_PROGRESS_VISIBLE_STEPS_PER_BLOCK = 15
+
+
+def _append_progress_block_line(
+    blocks: OrderedDict,
+    block_id: str,
+    title: str,
+    line: str,
+    *,
+    pinned: bool = False,
+    replace_kind: Optional[str] = None,
+    visible_limit: int = _PROGRESS_VISIBLE_STEPS_PER_BLOCK,
+) -> None:
+    """Update a structured progress block in-place.
+
+    Telegram can only edit the whole progress bubble, but keeping progress as
+    blocks lets the rendered message look like independent panes: main agent,
+    agent 1/N, agent 2/N, etc. Pinned lifecycle lines survive trimming; noisy
+    thinking/progress updates are replace-in-place where possible.
+    """
+    if not line:
+        return
+    if block_id not in blocks:
+        blocks[block_id] = {"title": title, "lines": []}
+    block = blocks[block_id]
+    current_title = block.get("title") or block_id
+    # A start event often has the goal while later tool/thinking events only have
+    # "agent i/n". Do not downgrade a richer title once we have it.
+    if title and not (" — " in str(current_title) and " — " not in str(title)):
+        block["title"] = title
+    else:
+        block["title"] = current_title
+    lines = block.setdefault("lines", [])
+
+    if replace_kind:
+        for item in reversed(lines):
+            if item.get("kind") == replace_kind:
+                item["text"] = line
+                item["pinned"] = bool(pinned)
+                return
+
+    lines.append({"text": line, "pinned": bool(pinned), "kind": replace_kind})
+    _trim_progress_block_lines(block, visible_limit=visible_limit)
+
+
+def _trim_progress_block_lines(block: dict, *, visible_limit: int = _PROGRESS_VISIBLE_STEPS_PER_BLOCK) -> None:
+    """Keep each block readable while preserving important lifecycle lines."""
+    lines = block.get("lines") or []
+    if visible_limit <= 0 or len(lines) <= visible_limit:
+        return
+
+    pinned = [item for item in lines if item.get("pinned")]
+    unpinned = [item for item in lines if not item.get("pinned")]
+    keep_unpinned_count = max(0, visible_limit - len(pinned))
+    kept_unpinned = unpinned[-keep_unpinned_count:] if keep_unpinned_count else []
+    kept_ids = {id(item) for item in pinned + kept_unpinned}
+    hidden = len(lines) - len(kept_ids)
+
+    trimmed = [item for item in lines if id(item) in kept_ids]
+    if hidden > 0:
+        insert_at = 0
+        # Keep pinned start/header lines visually first, then show omission.
+        while insert_at < len(trimmed) and trimmed[insert_at].get("pinned"):
+            insert_at += 1
+        trimmed.insert(
+            insert_at,
+            {"text": f"  … {hidden} earlier steps", "pinned": False, "kind": "trimmed"},
+        )
+    block["lines"] = trimmed
+
+
+def _render_progress_blocks(blocks: OrderedDict) -> str:
+    """Render structured progress blocks into one Telegram-editable bubble."""
+    rendered: list[str] = []
+    for block in blocks.values():
+        title = block.get("title") or "progress"
+        lines = [str(item.get("text") or "").rstrip() for item in block.get("lines", [])]
+        lines = [line for line in lines if line]
+        if not lines:
+            continue
+        if rendered:
+            rendered.append("")
+        rendered.append(title)
+        for idx, line in enumerate(lines):
+            branch = "└─" if idx == len(lines) - 1 else "├─"
+            if line.startswith(("├─", "└─", "  …")):
+                rendered.append(line)
+            else:
+                rendered.append(f"{branch} {line}")
+    return "\n".join(rendered)
+
 
 def _format_subagent_progress_line(
     event_type: str,
@@ -16083,7 +16176,30 @@ class GatewayRunner:
                     **kwargs,
                 )
                 if msg:
-                    progress_queue.put(msg)
+                    task_index = kwargs.get("task_index")
+                    task_count = kwargs.get("task_count")
+                    try:
+                        agent_label = f"agent {int(task_index) + 1}"
+                        if task_count and int(task_count) > 1:
+                            agent_label += f"/{int(task_count)}"
+                        block_id = f"agent:{int(task_index)}"
+                    except Exception:
+                        agent_label = "agent"
+                        block_id = "agent:unknown"
+                    block_title = f"🤖 {agent_label}"
+                    goal = str(kwargs.get("goal") or "").replace("\n", " ").strip()
+                    if goal:
+                        block_title = f"{block_title} — {goal[:72]}"
+                    progress_queue.put(
+                        (
+                            _PROGRESS_BLOCK_EVENT,
+                            block_id,
+                            block_title,
+                            msg,
+                            event_type in {"subagent.start", "subagent.complete"},
+                            "thinking" if event_type == "subagent.thinking" else None,
+                        )
+                    )
                 return
 
             # Only act on tool.started events (ignore tool.completed, reasoning.available, etc.)
@@ -16131,7 +16247,16 @@ class GatewayRunner:
                     msg = f"{emoji} {tool_name}: \"{preview}\""
                 else:
                     msg = f"{emoji} {tool_name}..."
-                progress_queue.put(msg)
+                progress_queue.put(
+                    (
+                        _PROGRESS_BLOCK_EVENT,
+                        _PROGRESS_MAIN_BLOCK_ID,
+                        "🧭 main agent",
+                        msg,
+                        tool_name == "delegate_task",
+                        None,
+                    )
+                )
                 return
             
             # "all" / "new" modes: short preview, respects tool_preview_length
@@ -16159,7 +16284,16 @@ class GatewayRunner:
             last_progress_msg[0] = msg
             repeat_count[0] = 0
             
-            progress_queue.put(msg)
+            progress_queue.put(
+                (
+                    _PROGRESS_BLOCK_EVENT,
+                    _PROGRESS_MAIN_BLOCK_ID,
+                    "🧭 main agent",
+                    msg,
+                    tool_name == "delegate_task",
+                    None,
+                )
+            )
         
         # Background task to send progress messages
         # Accumulates tool lines into a single message that gets edited.
@@ -16205,8 +16339,9 @@ class GatewayRunner:
                         break
                 return
 
-            progress_lines = []      # Accumulated tool lines for the CURRENT editable bubble
-            progress_msg_id = None   # ID of the current progress message to edit
+            progress_lines = []      # Legacy accumulated tool lines
+            progress_blocks = OrderedDict()  # Structured panes: main, agent 1/N, agent 2/N...
+            progress_msg_id = None   # ID of the progress message to edit
             can_edit = True          # False once an edit fails (platform doesn't support it)
             _last_edit_ts = 0.0      # Throttle edits to avoid Telegram flood control
             _PROGRESS_EDIT_INTERVAL = 1.5  # Minimum seconds between edits
@@ -16353,12 +16488,28 @@ class GatewayRunner:
                     except Exception:
                         pass
 
-                    # Handle dedup messages: update last line with repeat counter
+                    # Handle dedup messages: update last main-agent line with repeat counter
                     if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
                         _, base_msg, count = raw
-                        if progress_lines:
-                            progress_lines[-1] = f"{base_msg} (×{count + 1})"
-                        msg = progress_lines[-1] if progress_lines else base_msg
+                        msg = f"{base_msg} (×{count + 1})"
+                        if progress_blocks and _PROGRESS_MAIN_BLOCK_ID in progress_blocks:
+                            main_lines = progress_blocks[_PROGRESS_MAIN_BLOCK_ID].get("lines") or []
+                            if main_lines:
+                                main_lines[-1]["text"] = msg
+                        elif progress_lines:
+                            progress_lines[-1] = msg
+                        else:
+                            progress_lines.append(msg)
+                    elif isinstance(raw, tuple) and len(raw) >= 1 and raw[0] == _PROGRESS_BLOCK_EVENT:
+                        _, block_id, block_title, msg, pinned, replace_kind = raw[:6]
+                        _append_progress_block_line(
+                            progress_blocks,
+                            str(block_id),
+                            str(block_title),
+                            str(msg),
+                            pinned=bool(pinned),
+                            replace_kind=replace_kind,
+                        )
                     elif isinstance(raw, tuple) and len(raw) >= 1 and raw[0] == "__reset__":
                         # Content bubble just landed on the platform — close off
                         # the current tool-progress bubble so the next tool
@@ -16370,6 +16521,7 @@ class GatewayRunner:
                         # linearization regression after PR #7885.)
                         progress_msg_id = None
                         progress_lines = []
+                        progress_blocks = OrderedDict()
                         last_progress_msg[0] = None
                         repeat_count[0] = 0
                         continue
@@ -16402,7 +16554,7 @@ class GatewayRunner:
 
                     if can_edit and progress_msg_id is not None:
                         # Try to edit the existing progress message
-                        full_text = "\n".join(progress_lines)
+                        full_text = _render_progress_blocks(progress_blocks) if progress_blocks else _progress_text(progress_lines)
                         result = await _edit_progress_message(progress_msg_id, full_text)
                         if not result.success:
                             _err = (getattr(result, "error", "") or "").lower()
@@ -16442,7 +16594,7 @@ class GatewayRunner:
                     else:
                         if can_edit:
                             # First tool: send all accumulated text as new message
-                            full_text = "\n".join(progress_lines)
+                            full_text = _render_progress_blocks(progress_blocks) if progress_blocks else "\n".join(progress_lines)
                             result = await adapter.send(
                                 chat_id=source.chat_id,
                                 content=full_text,
@@ -16478,22 +16630,39 @@ class GatewayRunner:
                             raw = progress_queue.get_nowait()
                             if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
                                 _, base_msg, count = raw
-                                if progress_lines:
-                                    progress_lines[-1] = f"{base_msg} (×{count + 1})"
+                                msg = f"{base_msg} (×{count + 1})"
+                                if progress_blocks and _PROGRESS_MAIN_BLOCK_ID in progress_blocks:
+                                    main_lines = progress_blocks[_PROGRESS_MAIN_BLOCK_ID].get("lines") or []
+                                    if main_lines:
+                                        main_lines[-1]["text"] = msg
+                                elif progress_lines:
+                                    progress_lines[-1] = msg
                                     await _roll_progress_overflow_if_needed()
+                            elif isinstance(raw, tuple) and len(raw) >= 1 and raw[0] == _PROGRESS_BLOCK_EVENT:
+                                _, block_id, block_title, msg, pinned, replace_kind = raw[:6]
+                                _append_progress_block_line(
+                                    progress_blocks,
+                                    str(block_id),
+                                    str(block_title),
+                                    str(msg),
+                                    pinned=bool(pinned),
+                                    replace_kind=replace_kind,
+                                )
                             elif isinstance(raw, tuple) and len(raw) >= 1 and raw[0] == "__reset__":
                                 # Content-bubble marker during drain: close off
                                 # the current progress bubble and start a fresh
                                 # one for any tool lines that arrived after.
-                                await _roll_progress_overflow_if_needed()
-                                if can_edit and progress_lines and progress_msg_id:
-                                    _pending_text = _progress_text(progress_lines)
+                                if not progress_blocks:
+                                    await _roll_progress_overflow_if_needed()
+                                if can_edit and (progress_blocks or progress_lines) and progress_msg_id:
+                                    _pending_text = _render_progress_blocks(progress_blocks) if progress_blocks else _progress_text(progress_lines)
                                     try:
                                         await _edit_progress_message(progress_msg_id, _pending_text)
                                     except Exception:
                                         pass
                                 progress_msg_id = None
                                 progress_lines = []
+                                progress_blocks = OrderedDict()
                                 last_progress_msg[0] = None
                                 repeat_count[0] = 0
                             else:
@@ -16502,10 +16671,10 @@ class GatewayRunner:
                         except Exception:
                             break
                     # Final edit with all remaining tools (only if editing works)
-                    if can_edit and progress_lines and progress_msg_id:
+                    if can_edit and progress_lines and not progress_blocks and progress_msg_id:
                         await _roll_progress_overflow_if_needed()
-                    if can_edit and progress_lines and progress_msg_id:
-                        full_text = _progress_text(progress_lines)
+                    if can_edit and (progress_blocks or progress_lines) and progress_msg_id:
+                        full_text = _render_progress_blocks(progress_blocks) if progress_blocks else _progress_text(progress_lines)
                         try:
                             await _edit_progress_message(progress_msg_id, full_text)
                         except Exception:
