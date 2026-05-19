@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 
 from agent.route_guard import RouteGuardConfig, RouteGuardController, append_routeguard_guidance, classify_tool
 from agent.route_judge import RouteJudgeConfig
+from agent.route_guard_metrics import RouteGuardMetricsConfig, load_metric_events
 from run_agent import AIAgent
 
 
@@ -57,7 +58,18 @@ def _make_agent(*tool_names: str, config: dict | None = None) -> AIAgent:
 
 
 def _route_guard_config(mode: str = "enforce") -> dict:
-    return {"route_guard": {"enabled": True, "mode": mode, "trace_enabled": True}}
+    return {
+        "route_guard": {
+            "enabled": True,
+            "mode": mode,
+            "trace_enabled": True,
+            "metrics": {"enabled": False},
+        }
+    }
+
+
+def _disabled_metrics_config():
+    return RouteGuardMetricsConfig(enabled=False)
 
 
 def test_classifies_mcp_and_bypass_tool_classes():
@@ -70,7 +82,7 @@ def test_classifies_mcp_and_bypass_tool_classes():
 
 
 def test_notion_page_analysis_blocks_browser_before_notion_api_in_enforce_mode():
-    guard = RouteGuardController(RouteGuardConfig(enabled=True, mode="enforce"))
+    guard = RouteGuardController(RouteGuardConfig(enabled=True, mode="enforce", metrics=_disabled_metrics_config()))
     guard.reset_for_turn("https://www.notion.so/acme Внимательно проанализируй транскрипцию созвона")
 
     decision = guard.before_call("mcp_browser_use_browser_navigate", {"url": "https://www.notion.so/acme"})
@@ -83,7 +95,7 @@ def test_notion_page_analysis_blocks_browser_before_notion_api_in_enforce_mode()
 
 
 def test_notion_page_analysis_allows_notion_api_and_then_browser_after_api_failure():
-    guard = RouteGuardController(RouteGuardConfig(enabled=True, mode="enforce"))
+    guard = RouteGuardController(RouteGuardConfig(enabled=True, mode="enforce", metrics=_disabled_metrics_config()))
     guard.reset_for_turn("https://www.notion.so/acme сделай summary по странице")
 
     first = guard.before_call("mcp_notion_notion_get_page", {"page_id": "acme"})
@@ -251,7 +263,7 @@ def test_route_guard_tool_trajectory_fixtures():
 
 
 def test_observe_mode_is_trace_only_and_does_not_append_tokens():
-    controller = RouteGuardController(RouteGuardConfig(enabled=True, mode="observe"))
+    controller = RouteGuardController(RouteGuardConfig(enabled=True, mode="observe", metrics=_disabled_metrics_config()))
     controller.reset_for_turn("https://www.notion.so/acme прочитай этот документ")
     decision = controller.before_call("mcp_browser_use_browser_navigate", {"url": "https://www.notion.so/acme"})
 
@@ -260,7 +272,7 @@ def test_observe_mode_is_trace_only_and_does_not_append_tokens():
 
 
 def test_warn_mode_appends_compact_guidance_only():
-    controller = RouteGuardController(RouteGuardConfig(enabled=True, mode="warn"))
+    controller = RouteGuardController(RouteGuardConfig(enabled=True, mode="warn", metrics=_disabled_metrics_config()))
     controller.reset_for_turn("https://www.notion.so/acme read this Notion doc and tell me what it says")
     decision = controller.before_call("web_extract", {"urls": ["https://www.notion.so/acme"]})
     result = append_routeguard_guidance("web result", decision)
@@ -287,7 +299,12 @@ def test_routejudge_can_set_route_once_when_deterministic_detector_is_uncertain(
         }
 
     controller = RouteGuardController(
-        RouteGuardConfig(enabled=True, mode="enforce", judge=RouteJudgeConfig(enabled=True)),
+        RouteGuardConfig(
+            enabled=True,
+            mode="enforce",
+            judge=RouteJudgeConfig(enabled=True),
+            metrics=_disabled_metrics_config(),
+        ),
         route_judge=judge,
     )
     controller.reset_for_turn("https://www.notion.so/acme что там?")
@@ -304,10 +321,47 @@ def test_routejudge_is_not_called_when_deterministic_route_is_known():
         raise AssertionError("judge should not be called for high-confidence deterministic route")
 
     controller = RouteGuardController(
-        RouteGuardConfig(enabled=True, mode="enforce", judge=RouteJudgeConfig(enabled=True)),
+        RouteGuardConfig(
+            enabled=True,
+            mode="enforce",
+            judge=RouteJudgeConfig(enabled=True),
+            metrics=_disabled_metrics_config(),
+        ),
         route_judge=judge,
     )
     controller.reset_for_turn("https://www.notion.so/acme проанализируй транскрипцию")
 
     assert controller.active_route == "notion_page_analysis"
     assert controller.state.judge_envelope.status == "not_called"
+
+
+def test_runtime_metrics_persist_events_and_refresh_dashboard(tmp_path):
+    metrics_path = tmp_path / "metrics.jsonl"
+    dashboard_path = tmp_path / "dashboard.json"
+    controller = RouteGuardController(
+        RouteGuardConfig(
+            enabled=True,
+            mode="observe",
+            metrics=RouteGuardMetricsConfig(
+                enabled=True,
+                path=str(metrics_path),
+                dashboard_path=str(dashboard_path),
+            ),
+        )
+    )
+
+    controller.reset_for_turn("https://www.notion.so/acme проанализируй транскрипцию")
+    decision = controller.before_call("mcp_browser_use_browser_navigate", {"url": "https://www.notion.so/acme"})
+    controller.after_call("mcp_browser_use_browser_navigate", {"url": "https://www.notion.so/acme"}, "opened", failed=False)
+
+    events = load_metric_events(metrics_path)
+    assert [event["event_type"] for event in events] == ["route_detected", "route_decision", "tool_result"]
+    assert events[0]["route"] == "notion_page_analysis"
+    assert events[1]["action"] == "observe"
+    assert events[1]["code"] == "wrong_route_observed"
+    assert decision.action == "observe"
+
+    dashboard = json.loads(dashboard_path.read_text())
+    assert dashboard["total_routed_turns_since_v2"] == 1
+    assert dashboard["wrong_tool_first_call_rate"] == 1.0
+    assert dashboard["token_budget_status"] == "ok"
