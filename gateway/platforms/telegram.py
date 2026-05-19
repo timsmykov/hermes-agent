@@ -483,6 +483,8 @@ class TelegramAdapter(BasePlatformAdapter):
         # active-session follow-up should be queued, steered into the current run,
         # or discarded so it never reaches agent context.
         self._busy_choice_state: Dict[str, Dict[str, Any]] = {}
+        # Goal-card inline controls: control_id → metadata from send_goal_card.
+        self._goal_control_state: Dict[str, Dict[str, Any]] = {}
         # Overflow edit chains: (chat_id, any_visible_message_id) → [message_ids].
         # Telegram streams long answers by editing/sending multiple messages once
         # a reply crosses 4096 UTF-16 units. Mid-stream chunks are intentionally
@@ -2154,6 +2156,79 @@ class TelegramAdapter(BasePlatformAdapter):
             self._status_message_ids[key] = str(result.message_id)
         return result
 
+    def _goal_card_keyboard(self, control_id: str, status: str = "active") -> "InlineKeyboardMarkup":
+        """Return Telegram inline controls for a /goal status card."""
+        status = str(status or "active").lower()
+        if status == "active":
+            primary = InlineKeyboardButton("⏸ Пауза", callback_data=f"gc:p:{control_id}")
+        elif status == "paused":
+            primary = InlineKeyboardButton("▶ Продолжить", callback_data=f"gc:r:{control_id}")
+        else:
+            primary = InlineKeyboardButton("🔄 Статус", callback_data=f"gc:s:{control_id}")
+        return InlineKeyboardMarkup([
+            [primary, InlineKeyboardButton("🔄 Статус", callback_data=f"gc:s:{control_id}")],
+            [InlineKeyboardButton("✅ Снять цель", callback_data=f"gc:c:{control_id}")],
+        ])
+
+    async def send_goal_card(
+        self,
+        chat_id: str,
+        content: str,
+        *,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a Telegram /goal control card with inline management buttons."""
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+        metadata = dict(metadata or {})
+        control_id = str(metadata.get("goal_control_id") or "goal")[:32]
+        self._goal_control_state[control_id] = metadata
+        thread_id = self._metadata_thread_id(metadata)
+        reply_to_id = self._metadata_reply_to_message_id(metadata)
+        try:
+            msg = await self._bot.send_message(
+                chat_id=int(chat_id),
+                text=content,
+                parse_mode=None,
+                reply_markup=self._goal_card_keyboard(control_id, metadata.get("goal_status", "active")),
+                reply_to_message_id=reply_to_id,
+                **self._thread_kwargs_for_send(chat_id, thread_id, metadata, reply_to_message_id=reply_to_id),
+                **self._notification_kwargs(metadata),
+            )
+            return SendResult(success=True, message_id=str(getattr(msg, "message_id", "") or ""))
+        except Exception as exc:
+            logger.warning("[%s] Failed to send goal card: %s", self.name, exc)
+            return SendResult(success=False, error=str(exc))
+
+    async def edit_goal_card(
+        self,
+        chat_id: str,
+        message_id: str,
+        content: str,
+        *,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Edit an existing Telegram /goal control card and refresh buttons."""
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+        metadata = dict(metadata or {})
+        control_id = str(metadata.get("goal_control_id") or "goal")[:32]
+        self._goal_control_state[control_id] = metadata
+        try:
+            await self._bot.edit_message_text(
+                chat_id=int(chat_id),
+                message_id=int(message_id),
+                text=content,
+                parse_mode=None,
+                reply_markup=self._goal_card_keyboard(control_id, metadata.get("goal_status", "active")),
+            )
+            return SendResult(success=True, message_id=str(message_id))
+        except Exception as exc:
+            if "not modified" in str(exc).lower():
+                return SendResult(success=True, message_id=str(message_id))
+            logger.debug("[%s] Failed to edit goal card %s: %s", self.name, message_id, exc)
+            return SendResult(success=False, error=str(exc))
+
     async def edit_message(
         self,
         chat_id: str,
@@ -3347,6 +3422,41 @@ class TelegramAdapter(BasePlatformAdapter):
                 }.get(choice, "Done."))
             else:
                 await query.answer(text="Could not route the message.")
+            return
+
+        # --- Goal-card callbacks (gc:pause|resume|clear|status:control_id) ---
+        if data.startswith("gc:"):
+            parts = data.split(":", 2)
+            if len(parts) != 3 or parts[1] not in {"p", "r", "c", "s"}:
+                await query.answer(text="Invalid goal action.")
+                return
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ You are not authorized to control this goal.")
+                return
+            action, control_id = parts[1], parts[2]
+            callback_info = self._goal_control_state.get(control_id)
+            if not callback_info:
+                await query.answer(text="Goal controls expired. Use /goal status.")
+                return
+            runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
+            handler = getattr(runner, "_handle_goal_button_action", None)
+            if not callable(handler):
+                await query.answer(text="Goal controls unavailable.")
+                return
+            try:
+                result = await handler(action, callback_info)
+            except Exception as exc:
+                logger.error("[%s] goal-card callback failed: %s", self.name, exc, exc_info=True)
+                await query.answer(text="Goal action failed.")
+                return
+            await query.answer(text=(result or "Done.")[:200])
             return
 
         # --- Model picker callbacks ---
