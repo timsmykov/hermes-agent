@@ -43,6 +43,14 @@ def test_ignores_non_subagent_events():
     assert _format_subagent_progress_line("tool.started", tool_name="terminal") is None
 
 
+def test_hides_subagent_thinking_reasoning_from_telegram_progress():
+    assert _format_subagent_progress_line(
+        "subagent.thinking",
+        preview="Need modify loop to combine table caption.",
+        task_index=0,
+        task_count=1,
+    ) is None
+
 def test_renders_structured_progress_blocks_with_stable_agent_sections():
     blocks = OrderedDict()
     _append_progress_block_line(blocks, "main", "🧭 main agent", "🔀 delegate_task: \"3 agents\"", pinned=True)
