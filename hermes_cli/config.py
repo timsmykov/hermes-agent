@@ -870,6 +870,42 @@ DEFAULT_CONFIG = {
         },
     },
 
+    # RouteGuard enforces API-first routes for high-confidence workflows where
+    # the wrong fallback tool can leak context, waste time, or produce a bad UX.
+    # Rollout modes: observe -> warn -> enforce. Default is disabled so upgrades
+    # never change tool execution until explicitly enabled.
+    "route_guard": {
+        "enabled": False,
+        "mode": "observe",  # observe | warn | enforce
+        "trace_enabled": True,
+        "judge": {
+            "enabled": False,
+            "mode": "observe",
+            "confidence_threshold": 0.80,
+            "timeout_ms": 1200,
+            "max_calls_per_turn": 1,
+            "cache_enabled": True,
+            "self_improvement_enabled": False,
+            "self_improvement_llm_on_success": False,
+        },
+        "metrics": {
+            "enabled": True,
+            "path": ".hermes/routeguard/metrics.jsonl",
+            "dashboard_path": ".hermes/routeguard/dashboard.json",
+            "incidents_dir": ".hermes/routeguard/incidents",
+            "window_size": 100,
+            "scorecard_every_routed_turns": 25,
+            "scorecard_every_incidents": 10,
+            "dashboard_llm_summary": False,
+        },
+        "self_improvement": {
+            "enabled": False,
+            "ordinary_success_llm_calls_allowed": 0,
+            "max_synthesis_per_routed_turn_window": 1,
+            "synthesis_window_routed_turns": 25,
+        },
+    },
+
     "compression": {
         "enabled": True,
         "threshold": 0.50,            # compress when context usage exceeds this ratio

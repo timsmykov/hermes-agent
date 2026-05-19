@@ -361,6 +361,10 @@ def run_conversation(
     agent._mute_post_response = False
     agent._unicode_sanitization_passes = 0
     agent._tool_guardrails.reset_for_turn()
+    try:
+        agent._route_guard.reset_for_turn(persist_user_message or user_message)
+    except Exception:
+        logger.debug("RouteGuard reset failed", exc_info=True)
     agent._tool_guardrail_halt_decision = None
     # True until the server rejects an image_url content part with an error
     # like "Only 'text' content type is supported."  Set to False on first

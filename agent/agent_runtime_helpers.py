@@ -40,6 +40,7 @@ from agent.message_sanitization import (
     _sanitize_surrogates,
 )
 from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_result_message
+from agent.route_guard import append_routeguard_guidance, routeguard_synthetic_result
 from agent.trajectory import convert_scratchpad_to_think
 from agent.credential_pool import STATUS_EXHAUSTED
 from agent.error_classifier import classify_api_error, FailoverReason
@@ -1566,6 +1567,14 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     if block_message is not None:
         return json.dumps({"error": block_message}, ensure_ascii=False)
 
+    routeguard_decision = None
+    try:
+        routeguard_decision = agent._route_guard.before_call(function_name, function_args)
+    except Exception:
+        logger.debug("RouteGuard before_call failed", exc_info=True)
+    if routeguard_decision is not None and not routeguard_decision.allows_execution:
+        return routeguard_synthetic_result(routeguard_decision)
+
     if function_name == "todo":
         from tools.todo_tool import todo_tool as _todo_tool
         return _todo_tool(
@@ -1627,7 +1636,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     elif function_name == "delegate_task":
         return agent._dispatch_delegate_task(function_args)
     else:
-        return _ra().handle_function_call(
+        result = _ra().handle_function_call(
             function_name, function_args, effective_task_id,
             tool_call_id=tool_call_id,
             session_id=agent.session_id or "",
@@ -1635,6 +1644,15 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             gateway_session_key=agent._gateway_session_key,
             skip_pre_tool_call_hook=True,
         )
+        try:
+            from agent.display import _detect_tool_failure as _detect_failure
+            failed, _ = _detect_failure(function_name, result)
+            agent._route_guard.after_call(function_name, function_args, result, failed=failed)
+        except Exception:
+            logger.debug("RouteGuard after_call failed", exc_info=True)
+        if routeguard_decision is not None:
+            result = append_routeguard_guidance(result, routeguard_decision)
+        return result
 
 
 

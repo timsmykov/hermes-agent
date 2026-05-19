@@ -30,6 +30,7 @@ from agent.display import (
     _detect_tool_failure,
 )
 from agent.tool_guardrails import ToolGuardrailDecision
+from agent.route_guard import RouteGuardDecision, append_routeguard_guidance, routeguard_synthetic_result
 from agent.tool_dispatch_helpers import (
     _is_destructive_command,
     _is_multimodal_tool_result,
@@ -124,6 +125,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
 
         block_result = None
         blocked_by_guardrail = False
+        routeguard_decision: RouteGuardDecision | None = None
         try:
             from hermes_cli.plugins import get_pre_tool_call_block_message
             block_message = get_pre_tool_call_block_message(
@@ -135,18 +137,27 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         if block_message is not None:
             block_result = json.dumps({"error": block_message}, ensure_ascii=False)
         else:
-            guardrail_decision = agent._tool_guardrails.before_call(function_name, function_args)
-            if not guardrail_decision.allows_execution:
-                block_result = agent._guardrail_block_result(guardrail_decision)
+            try:
+                routeguard_decision = agent._route_guard.before_call(function_name, function_args)
+            except Exception:
+                routeguard_decision = None
+                logger.debug("RouteGuard before_call failed", exc_info=True)
+            if routeguard_decision is not None and not routeguard_decision.allows_execution:
+                block_result = routeguard_synthetic_result(routeguard_decision)
                 blocked_by_guardrail = True
+            else:
+                guardrail_decision = agent._tool_guardrails.before_call(function_name, function_args)
+                if not guardrail_decision.allows_execution:
+                    block_result = agent._guardrail_block_result(guardrail_decision)
+                    blocked_by_guardrail = True
 
-        parsed_calls.append((tool_call, function_name, function_args, block_result, blocked_by_guardrail))
+        parsed_calls.append((tool_call, function_name, function_args, block_result, blocked_by_guardrail, routeguard_decision))
 
     # ── Logging / callbacks ──────────────────────────────────────────
-    tool_names_str = ", ".join(name for _, name, _, _, _ in parsed_calls)
+    tool_names_str = ", ".join(name for _, name, _, _, _, _ in parsed_calls)
     if not agent.quiet_mode:
         print(f"  ⚡ Concurrent: {num_tools} tool calls — {tool_names_str}")
-        for i, (tc, name, args, block_result, blocked_by_guardrail) in enumerate(parsed_calls, 1):
+        for i, (tc, name, args, block_result, blocked_by_guardrail, routeguard_decision) in enumerate(parsed_calls, 1):
             args_str = json.dumps(args, ensure_ascii=False)
             if agent.verbose_logging:
                 print(f"  📞 Tool {i}: {name}({list(args.keys())})")
@@ -155,7 +166,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 args_preview = args_str[:agent.log_prefix_chars] + "..." if len(args_str) > agent.log_prefix_chars else args_str
                 print(f"  📞 Tool {i}: {name}({list(args.keys())}) - {args_preview}")
 
-    for tc, name, args, block_result, blocked_by_guardrail in parsed_calls:
+    for tc, name, args, block_result, blocked_by_guardrail, routeguard_decision in parsed_calls:
         if block_result is not None:
             continue
         if agent.tool_progress_callback:
@@ -165,7 +176,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             except Exception as cb_err:
                 logging.debug(f"Tool progress callback error: {cb_err}")
 
-    for tc, name, args, block_result, blocked_by_guardrail in parsed_calls:
+    for tc, name, args, block_result, blocked_by_guardrail, routeguard_decision in parsed_calls:
         if block_result is not None:
             continue
         if agent.tool_start_callback:
@@ -177,7 +188,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     # ── Concurrent execution ─────────────────────────────────────────
     # Each slot holds (function_name, function_args, function_result, duration, error_flag, blocked_flag)
     results = [None] * num_tools
-    for i, (tc, name, args, block_result, blocked_by_guardrail) in enumerate(parsed_calls):
+    for i, (tc, name, args, block_result, blocked_by_guardrail, routeguard_decision) in enumerate(parsed_calls):
         if block_result is not None:
             results[i] = (name, args, block_result, 0.0, True, True)
 
@@ -279,7 +290,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     try:
         runnable_calls = [
             (i, tc, name, args)
-            for i, (tc, name, args, block_result, blocked_by_guardrail) in enumerate(parsed_calls)
+            for i, (tc, name, args, block_result, blocked_by_guardrail, routeguard_decision) in enumerate(parsed_calls)
             if block_result is None
         ]
         futures = []
@@ -346,7 +357,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             spinner.stop(f"⚡ {completed}/{num_tools} tools completed in {total_dur:.1f}s total")
 
     # ── Post-execution: display per-tool results ─────────────────────
-    for i, (tc, name, args, block_result, blocked_by_guardrail) in enumerate(parsed_calls):
+    for i, (tc, name, args, block_result, blocked_by_guardrail, routeguard_decision) in enumerate(parsed_calls):
         r = results[i]
         blocked = False
         if r is None:
@@ -366,6 +377,12 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     function_result,
                     failed=is_error,
                 )
+                try:
+                    agent._route_guard.after_call(function_name, function_args, function_result, failed=is_error)
+                except Exception:
+                    logger.debug("RouteGuard after_call failed", exc_info=True)
+                if routeguard_decision is not None:
+                    function_result = append_routeguard_guidance(function_result, routeguard_decision)
 
             if is_error:
                 _err_text = _multimodal_text_summary(function_result)
@@ -508,12 +525,25 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             pass
 
         _guardrail_block_decision: ToolGuardrailDecision | None = None
+        _routeguard_decision: RouteGuardDecision | None = None
         if _block_msg is None:
-            guardrail_decision = agent._tool_guardrails.before_call(function_name, function_args)
-            if not guardrail_decision.allows_execution:
-                _guardrail_block_decision = guardrail_decision
+            try:
+                _routeguard_decision = agent._route_guard.before_call(function_name, function_args)
+            except Exception:
+                _routeguard_decision = None
+                logger.debug("RouteGuard before_call failed", exc_info=True)
+            if _routeguard_decision is not None and not _routeguard_decision.allows_execution:
+                pass
+            else:
+                guardrail_decision = agent._tool_guardrails.before_call(function_name, function_args)
+                if not guardrail_decision.allows_execution:
+                    _guardrail_block_decision = guardrail_decision
 
-        _execution_blocked = _block_msg is not None or _guardrail_block_decision is not None
+        _execution_blocked = (
+            _block_msg is not None
+            or _guardrail_block_decision is not None
+            or (_routeguard_decision is not None and not _routeguard_decision.allows_execution)
+        )
 
         if _execution_blocked:
             # Tool blocked by plugin or guardrail policy — skip counters,
@@ -590,6 +620,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         if _block_msg is not None:
             # Tool blocked by plugin policy — return error without executing.
             function_result = json.dumps({"error": _block_msg}, ensure_ascii=False)
+            tool_duration = 0.0
+        elif _routeguard_decision is not None and not _routeguard_decision.allows_execution:
+            # Tool blocked by RouteGuard — synthesize exactly one tool result
+            # for the original tool_call_id without executing.
+            function_result = routeguard_synthetic_result(_routeguard_decision)
             tool_duration = 0.0
         elif _guardrail_block_decision is not None:
             # Tool blocked by tool-loop guardrail — synthesize exactly one
@@ -800,6 +835,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 function_result,
                 failed=_is_error_result,
             )
+            try:
+                agent._route_guard.after_call(function_name, function_args, function_result, failed=_is_error_result)
+            except Exception:
+                logger.debug("RouteGuard after_call failed", exc_info=True)
+            if _routeguard_decision is not None:
+                function_result = append_routeguard_guidance(function_result, _routeguard_decision)
             result_preview = function_result if agent.verbose_logging else (
                 function_result[:200] if len(function_result) > 200 else function_result
             )
