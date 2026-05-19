@@ -264,6 +264,7 @@ async def test_goal_set_sends_control_card_and_queues_kickoff(hermes_home):
     assert card["kind"] == "goal_card"
     assert "Цель активирована" in card["content"]
     assert "make Telegram goals visible" in card["content"]
+    assert "Ходы:" not in card["content"]
     assert card["metadata"]["goal_status"] == "active"
     assert card["metadata"].get("goal_control_id")
     assert adapter._pending_messages, "goal text should be queued as kickoff turn"
