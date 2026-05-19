@@ -19,6 +19,7 @@ preserved.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -70,6 +71,47 @@ def _ra():
     """
     import run_agent
     return run_agent
+
+
+def _make_route_judge(agent, cfg: RouteGuardConfig):
+    if not cfg.enabled or not cfg.judge.enabled:
+        return None
+
+    def _judge(text: str) -> str:
+        from agent.auxiliary_client import call_llm, extract_content_or_reasoning
+
+        system = (
+            "You are Hermes RouteJudge. Return ONLY compact JSON matching the RouteJudge schema. "
+            "Known route: notion_page_analysis. Tool classes: notion_api, browser_ui, generic_web, "
+            "shell_escape, delegation, scheduling, file_artifact, image_generation, gbrain, other. "
+            "For private Notion page analysis, primary_tool_classes must be notion_api and browser/generic_web "
+            "must be blocked before primary unless explicit UI/browser access is requested."
+        )
+        user = (
+            "Classify this Hermes user request for routing. If no known route applies, return route='unknown' "
+            "with low confidence. Do not include secrets or extra text.\n\nRequest:\n"
+            + (text or "")[:4000]
+        )
+        response = call_llm(
+            task="route_judge",
+            main_runtime=agent._current_main_runtime() if hasattr(agent, "_current_main_runtime") else None,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            temperature=0,
+            max_tokens=320,
+            timeout=max(0.2, cfg.judge.timeout_ms / 1000),
+        )
+        content = extract_content_or_reasoning(response)
+        # Defensive compacting: accept fenced JSON, but pass only the object to the validator.
+        start = content.find("{")
+        end = content.rfind("}")
+        if start >= 0 and end >= start:
+            return content[start : end + 1]
+        return json.dumps({"route": "unknown", "confidence": 0.0, "rationale": "no_json_returned"})
+
+    return _judge
 
 
 def init_agent(
@@ -952,8 +994,10 @@ def init_agent(
     except Exception as _tlg_err:
         _ra().logger.warning("Tool loop guardrail config ignored: %s", _tlg_err)
     try:
+        _route_guard_cfg = RouteGuardConfig.from_mapping(_agent_cfg.get("route_guard", {}))
         agent._route_guard = RouteGuardController(
-            RouteGuardConfig.from_mapping(_agent_cfg.get("route_guard", {}))
+            _route_guard_cfg,
+            route_judge=_make_route_judge(agent, _route_guard_cfg),
         )
     except Exception as _rg_err:
         _ra().logger.warning("RouteGuard config ignored: %s", _rg_err)
