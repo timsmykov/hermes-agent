@@ -10,6 +10,7 @@ Usage:
 """
 
 import asyncio
+import html
 import hmac
 import importlib.util
 import json
@@ -116,6 +117,7 @@ _PUBLIC_API_PATHS: frozenset = frozenset({
     "/api/config/defaults",
     "/api/config/schema",
     "/api/model/info",
+    "/api/routeguard/dashboard",
     "/api/dashboard/themes",
     "/api/dashboard/plugins",
     "/api/dashboard/plugins/rescan",
@@ -244,6 +246,86 @@ async def auth_middleware(request: Request, call_next):
                 content={"detail": "Unauthorized"},
             )
     return await call_next(request)
+
+
+def _routeguard_dashboard_payload() -> Dict[str, Any]:
+    """Return the deterministic RouteGuard dashboard payload."""
+    config = load_config()
+    route_guard_config = config.get("route_guard", {}) if isinstance(config, dict) else {}
+    metrics_config = route_guard_config.get("metrics", {}) if isinstance(route_guard_config, dict) else {}
+    dashboard_path_value = metrics_config.get("dashboard_path", ".hermes/routeguard/dashboard.json")
+    dashboard_path = Path(str(dashboard_path_value))
+    if not dashboard_path.is_absolute():
+        dashboard_path = Path(get_hermes_home()) / dashboard_path
+
+    dashboard: Dict[str, Any]
+    if dashboard_path.exists():
+        try:
+            loaded = json.loads(dashboard_path.read_text(encoding="utf-8"))
+            dashboard = loaded if isinstance(loaded, dict) else {}
+        except Exception:
+            dashboard = {"error": "dashboard_json_unreadable"}
+    else:
+        from agent.route_guard_metrics import RouteGuardScorecard, write_dashboard
+
+        dashboard = write_dashboard(dashboard_path, RouteGuardScorecard())
+
+    return {
+        "route_guard": route_guard_config,
+        "dashboard_path": str(dashboard_path),
+        "dashboard": dashboard,
+    }
+
+
+@app.get("/api/routeguard/dashboard")
+async def get_routeguard_dashboard():
+    return _routeguard_dashboard_payload()
+
+
+@app.get("/routeguard", response_class=HTMLResponse)
+async def routeguard_dashboard_page():
+    payload = _routeguard_dashboard_payload()
+    route_guard = payload.get("route_guard", {}) if isinstance(payload, dict) else {}
+    dashboard = payload.get("dashboard", {}) if isinstance(payload, dict) else {}
+    enabled = route_guard.get("enabled") if isinstance(route_guard, dict) else None
+    mode = route_guard.get("mode") if isinstance(route_guard, dict) else None
+    judge = route_guard.get("judge", {}) if isinstance(route_guard, dict) else {}
+    self_improvement = route_guard.get("self_improvement", {}) if isinstance(route_guard, dict) else {}
+    body = json.dumps(payload, ensure_ascii=False, indent=2)
+    stop_progress = dashboard.get("stop_progress", {}) if isinstance(dashboard, dict) else {}
+    html_doc = f"""
+<!doctype html>
+<meta charset=\"utf-8\">
+<title>Hermes RouteGuard v2</title>
+<style>
+  :root {{ color-scheme: dark; font-family: Inter, system-ui, sans-serif; background: #080b12; color: #e8edf7; }}
+  body {{ margin: 0; padding: 32px; }}
+  main {{ max-width: 1100px; margin: 0 auto; }}
+  h1 {{ margin: 0 0 8px; font-size: 30px; }}
+  .muted {{ color: #91a0b8; }}
+  .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin: 24px 0; }}
+  .card {{ background: #101725; border: 1px solid #233049; border-radius: 14px; padding: 16px; }}
+  .label {{ color: #91a0b8; font-size: 12px; text-transform: uppercase; letter-spacing: .08em; }}
+  .value {{ margin-top: 6px; font-size: 20px; font-weight: 700; }}
+  pre {{ overflow: auto; background: #05070c; border: 1px solid #233049; border-radius: 14px; padding: 16px; }}
+  code {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; }}
+</style>
+<main>
+  <h1>Hermes RouteGuard v2 / Self-improvement</h1>
+  <p class=\"muted\">Deterministic control dashboard. LLM self-improvement stays bounded; ordinary successful turns must not spend self-improvement tokens.</p>
+  <section class=\"grid\">
+    <div class=\"card\"><div class=\"label\">RouteGuard</div><div class=\"value\">{html.escape('enabled' if enabled else 'disabled')} / {html.escape(str(mode))}</div></div>
+    <div class=\"card\"><div class=\"label\">RouteJudge</div><div class=\"value\">{html.escape('enabled' if isinstance(judge, dict) and judge.get('enabled') else 'disabled')} / {html.escape(str(judge.get('mode', 'n/a') if isinstance(judge, dict) else 'n/a'))}</div></div>
+    <div class=\"card\"><div class=\"label\">Self-improvement</div><div class=\"value\">{html.escape('enabled' if isinstance(self_improvement, dict) and self_improvement.get('enabled') else 'disabled')}</div></div>
+    <div class=\"card\"><div class=\"label\">Token budget</div><div class=\"value\">{html.escape(str(dashboard.get('token_budget_status', 'unknown') if isinstance(dashboard, dict) else 'unknown'))}</div></div>
+    <div class=\"card\"><div class=\"label\">Stop progress</div><div class=\"value\">{html.escape(str(stop_progress.get('display', 'n/a') if isinstance(stop_progress, dict) else 'n/a'))}</div></div>
+    <div class=\"card\"><div class=\"label\">Next condition</div><div class=\"value\">{html.escape(str(dashboard.get('next_stop_condition', 'n/a') if isinstance(dashboard, dict) else 'n/a'))}</div></div>
+  </section>
+  <p><a href=\"/api/routeguard/dashboard\">Raw JSON</a></p>
+  <pre><code>{html.escape(body)}</code></pre>
+</main>
+"""
+    return HTMLResponse(html_doc)
 
 
 # ---------------------------------------------------------------------------
