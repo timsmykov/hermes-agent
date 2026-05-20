@@ -2998,6 +2998,44 @@ class GatewayRunner:
         return mode
 
     @staticmethod
+    def _format_background_process_notification(
+        *,
+        exit_code: int | None,
+        output: str | None,
+        running: bool = False,
+    ) -> str:
+        """Return a user-facing notification for gateway background work.
+
+        Watcher notifications are public chat UX, not a debugger surface. Keep
+        process IDs, command internals, and raw bracketed system phrasing out of
+        the message; the full process log remains available via the process tools
+        and server logs when needed.
+        """
+        try:
+            from tools.ansi_strip import strip_ansi
+            clean_output = strip_ansi(output or "")
+        except Exception:
+            clean_output = output or ""
+        clean_output = clean_output.strip()
+
+        if running:
+            message = "⏳ Background task is still running."
+            if clean_output:
+                message += f"\n\nRecent output:\n{clean_output[-500:]}"
+            return message
+
+        if exit_code == 0:
+            message = "✅ Background task completed."
+        elif exit_code is None:
+            message = "ℹ️ Background task finished."
+        else:
+            message = f"⚠️ Background task failed (exit code {exit_code})."
+
+        if clean_output:
+            message += f"\n\nFinal output:\n{clean_output[-1000:]}"
+        return message
+
+    @staticmethod
     def _load_provider_routing() -> dict:
         """Load OpenRouter provider routing preferences from config.yaml."""
         try:
@@ -15364,9 +15402,9 @@ class GatewayRunner:
                 )
                 if should_notify:
                     new_output = session.output_buffer[-1000:] if session.output_buffer else ""
-                    message_text = (
-                        f"[Background process {session_id} finished with exit code {session.exit_code}~ "
-                        f"Here's the final output:\n{new_output}]"
+                    message_text = self._format_background_process_notification(
+                        exit_code=session.exit_code,
+                        output=new_output,
                     )
                     adapter = None
                     for p, a in self.adapters.items():
@@ -15385,9 +15423,10 @@ class GatewayRunner:
                 # New output available -- deliver status update (only in "all" mode)
                 # Skip periodic updates for agent_notify watchers (they only care about completion)
                 new_output = session.output_buffer[-500:] if session.output_buffer else ""
-                message_text = (
-                    f"[Background process {session_id} is still running~ "
-                    f"New output:\n{new_output}]"
+                message_text = self._format_background_process_notification(
+                    exit_code=session.exit_code,
+                    output=new_output,
+                    running=True,
                 )
                 adapter = None
                 for p, a in self.adapters.items():

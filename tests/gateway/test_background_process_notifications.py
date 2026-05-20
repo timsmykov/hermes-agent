@@ -130,7 +130,7 @@ class TestLoadBackgroundNotificationsMode:
                 None,  # process disappears → watcher exits
             ],
             1,
-            "is still running",
+            "Background task is still running",
         ),
         # result mode: running output → no update
         (
@@ -154,7 +154,7 @@ class TestLoadBackgroundNotificationsMode:
             "result",
             [SimpleNamespace(output_buffer="done\n", exited=True, exit_code=0)],
             1,
-            "finished with exit code 0",
+            "Background task completed",
         ),
         # error mode: exit 0 → no notification
         (
@@ -168,14 +168,14 @@ class TestLoadBackgroundNotificationsMode:
             "error",
             [SimpleNamespace(output_buffer="traceback\n", exited=True, exit_code=1)],
             1,
-            "finished with exit code 1",
+            "Background task failed (exit code 1)",
         ),
         # all mode: exited → notifies
         (
             "all",
             [SimpleNamespace(output_buffer="ok\n", exited=True, exit_code=0)],
             1,
-            "finished with exit code 0",
+            "Background task completed",
         ),
     ],
 )
@@ -202,6 +202,21 @@ async def test_run_process_watcher_respects_notification_mode(
     if expected_fragment is not None:
         sent_message = adapter.send.await_args.args[1]
         assert expected_fragment in sent_message
+        assert "proc_test" not in sent_message
+        assert "[Background process" not in sent_message
+
+
+def test_format_background_process_notification_is_user_facing():
+    message = GatewayRunner._format_background_process_notification(
+        exit_code=0,
+        output="\x1b[32mFiles changed:\x1b[0m\ngateway/run.py\n",
+    )
+
+    assert message.startswith("✅ Background task completed.")
+    assert "Files changed:" in message
+    assert "\x1b" not in message
+    assert "proc_" not in message
+    assert "[Background process" not in message
 
 
 @pytest.mark.asyncio
