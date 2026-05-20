@@ -1934,6 +1934,24 @@ class TestDelegateEventEnum(unittest.TestCase):
         cb("tool.started", tool_name="terminal", preview="ls")
         parent._delegate_spinner.print_above.assert_called()
 
+    def test_progress_callback_relays_specialist_agent_name(self):
+        """Explicit specialist labels ride on every subagent progress event."""
+        parent = _make_mock_parent()
+        parent._delegate_spinner = MagicMock()
+        parent.tool_progress_callback = MagicMock()
+
+        cb = _build_child_progress_callback(
+            0,
+            "research docs",
+            parent,
+            task_count=1,
+            agent_name="researcher",
+        )
+        cb("subagent.start", preview="research docs")
+
+        _args, kwargs = parent.tool_progress_callback.call_args
+        self.assertEqual(kwargs["agent_name"], "researcher")
+
     def test_progress_callback_normalises_thinking(self):
         """Both _thinking and reasoning.available route to TASK_THINKING."""
         parent = _make_mock_parent()

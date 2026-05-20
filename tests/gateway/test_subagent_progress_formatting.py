@@ -3,6 +3,7 @@ from collections import OrderedDict
 from gateway.run import (
     _append_progress_block_line,
     _format_subagent_progress_line,
+    _infer_subagent_display_name,
     _render_progress_blocks,
 )
 
@@ -37,6 +38,21 @@ def test_formats_subagent_tool_event_with_preview_cap():
 
     assert line.startswith("  ↳ 💻 terminal: ")
     assert "hermes kanban boards ..." in line
+
+
+def test_uses_specialist_name_when_subagent_identity_is_available():
+    assert _infer_subagent_display_name(
+        kwargs={"agent_name": "researcher", "goal": "Compare docs", "toolsets": ["web"]},
+        fallback="agent 1",
+    ) == "researcher"
+    assert _infer_subagent_display_name(
+        kwargs={"goal": "Run QA regression checks", "toolsets": ["terminal", "file"]},
+        fallback="agent 2",
+    ) == "qa"
+    assert _infer_subagent_display_name(
+        kwargs={"goal": "Implement the fix", "toolsets": ["terminal", "file"]},
+        fallback="agent 3",
+    ) == "builder"
 
 
 def test_ignores_non_subagent_events():

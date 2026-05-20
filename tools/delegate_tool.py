@@ -686,6 +686,7 @@ def _build_child_progress_callback(
     parent_agent,
     task_count: int = 1,
     *,
+    agent_name: Optional[str] = None,
     subagent_id: Optional[str] = None,
     parent_id: Optional[str] = None,
     depth: Optional[int] = None,
@@ -728,6 +729,8 @@ def _build_child_progress_callback(
             "task_count": task_count,
             "goal": goal_label,
         }
+        if agent_name is not None:
+            kw["agent_name"] = str(agent_name).strip()
         if subagent_id is not None:
             kw["subagent_id"] = subagent_id
         if parent_id is not None:
@@ -888,6 +891,8 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    # Optional human-readable specialist label for Telegram/TUI progress.
+    agent_name: Optional[str] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -992,6 +997,7 @@ def _build_child_agent(
         goal,
         parent_agent,
         task_count,
+        agent_name=agent_name,
         subagent_id=subagent_id,
         parent_id=parent_subagent_id,
         depth=tui_depth,
@@ -1919,6 +1925,7 @@ def delegate_task(
     goal: Optional[str] = None,
     context: Optional[str] = None,
     toolsets: Optional[List[str]] = None,
+    agent_name: Optional[str] = None,
     tasks: Optional[List[Dict[str, Any]]] = None,
     max_iterations: Optional[int] = None,
     acp_command: Optional[str] = None,
@@ -1930,8 +1937,8 @@ def delegate_task(
     Spawn one or more child agents to handle delegated tasks.
 
     Supports two modes:
-      - Single: provide goal (+ optional context, toolsets, role)
-      - Batch:  provide tasks array [{goal, context, toolsets, role}, ...]
+      - Single: provide goal (+ optional context, toolsets, agent_name, role)
+      - Batch:  provide tasks array [{goal, context, toolsets, agent_name, role}, ...]
 
     The 'role' parameter controls whether a child can further delegate:
     'leaf' (default) cannot; 'orchestrator' retains the delegation
@@ -2017,7 +2024,7 @@ def delegate_task(
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
         task_list = [
-            {"goal": goal, "context": context, "toolsets": toolsets, "role": top_role}
+            {"goal": goal, "context": context, "toolsets": toolsets, "agent_name": agent_name, "role": top_role}
         ]
     else:
         return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
@@ -2063,6 +2070,7 @@ def delegate_task(
                 goal=t["goal"],
                 context=t.get("context"),
                 toolsets=t.get("toolsets") or toolsets,
+                agent_name=t.get("agent_name") or t.get("name") or t.get("display_name"),
                 model=creds["model"],
                 max_iterations=effective_max_iter,
                 task_count=n_tasks,
@@ -2536,7 +2544,7 @@ def _build_top_level_description() -> str:
         "Only the final summary is returned -- intermediate tool results "
         "never enter your context window.\n\n"
         "TWO MODES (one of 'goal' or 'tasks' is required):\n"
-        "1. Single task: provide 'goal' (+ optional context, toolsets)\n"
+        "1. Single task: provide 'goal' (+ optional context, toolsets, agent_name)\n"
         f"2. Batch (parallel): provide 'tasks' array with up to {max_children} "
         f"items concurrently for this user (configured via "
         f"delegation.max_concurrent_children in config.yaml). "
@@ -2691,6 +2699,14 @@ DELEGATE_TASK_SCHEMA = {
                     "specific you are, the better the subagent performs."
                 ),
             },
+            "agent_name": {
+                "type": "string",
+                "description": (
+                    "Optional human-readable specialist name for progress UI, "
+                    "e.g. researcher, qa, builder, critic, ops. Prefer this "
+                    "when routing work to a known lane."
+                ),
+            },
             "toolsets": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -2712,6 +2728,10 @@ DELEGATE_TASK_SCHEMA = {
                         "context": {
                             "type": "string",
                             "description": "Task-specific context",
+                        },
+                        "agent_name": {
+                            "type": "string",
+                            "description": "Optional specialist name for progress UI, e.g. researcher, qa, builder, critic, ops.",
                         },
                         "toolsets": {
                             "type": "array",
@@ -2788,6 +2808,7 @@ registry.register(
         goal=args.get("goal"),
         context=args.get("context"),
         toolsets=args.get("toolsets"),
+        agent_name=args.get("agent_name"),
         tasks=args.get("tasks"),
         max_iterations=args.get("max_iterations"),
         acp_command=args.get("acp_command"),
