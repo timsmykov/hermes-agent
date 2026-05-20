@@ -412,6 +412,11 @@ def _trim_progress_block_lines(block: dict, *, visible_limit: int = _PROGRESS_VI
     block["lines"] = trimmed
 
 
+def _sanitize_progress_code_block_text(text: str) -> str:
+    """Keep tool previews from accidentally closing Telegram code blocks."""
+    return str(text).replace("```", "ʼʼʼ")
+
+
 def _progress_block_sort_key(item: tuple[str, dict]) -> tuple[int, int, str]:
     """Keep progress panes stable: main first, then agent 1, agent 2, ..."""
     block_id, _block = item
@@ -426,25 +431,31 @@ def _progress_block_sort_key(item: tuple[str, dict]) -> tuple[int, int, str]:
 
 
 def _render_progress_blocks(blocks: OrderedDict) -> str:
-    """Render structured progress blocks into one Telegram-editable bubble."""
-    rendered: list[str] = []
+    """Render structured progress blocks into one Telegram-editable bubble.
+
+    Each pane is its own fenced code block so Telegram visually separates the
+    main timeline and every delegated agent timeline without repeating agent
+    labels inside each line.
+    """
+    rendered_blocks: list[str] = []
     for _block_id, block in sorted(blocks.items(), key=_progress_block_sort_key):
-        title = block.get("title") or "progress"
-        lines = [str(item.get("text") or "").rstrip() for item in block.get("lines", [])]
+        title = _sanitize_progress_code_block_text(block.get("title") or "progress")
+        lines = [
+            _sanitize_progress_code_block_text(str(item.get("text") or "").rstrip())
+            for item in block.get("lines", [])
+        ]
         lines = [line for line in lines if line]
         if not lines:
             continue
-        if rendered:
-            rendered.append("")
-            rendered.append("━━━━━━━━━━━━━━━━")
-        rendered.append(title)
+        block_lines = [title]
         for idx, line in enumerate(lines):
             branch = "└─" if idx == len(lines) - 1 else "├─"
             if line.startswith(("├─", "└─", "  …")):
-                rendered.append(line)
+                block_lines.append(line)
             else:
-                rendered.append(f"{branch} {line}")
-    return "\n".join(rendered)
+                block_lines.append(f"{branch} {line}")
+        rendered_blocks.append("```\n" + "\n".join(block_lines) + "\n```")
+    return "\n\n".join(rendered_blocks)
 
 
 def _format_subagent_progress_line(
