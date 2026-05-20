@@ -219,6 +219,32 @@ def test_format_background_process_notification_is_user_facing():
     assert "[Background process" not in message
 
 
+def test_format_background_process_notification_summarizes_jsonl_artifacts():
+    output = "\n".join([
+        '{"ready":"Wei Zihang-PW11.docx","unit":11,"path":"/secret/path/Wei Zihang-PW11.docx"}',
+        '{"discovered":"rudn-additional-g1-unit-11-20260520","bundle_count":1,"artifact_count":1,"queued":["abc"],"warnings":[]}',
+        '{"ready":"Vaganov Alexander case 12.docx","unit":12,"path":"/secret/path/Vaganov Alexander case 12.docx"}',
+        '{"ready":"Mezhenina case 12.docx.pdf","unit":12,"path":"/secret/path/Mezhenina case 12.docx.pdf"}',
+        '{"discovered":"rudn-additional-g1-unit-12-20260520","bundle_count":2,"artifact_count":2,"queued":["def","ghi"],"warnings":[]}',
+    ])
+
+    message = GatewayRunner._format_background_process_notification(
+        exit_code=0,
+        output=output,
+    )
+
+    assert "Summary:" in message
+    assert "Structured result:" in message
+    assert "ready files: 3" in message
+    assert "Wei Zihang-PW11.docx — unit 11" in message
+    assert "Vaganov Alexander case 12.docx — unit 12" in message
+    assert "Mezhenina case 12.docx.pdf — unit 12" in message
+    assert "discovered batches: 2" in message
+    assert "queued artifacts: 3" in message
+    assert "/secret/path" not in message
+    assert '{"ready"' not in message
+
+
 @pytest.mark.asyncio
 async def test_thread_id_passed_to_send(monkeypatch, tmp_path):
     """thread_id from watcher dict is forwarded as metadata to adapter.send()."""
