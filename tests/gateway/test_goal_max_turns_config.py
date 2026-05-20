@@ -19,7 +19,24 @@ class _FakeSessionStore:
         return self.entry
 
     def _generate_session_key(self, source):
-        return "agent:main:discord:channel:goal-config"
+        return "agent:main:telegram:channel:goal-config"
+
+
+class _RecordingAdapter:
+    def __init__(self):
+        self._pending_messages = {}
+        self.goal_cards = []
+
+    async def send_goal_card(self, chat_id, content, metadata=None):
+        self.goal_cards.append(
+            {"chat_id": chat_id, "content": content, "metadata": metadata or {}}
+        )
+
+        class _Result:
+            success = True
+            message_id = "goal-card-msg"
+
+        return _Result()
 
 
 @pytest.mark.asyncio
@@ -33,17 +50,18 @@ async def test_gateway_goal_uses_goals_max_turns_from_full_config(tmp_path, monk
 
     runner = object.__new__(GatewayRunner)
     runner.config = GatewayConfig(
-        platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="token")}
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="token")}
     )
     runner.session_store = _FakeSessionStore()
-    runner.adapters = {}
+    adapter = _RecordingAdapter()
+    runner.adapters = {Platform.TELEGRAM: adapter}
     runner._queued_events = {}
 
     event = MessageEvent(
         text="/goal ship the benchmark",
         message_type=MessageType.TEXT,
         source=SessionSource(
-            platform=Platform.DISCORD,
+            platform=Platform.TELEGRAM,
             chat_id="chat-goal-config",
             chat_type="channel",
             user_id="user-goal-config",
@@ -54,9 +72,15 @@ async def test_gateway_goal_uses_goals_max_turns_from_full_config(tmp_path, monk
     response = await GatewayRunner._handle_goal_command(runner, event)
 
     try:
-        assert "⊙ Goal set (7-turn budget): ship the benchmark" in response
+        assert response == ""
+        assert len(adapter.goal_cards) == 1
+        card = adapter.goal_cards[0]
+        assert "Цель активирована" in card["content"]
+        assert "ship the benchmark" in card["content"]
+        assert card["metadata"]["goal_status"] == "active"
         state = goals.GoalManager("sid-gateway-goal-config").state
         assert state is not None
         assert state.max_turns == 7
+        assert state.goal == "ship the benchmark"
     finally:
         goals._DB_CACHE.clear()
