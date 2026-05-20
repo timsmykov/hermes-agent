@@ -1,11 +1,11 @@
-"""Tests for reply-to pointer injection in _prepare_inbound_message_text.
+"""Tests for reply-to context injection in _prepare_inbound_message_text.
 
-The `[Replying to: "..."]` prefix is a *disambiguation pointer*, not
-deduplication. It must always be injected when the user explicitly replies
-to a prior message — even when the quoted text already exists somewhere
-in the conversation history. History can contain the same or similar text
-multiple times, and without an explicit pointer the agent has to guess
-which prior message the user is referencing.
+The reply context block is a *disambiguation pointer*, not deduplication. It
+must always be injected when the user explicitly replies to a prior message —
+even when the replied-to text already exists somewhere in the conversation
+history. History can contain the same or similar text multiple times, and
+without an explicit pointer the agent has to guess which prior message the
+user is referencing.
 """
 import pytest
 
@@ -35,9 +35,16 @@ def _source() -> SessionSource:
         user_name="Alice",
     )
 
+def _reply_context_block(message_id: str, text: str) -> str:
+    return (
+        f"[Reply context: full text of replied-to message {message_id}]\n"
+        f"{text}\n"
+        "[End reply context]\n\n"
+    )
+
 
 @pytest.mark.asyncio
-async def test_reply_prefix_injected_when_text_absent_from_history():
+async def test_reply_context_injected_when_text_absent_from_history():
     runner = _make_runner()
     source = _source()
     event = MessageEvent(
@@ -55,16 +62,19 @@ async def test_reply_prefix_injected_when_text_absent_from_history():
 
     assert result is not None
     assert result.startswith(
-        '[Replying to: "Japan is great for culture, food, and efficiency."]'
+        _reply_context_block(
+            "42",
+            "Japan is great for culture, food, and efficiency.",
+        )
     )
     assert result.endswith("What's the best time to go?")
 
 
 @pytest.mark.asyncio
-async def test_reply_prefix_still_injected_when_text_in_history():
+async def test_reply_context_still_injected_when_text_in_history():
     """Regression test: the pointer must survive even when the quoted text
     already appears in history. Previously a `found_in_history` guard
-    silently dropped the prefix, leaving the agent to guess which prior
+    silently dropped the context, leaving the agent to guess which prior
     message the user was referencing."""
     runner = _make_runner()
     source = _source()
@@ -95,7 +105,7 @@ async def test_reply_prefix_still_injected_when_text_in_history():
     )
 
     assert result is not None
-    assert result.startswith(f'[Replying to: "{quoted}"]')
+    assert result.startswith(_reply_context_block("42", quoted))
     assert result.endswith("What's the best time to go?")
 
 
@@ -137,7 +147,7 @@ async def test_no_prefix_when_reply_to_text_is_empty():
 
 
 @pytest.mark.asyncio
-async def test_reply_snippet_truncated_to_500_chars():
+async def test_reply_context_includes_full_replied_text():
     runner = _make_runner()
     source = _source()
     long_text = "x" * 800
@@ -155,5 +165,5 @@ async def test_reply_snippet_truncated_to_500_chars():
     )
 
     assert result is not None
-    assert result.startswith('[Replying to: "' + "x" * 500 + '"]')
-    assert "x" * 501 not in result
+    assert result.startswith(_reply_context_block("42", long_text))
+    assert result.endswith("follow-up")
