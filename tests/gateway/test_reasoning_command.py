@@ -201,36 +201,34 @@ class TestReasoningCommand:
         assert runner._resolve_session_reasoning_config(source=source) == {"enabled": True, "effort": "xhigh"}
 
     def test_resolve_session_reasoning_defaults_to_high_for_codex_spark(self, tmp_path, monkeypatch):
-        hermes_home = tmp_path / hermes
+        hermes_home = tmp_path / "hermes"
         hermes_home.mkdir()
-        (hermes_home / config.yaml).write_text(, encoding=utf-8)
+        (hermes_home / "config.yaml").write_text("", encoding="utf-8")
 
-        monkeypatch.setattr(gateway_run, _hermes_home, hermes_home)
+        monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
 
         runner = _make_runner()
-        source = _make_event(/reasoning).source
+        source = _make_event("/reasoning").source
 
         assert runner._resolve_session_reasoning_config(
             source=source,
-            model=gpt-5.3-codex-spark,
-        ) == {enabled: True, effort: high}
+            model="gpt-5.3-codex-spark",
+        ) == {"enabled": True, "effort": "high"}
 
     def test_resolve_session_reasoning_respects_global_setting_for_codex_spark(self, tmp_path, monkeypatch):
-        hermes_home = tmp_path / hermes
+        hermes_home = tmp_path / "hermes"
         hermes_home.mkdir()
-        (hermes_home / config.yaml).write_text(agent:
- reasoning_effort: low
-, encoding=utf-8)
+        (hermes_home / "config.yaml").write_text("agent:\n  reasoning_effort: low\n", encoding="utf-8")
 
-        monkeypatch.setattr(gateway_run, _hermes_home, hermes_home)
+        monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
 
         runner = _make_runner()
-        source = _make_event(/reasoning).source
+        source = _make_event("/reasoning").source
 
         assert runner._resolve_session_reasoning_config(
             source=source,
-            model=gpt-5.3-codex-spark,
-        ) == {enabled: True, effort: low}
+            model="gpt-5.3-codex-spark",
+        ) == {"enabled": True, "effort": "low"}
 
     def test_run_agent_reloads_reasoning_config_per_message(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / "hermes"
@@ -426,4 +424,18 @@ class TestReasoningCommand:
         )
 
         result = asyncio.run(
-            runner._ru
+            runner._run_agent(
+                message="ping",
+                context_prompt="",
+                history=[],
+                source=source,
+                session_id="session-1",
+                session_key="agent:main:homeassistant:dm",
+            )
+        )
+
+        assert result["final_response"] == "ok"
+        assert _CapturingAgent.last_init is not None
+        assert _CapturingAgent.last_init["platform"] == "homeassistant"
+        enabled_toolsets = set(_CapturingAgent.last_init["enabled_toolsets"])
+        assert "homeassistant" in enabled_toolsets
