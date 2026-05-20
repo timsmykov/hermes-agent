@@ -65,8 +65,9 @@ def test_renders_structured_progress_blocks_with_stable_agent_sections():
     assert "🤖 agent 1 — Investigate" in rendered
     assert "🤖 agent 2 — Verify" in rendered
     assert rendered.index("🤖 agent 1 — Investigate") < rendered.index("🤖 agent 2 — Verify")
+    assert rendered.startswith("🧭 main agent\n")
     assert "```\n🤖 agent 1" in rendered
-    assert rendered.count("```") == 6
+    assert rendered.count("```") == 4
     assert "agent 1 search_files" not in rendered
     assert "agent 2 read_file" not in rendered
 
@@ -83,7 +84,7 @@ def test_renders_agent_blocks_in_numeric_order_even_when_events_arrive_out_of_or
     assert rendered.index("🧭 main agent") < rendered.index("🤖 agent 1 — First")
     assert rendered.index("🤖 agent 1 — First") < rendered.index("🤖 agent 2 — Second")
     assert rendered.index("🤖 agent 2 — Second") < rendered.index("🤖 agent 3 — Third")
-    assert rendered.count("```") == 8
+    assert rendered.count("```") == 6
     assert "agent 1/3" not in rendered
 
 
