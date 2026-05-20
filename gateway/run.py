@@ -325,7 +325,7 @@ def _sanitize_progress_code_block_text(text: str) -> str:
 
 
 def _progress_block_sort_key(item: tuple[str, dict]) -> tuple[int, int, str]:
-    """Keep progress panes stable: main first, then agent 1, agent 2, ..."""
+    """Keep progress panes stable: main first, then child 1, child 2, ..."""
     block_id, _block = item
     if block_id == _PROGRESS_MAIN_BLOCK_ID:
         return (0, -1, block_id)
@@ -335,6 +335,60 @@ def _progress_block_sort_key(item: tuple[str, dict]) -> tuple[int, int, str]:
         except Exception:
             return (1, 10_000, block_id)
     return (2, 10_000, block_id)
+
+
+def _normalize_subagent_display_name(value: Any) -> str:
+    """Return a compact safe specialist label for public progress UI."""
+    text = str(value or "").replace("\n", " ").strip()
+    if not text:
+        return ""
+    text = re.sub(r"[^\w .:/+\-]+", "", text, flags=re.UNICODE)
+    text = re.sub(r"\s+", " ", text).strip(" -:.")
+    return text[:32]
+
+
+def _infer_subagent_display_name(*, kwargs: dict, fallback: str) -> str:
+    """Prefer explicit specialist names, then infer from toolsets/goal."""
+    explicit = _normalize_subagent_display_name(
+        kwargs.get("agent_name") or kwargs.get("name") or kwargs.get("display_name")
+    )
+    if explicit:
+        return explicit
+
+    toolsets = kwargs.get("toolsets") or []
+    try:
+        toolset_names = {str(t).lower() for t in toolsets}
+    except Exception:
+        toolset_names = set()
+    goal = str(kwargs.get("goal") or "").lower()
+
+    if "browser" in toolset_names or "browser_use" in toolset_names:
+        return "browser-operator"
+    if "image_gen" in toolset_names or "image" in toolset_names:
+        return "image-operator"
+    if {"terminal", "file"} & toolset_names:
+        if re.search(r"\b(research|compare|docs?|source|evidence)\b", goal):
+            return "researcher"
+        if re.search(r"\b(qa|test|verify|regression|canary|smoke)\b", goal):
+            return "qa"
+        if re.search(r"\b(review|audit|risk|critique)\b", goal):
+            return "critic"
+        if re.search(r"\b(deploy|release|ship|rollout)\b", goal):
+            return "release-manager"
+        if re.search(r"\b(logs?|service|systemd|health|incident|ops)\b", goal):
+            return "ops"
+        return "builder"
+    if {"web", "search", "x_search"} & toolset_names:
+        return "researcher"
+    if re.search(r"\b(research|compare|docs?|source|evidence)\b", goal):
+        return "researcher"
+    if re.search(r"\b(qa|test|verify|regression|canary|smoke)\b", goal):
+        return "qa"
+    if re.search(r"\b(build|implement|fix|code|patch|refactor)\b", goal):
+        return "builder"
+    if re.search(r"\b(review|audit|risk|critique)\b", goal):
+        return "critic"
+    return fallback
 
 
 def _render_progress_blocks(blocks: OrderedDict) -> str:
@@ -16502,11 +16556,12 @@ class GatewayRunner:
                 if msg:
                     task_index = kwargs.get("task_index")
                     try:
-                        agent_label = f"agent {int(task_index) + 1}"
+                        fallback_label = f"agent {int(task_index) + 1}"
                         block_id = f"agent:{int(task_index)}"
                     except Exception:
-                        agent_label = "agent"
+                        fallback_label = "agent"
                         block_id = "agent:unknown"
+                    agent_label = _infer_subagent_display_name(kwargs=kwargs, fallback=fallback_label)
                     block_title = f"🤖 {agent_label}"
                     goal = str(kwargs.get("goal") or "").replace("\n", " ").strip()
                     if goal:
