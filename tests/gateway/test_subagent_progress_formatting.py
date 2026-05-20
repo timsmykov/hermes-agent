@@ -66,7 +66,8 @@ def test_renders_structured_progress_blocks_with_stable_agent_sections():
     assert "🤖 agent 2 — Verify" in rendered
     assert rendered.index("🤖 agent 1 — Investigate") < rendered.index("🤖 agent 2 — Verify")
     assert rendered.startswith("🧭 main agent\n")
-    assert "```\n🤖 agent 1" in rendered
+    assert "\n\n```\n🤖 agent 1" in rendered
+    assert '3 agents"\n\n```\n\n```\n🤖 agent 1' not in rendered
     assert rendered.count("```") == 4
     assert "agent 1 search_files" not in rendered
     assert "agent 2 read_file" not in rendered
