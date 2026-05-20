@@ -265,7 +265,7 @@ def _append_progress_block_line(
 
     Telegram can only edit the whole progress bubble, but keeping progress as
     blocks lets the rendered message look like independent panes: main agent,
-    agent 1/N, agent 2/N, etc. Pinned lifecycle lines survive trimming; noisy
+    agent 1, agent 2, etc. Pinned lifecycle lines survive trimming; noisy
     thinking/progress updates are replace-in-place where possible.
     """
     if not line:
@@ -319,10 +319,23 @@ def _trim_progress_block_lines(block: dict, *, visible_limit: int = _PROGRESS_VI
     block["lines"] = trimmed
 
 
+def _progress_block_sort_key(item: tuple[str, dict]) -> tuple[int, int, str]:
+    """Keep progress panes stable: main first, then agent 1, agent 2, ..."""
+    block_id, _block = item
+    if block_id == _PROGRESS_MAIN_BLOCK_ID:
+        return (0, -1, block_id)
+    if block_id.startswith("agent:"):
+        try:
+            return (1, int(block_id.split(":", 1)[1]), block_id)
+        except Exception:
+            return (1, 10_000, block_id)
+    return (2, 10_000, block_id)
+
+
 def _render_progress_blocks(blocks: OrderedDict) -> str:
     """Render structured progress blocks into one Telegram-editable bubble."""
     rendered: list[str] = []
-    for block in blocks.values():
+    for _block_id, block in sorted(blocks.items(), key=_progress_block_sort_key):
         title = block.get("title") or "progress"
         lines = [str(item.get("text") or "").rstrip() for item in block.get("lines", [])]
         lines = [line for line in lines if line]
@@ -330,6 +343,7 @@ def _render_progress_blocks(blocks: OrderedDict) -> str:
             continue
         if rendered:
             rendered.append("")
+            rendered.append("━━━━━━━━━━━━━━━━")
         rendered.append(title)
         for idx, line in enumerate(lines):
             branch = "└─" if idx == len(lines) - 1 else "├─"
@@ -369,11 +383,8 @@ def _format_subagent_progress_line(
 
     goal = _short(kwargs.get("goal") or preview or "subtask", 72)
     task_index = kwargs.get("task_index")
-    task_count = kwargs.get("task_count")
     try:
         label = f"agent {int(task_index) + 1}"
-        if task_count and int(task_count) > 1:
-            label += f"/{int(task_count)}"
     except Exception:
         label = "agent"
 
@@ -16480,11 +16491,8 @@ class GatewayRunner:
                 )
                 if msg:
                     task_index = kwargs.get("task_index")
-                    task_count = kwargs.get("task_count")
                     try:
                         agent_label = f"agent {int(task_index) + 1}"
-                        if task_count and int(task_count) > 1:
-                            agent_label += f"/{int(task_count)}"
                         block_id = f"agent:{int(task_index)}"
                     except Exception:
                         agent_label = "agent"
@@ -16643,7 +16651,7 @@ class GatewayRunner:
                 return
 
             progress_lines = []      # Legacy accumulated tool lines
-            progress_blocks = OrderedDict()  # Structured panes: main, agent 1/N, agent 2/N...
+            progress_blocks = OrderedDict()  # Structured panes: main, agent 1, agent 2...
             progress_msg_id = None   # ID of the progress message to edit
             can_edit = True          # False once an edit fails (platform doesn't support it)
             _last_edit_ts = 0.0      # Throttle edits to avoid Telegram flood control
