@@ -54,6 +54,22 @@ class _FakeGateway:
     def _running_agent_count(self):
         return len(self._running_agents)
 
+    def _snapshot_running_agents(self):
+        return {
+            session_key: agent
+            for session_key, agent in self._running_agents.items()
+            if agent is not gw_mod._AGENT_PENDING_SENTINEL
+        }
+
+    def _mark_resume_pending_for_agents(self, *_a, **_kw):
+        return {}
+
+    def _clear_resume_pending_for_finished_agents(self, *_a, **_kw):
+        pass
+
+    def _increment_restart_failure_counts(self, *_a, **_kw):
+        pass
+
     def _update_runtime_status(self, *_a, **_kw):
         pass
 
