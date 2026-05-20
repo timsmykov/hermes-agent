@@ -16586,6 +16586,14 @@ class GatewayRunner:
             def _progress_text(lines: list) -> str:
                 return "\n".join(str(line) for line in lines)
 
+            def _full_progress_text() -> str:
+                parts = []
+                if progress_lines:
+                    parts.append(_progress_text(progress_lines))
+                if progress_blocks:
+                    parts.append(_render_progress_blocks(progress_blocks))
+                return "\n".join(part for part in parts if part)
+
             def _split_progress_groups(lines: list) -> list[list]:
                 """Partition progress lines into platform-sized editable bubbles."""
                 groups: list[list] = []
@@ -16625,10 +16633,13 @@ class GatewayRunner:
                 Returns True when it delivered/split the current buffer and the
                 caller should skip the normal send/edit path for this tick.
                 """
-                nonlocal progress_msg_id, progress_lines, can_edit
-                if not progress_lines or not can_edit:
+                nonlocal progress_msg_id, progress_lines, progress_blocks, can_edit
+                if not (progress_lines or progress_blocks) or not can_edit:
                     return False
-                groups = _split_progress_groups(progress_lines)
+                full_text = _full_progress_text()
+                if _progress_len_fn(full_text) <= _PROGRESS_TEXT_LIMIT:
+                    return False
+                groups = _split_progress_groups(full_text.splitlines())
                 if len(groups) <= 1:
                     return False
 
@@ -16653,6 +16664,7 @@ class GatewayRunner:
                 # just its lines so subsequent edits update it instead of
                 # replaying the full historical transcript into new messages.
                 progress_lines = groups[-1]
+                progress_blocks = OrderedDict()
                 return True
 
             while True:
@@ -16866,10 +16878,10 @@ class GatewayRunner:
                         except Exception:
                             break
                     # Final edit with all remaining tools (only if editing works)
-                    if can_edit and progress_lines and not progress_blocks and progress_msg_id:
+                    if can_edit and (progress_lines or progress_blocks) and progress_msg_id:
                         await _roll_progress_overflow_if_needed()
                     if can_edit and (progress_blocks or progress_lines) and progress_msg_id:
-                        full_text = _render_progress_blocks(progress_blocks) if progress_blocks else _progress_text(progress_lines)
+                        full_text = _full_progress_text()
                         try:
                             await _edit_progress_message(progress_msg_id, full_text)
                         except Exception:
