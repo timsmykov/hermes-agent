@@ -382,22 +382,17 @@ def _format_subagent_progress_line(
         return s
 
     goal = _short(kwargs.get("goal") or preview or "subtask", 72)
-    task_index = kwargs.get("task_index")
-    try:
-        label = f"agent {int(task_index) + 1}"
-    except Exception:
-        label = "agent"
 
     if event_type == "subagent.start":
-        return f"🤖 {label} start: \"{goal}\""
+        return f"🤖 start: \"{goal}\""
 
     if event_type == "subagent.complete":
         status = _short(kwargs.get("status") or preview or "done", 56)
-        return f"✅ {label} done: {status}"
+        return f"✅ done: {status}"
 
     if event_type == "subagent.progress":
         summary = _short(preview or tool_name or "progress", 96)
-        return f"🔀 {label}: {summary}"
+        return f"🔀 {summary}"
 
     if event_type == "subagent.tool":
         from agent.display import get_tool_emoji
@@ -406,9 +401,9 @@ def _format_subagent_progress_line(
         tool = tool_name or "tool"
         if progress_mode == "verbose" and args:
             arg_keys = list(args.keys())
-            return f"  ↳ {emoji} {label} {tool}({arg_keys})"
+            return f"  ↳ {emoji} {tool}({arg_keys})"
         detail = _short(preview or "", preview_cap)
-        return f"  ↳ {emoji} {label} {tool}: \"{detail}\"" if detail else f"  ↳ {emoji} {label} {tool}"
+        return f"  ↳ {emoji} {tool}: \"{detail}\"" if detail else f"  ↳ {emoji} {tool}"
 
     return None
 
