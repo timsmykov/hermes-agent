@@ -340,9 +340,9 @@ def _progress_block_sort_key(item: tuple[str, dict]) -> tuple[int, int, str]:
 def _render_progress_blocks(blocks: OrderedDict) -> str:
     """Render structured progress blocks into one Telegram-editable bubble.
 
-    Each pane is its own fenced code block so Telegram visually separates the
-    main timeline and every delegated agent timeline without repeating agent
-    labels inside each line.
+    The main orchestrator timeline stays as normal text. Delegated agent
+    timelines render as separate fenced code blocks for stronger visual
+    separation without repeating agent labels inside each line.
     """
     rendered_blocks: list[str] = []
     for _block_id, block in sorted(blocks.items(), key=_progress_block_sort_key):
@@ -361,7 +361,11 @@ def _render_progress_blocks(blocks: OrderedDict) -> str:
                 block_lines.append(line)
             else:
                 block_lines.append(f"{branch} {line}")
-        rendered_blocks.append("```\n" + "\n".join(block_lines) + "\n```")
+        block_text = "\n".join(block_lines)
+        if _block_id == _PROGRESS_MAIN_BLOCK_ID:
+            rendered_blocks.append(block_text)
+        else:
+            rendered_blocks.append("```\n" + block_text + "\n```")
     return "\n\n".join(rendered_blocks)
 
 
