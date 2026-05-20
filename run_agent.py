@@ -3156,6 +3156,43 @@ class AIAgent:
         )
         return bool(streamed) and streamed == visible_content
 
+    def _should_emit_interim_assistant_message(self, assistant_msg: Dict[str, Any], visible: str) -> bool:
+        """Return True when mid-turn assistant text is safe/useful to surface.
+
+        Assistant messages that also contain tool calls are often provider/model
+        scratchpad fragments rather than deliberate user-facing commentary. In
+        Telegram those fragments become standalone bubbles above the real work
+        (for example: "Need conclusion updates."), which reads like an agent
+        artifact instead of useful progress. Keep explicit user-facing status
+        notes, but suppress terse pre-tool fragments.
+        """
+        if not visible or visible == "(empty)":
+            return False
+        if not isinstance(assistant_msg, dict):
+            return False
+        if not assistant_msg.get("tool_calls"):
+            return True
+
+        text = re.sub(r"\s+", " ", visible).strip()
+        if not text:
+            return False
+
+        user_facing = re.search(
+            r"\b(?:i['’]?ll|i\s+will|let\s+me|i\s+am|я|сейчас|начинаю|"
+            r"проверю|сделаю|обновлю|доработаю|приступаю|ок|понял)\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if user_facing:
+            return True
+
+        # Single short sentence + tool call is usually internal task framing,
+        # not content the user asked to see as a separate message.
+        if len(text) <= 160 and "\n" not in visible and text.count(".") <= 1:
+            return False
+
+        return True
+
     def _emit_interim_assistant_message(self, assistant_msg: Dict[str, Any]) -> None:
         """Surface a real mid-turn assistant commentary message to the UI layer."""
         cb = getattr(self, "interim_assistant_callback", None)
@@ -3163,7 +3200,7 @@ class AIAgent:
             return
         content = assistant_msg.get("content")
         visible = self._strip_think_blocks(content or "").strip()
-        if not visible or visible == "(empty)":
+        if not self._should_emit_interim_assistant_message(assistant_msg, visible):
             return
         already_streamed = self._interim_content_was_streamed(visible)
         try:
