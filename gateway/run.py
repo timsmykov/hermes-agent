@@ -2998,6 +2998,72 @@ class GatewayRunner:
         return mode
 
     @staticmethod
+    def _summarize_background_structured_output(clean_output: str) -> str | None:
+        """Summarize newline-delimited JSON status output for chat UX."""
+        if not clean_output:
+            return None
+
+        rows = []
+        for line in clean_output.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if not (stripped.startswith("{") and stripped.endswith("}")):
+                return None
+            try:
+                parsed = json.loads(stripped)
+            except Exception:
+                return None
+            if not isinstance(parsed, dict):
+                return None
+            rows.append(parsed)
+
+        if not rows:
+            return None
+
+        ready_files: list[tuple[str, object]] = []
+        discovered: list[str] = []
+        queued_count = 0
+        warnings: list[str] = []
+
+        for row in rows:
+            if row.get("ready"):
+                ready_files.append((str(row.get("ready")), row.get("unit")))
+            if row.get("discovered"):
+                discovered.append(str(row.get("discovered")))
+            queued = row.get("queued")
+            if isinstance(queued, list):
+                queued_count += len(queued)
+            row_warnings = row.get("warnings")
+            if isinstance(row_warnings, list):
+                warnings.extend(str(w) for w in row_warnings if w)
+
+        if not ready_files and not discovered and not queued_count and not warnings:
+            return None
+
+        lines = ["Structured result:"]
+        if ready_files:
+            lines.append(f"- ready files: {len(ready_files)}")
+            for filename, unit in ready_files[:5]:
+                suffix = f" — unit {unit}" if unit not in {None, ""} else ""
+                lines.append(f"  • {filename}{suffix}")
+            if len(ready_files) > 5:
+                lines.append(f"  • …and {len(ready_files) - 5} more")
+        if discovered:
+            lines.append(f"- discovered batches: {len(discovered)}")
+            for name in discovered[:3]:
+                lines.append(f"  • {name}")
+            if len(discovered) > 3:
+                lines.append(f"  • …and {len(discovered) - 3} more")
+        if queued_count:
+            lines.append(f"- queued artifacts: {queued_count}")
+        if warnings:
+            lines.append(f"- warnings: {len(warnings)}")
+            for warning in warnings[:3]:
+                lines.append(f"  • {warning}")
+        return "\n".join(lines)
+
+    @staticmethod
     def _format_background_process_notification(
         *,
         exit_code: int | None,
@@ -3017,11 +3083,13 @@ class GatewayRunner:
         except Exception:
             clean_output = output or ""
         clean_output = clean_output.strip()
+        summarized_output = GatewayRunner._summarize_background_structured_output(clean_output)
+        display_output = summarized_output or clean_output
 
         if running:
             message = "⏳ Background task is still running."
-            if clean_output:
-                message += f"\n\nRecent output:\n{clean_output[-500:]}"
+            if display_output:
+                message += f"\n\nRecent output:\n{display_output[-500:]}"
             return message
 
         if exit_code == 0:
@@ -3031,8 +3099,9 @@ class GatewayRunner:
         else:
             message = f"⚠️ Background task failed (exit code {exit_code})."
 
-        if clean_output:
-            message += f"\n\nFinal output:\n{clean_output[-1000:]}"
+        if display_output:
+            label = "Summary" if summarized_output else "Final output"
+            message += f"\n\n{label}:\n{display_output[-1000:]}"
         return message
 
     @staticmethod
