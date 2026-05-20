@@ -21,8 +21,8 @@ def test_formats_subagent_lifecycle_events():
         task_count=2,
     )
 
-    assert start == '🤖 agent 1 start: "Investigate issue"'
-    assert done == "✅ agent 1 done: done"
+    assert start == '🤖 start: "Investigate issue"'
+    assert done == "✅ done: done"
 
 
 def test_formats_subagent_tool_event_with_preview_cap():
@@ -35,7 +35,7 @@ def test_formats_subagent_tool_event_with_preview_cap():
         preview_cap=24,
     )
 
-    assert line.startswith("  ↳ 💻 agent 2 terminal: ")
+    assert line.startswith("  ↳ 💻 terminal: ")
     assert "hermes kanban boards ..." in line
 
 
@@ -54,10 +54,10 @@ def test_hides_subagent_thinking_reasoning_from_telegram_progress():
 def test_renders_structured_progress_blocks_with_stable_agent_sections():
     blocks = OrderedDict()
     _append_progress_block_line(blocks, "main", "🧭 main agent", "🔀 delegate_task: \"3 agents\"", pinned=True)
-    _append_progress_block_line(blocks, "agent:0", "🤖 agent 1 — Investigate", "🤖 agent 1 start: \"Investigate\"", pinned=True)
-    _append_progress_block_line(blocks, "agent:1", "🤖 agent 2 — Verify", "🤖 agent 2 start: \"Verify\"", pinned=True)
-    _append_progress_block_line(blocks, "agent:0", "🤖 agent 1 — Investigate", "  ↳ 🔎 agent 1 search_files: \"RouteGuard\"")
-    _append_progress_block_line(blocks, "agent:1", "🤖 agent 2 — Verify", "  ↳ 📖 agent 2 read_file: \"gateway/run.py\"")
+    _append_progress_block_line(blocks, "agent:0", "🤖 agent 1 — Investigate", "🤖 start: \"Investigate\"", pinned=True)
+    _append_progress_block_line(blocks, "agent:1", "🤖 agent 2 — Verify", "🤖 start: \"Verify\"", pinned=True)
+    _append_progress_block_line(blocks, "agent:0", "🤖 agent 1 — Investigate", "  ↳ 🔎 search_files: \"RouteGuard\"")
+    _append_progress_block_line(blocks, "agent:1", "🤖 agent 2 — Verify", "  ↳ 📖 read_file: \"gateway/run.py\"")
 
     rendered = _render_progress_blocks(blocks)
 
@@ -66,14 +66,16 @@ def test_renders_structured_progress_blocks_with_stable_agent_sections():
     assert "🤖 agent 2 — Verify" in rendered
     assert rendered.index("🤖 agent 1 — Investigate") < rendered.index("🤖 agent 2 — Verify")
     assert "\n━━━━━━━━━━━━━━━━\n🤖 agent 1" in rendered
+    assert "agent 1 search_files" not in rendered
+    assert "agent 2 read_file" not in rendered
 
 
 def test_renders_agent_blocks_in_numeric_order_even_when_events_arrive_out_of_order():
     blocks = OrderedDict()
     _append_progress_block_line(blocks, "main", "🧭 main agent", "🔀 delegate_task: \"3 agents\"", pinned=True)
-    _append_progress_block_line(blocks, "agent:2", "🤖 agent 3 — Third", "🤖 agent 3 start: \"Third\"", pinned=True)
-    _append_progress_block_line(blocks, "agent:0", "🤖 agent 1 — First", "🤖 agent 1 start: \"First\"", pinned=True)
-    _append_progress_block_line(blocks, "agent:1", "🤖 agent 2 — Second", "🤖 agent 2 start: \"Second\"", pinned=True)
+    _append_progress_block_line(blocks, "agent:2", "🤖 agent 3 — Third", "🤖 start: \"Third\"", pinned=True)
+    _append_progress_block_line(blocks, "agent:0", "🤖 agent 1 — First", "🤖 start: \"First\"", pinned=True)
+    _append_progress_block_line(blocks, "agent:1", "🤖 agent 2 — Second", "🤖 start: \"Second\"", pinned=True)
 
     rendered = _render_progress_blocks(blocks)
 
@@ -86,15 +88,15 @@ def test_renders_agent_blocks_in_numeric_order_even_when_events_arrive_out_of_or
 
 def test_progress_block_keeps_important_lines_while_trimming_to_visible_limit():
     blocks = OrderedDict()
-    _append_progress_block_line(blocks, "agent:0", "🤖 agent 1", "🤖 agent 1 start", pinned=True, visible_limit=4)
+    _append_progress_block_line(blocks, "agent:0", "🤖 agent 1", "🤖 start", pinned=True, visible_limit=4)
     for idx in range(8):
         _append_progress_block_line(blocks, "agent:0", "🤖 agent 1", f"step {idx}", visible_limit=4)
-    _append_progress_block_line(blocks, "agent:0", "🤖 agent 1", "✅ agent 1 done", pinned=True, visible_limit=4)
+    _append_progress_block_line(blocks, "agent:0", "🤖 agent 1", "✅ done", pinned=True, visible_limit=4)
 
     rendered = _render_progress_blocks(blocks)
 
-    assert "🤖 agent 1 start" in rendered
-    assert "✅ agent 1 done" in rendered
+    assert "🤖 start" in rendered
+    assert "✅ done" in rendered
     assert "step 0" not in rendered
     assert "step 7" in rendered
     assert "earlier steps" in rendered
@@ -102,8 +104,8 @@ def test_progress_block_keeps_important_lines_while_trimming_to_visible_limit():
 
 def test_progress_block_replaces_thinking_line_instead_of_appending_noise():
     blocks = OrderedDict()
-    _append_progress_block_line(blocks, "agent:0", "🤖 agent 1", "💭 agent 1: \"thinking\"", replace_kind="thinking")
-    _append_progress_block_line(blocks, "agent:0", "🤖 agent 1", "💭 agent 1: \"analyzing\"", replace_kind="thinking")
+    _append_progress_block_line(blocks, "agent:0", "🤖 agent 1", "💭: \"thinking\"", replace_kind="thinking")
+    _append_progress_block_line(blocks, "agent:0", "🤖 agent 1", "💭: \"analyzing\"", replace_kind="thinking")
 
     rendered = _render_progress_blocks(blocks)
 
