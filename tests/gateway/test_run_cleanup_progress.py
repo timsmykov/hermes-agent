@@ -258,7 +258,8 @@ async def test_compaction_status_clears_when_compaction_finishes_even_without_cl
         if adapter.deleted:
             break
 
-    assert len(adapter.sent) == 2
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0]["content"].startswith("🗜️ Compacting context")
     expected_deleted = [
         {"chat_id": "-1001", "message_id": sent["message_id"]}
         for sent in adapter.sent
