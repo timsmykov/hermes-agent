@@ -16683,21 +16683,32 @@ class GatewayRunner:
                 _raw_progress_limit - (64 if _raw_progress_limit > 128 else 0),
             )
 
-            # Detect whether the adapter's edit_message accepts metadata so
-            # overflow edits preserve Telegram topic/thread routing (#27487).
+            # Detect which optional edit_message kwargs the adapter accepts.
+            # Metadata preserves Telegram topic/thread routing (#27487).
+            # finalize=True forces Telegram progress edits through MarkdownV2,
+            # otherwise edited progress bubbles show raw ``` fences instead of
+            # rendering delegated-agent panes as code blocks.
             _edit_accepts_metadata = False
-            if _progress_metadata:
-                try:
-                    _edit_params = inspect.signature(adapter.edit_message).parameters
-                    _edit_accepts_metadata = (
-                        "metadata" in _edit_params
-                        or any(
-                            param.kind is inspect.Parameter.VAR_KEYWORD
-                            for param in _edit_params.values()
-                        )
+            _edit_accepts_finalize = False
+            try:
+                _edit_params = inspect.signature(adapter.edit_message).parameters
+                _edit_accepts_metadata = (
+                    "metadata" in _edit_params
+                    or any(
+                        param.kind is inspect.Parameter.VAR_KEYWORD
+                        for param in _edit_params.values()
                     )
-                except (TypeError, ValueError):
-                    _edit_accepts_metadata = False
+                )
+                _edit_accepts_finalize = (
+                    "finalize" in _edit_params
+                    or any(
+                        param.kind is inspect.Parameter.VAR_KEYWORD
+                        for param in _edit_params.values()
+                    )
+                )
+            except (TypeError, ValueError):
+                _edit_accepts_metadata = False
+                _edit_accepts_finalize = False
 
             async def _edit_progress_message(message_id: str, content: str):
                 kwargs = {
@@ -16707,6 +16718,8 @@ class GatewayRunner:
                 }
                 if _edit_accepts_metadata:
                     kwargs["metadata"] = _progress_metadata
+                if _edit_accepts_finalize and source.platform == Platform.TELEGRAM:
+                    kwargs["finalize"] = True
                 return await adapter.edit_message(**kwargs)
 
             def _progress_text(lines: list) -> str:

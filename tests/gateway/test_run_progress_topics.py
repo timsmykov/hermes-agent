@@ -108,6 +108,7 @@ class MetadataEditProgressCaptureAdapter(ProgressCaptureAdapter):
                 "chat_id": chat_id,
                 "message_id": message_id,
                 "content": content,
+                "finalize": finalize,
                 "metadata": metadata,
             }
         )
@@ -325,6 +326,7 @@ async def test_run_agent_progress_edits_keep_originating_topic_metadata(monkeypa
     assert result["final_response"] == "done"
     assert adapter.edits
     assert all(call["metadata"] == {"thread_id": "17585"} for call in adapter.edits)
+    assert all(call["finalize"] is True for call in adapter.edits)
 
 
 @pytest.mark.asyncio
