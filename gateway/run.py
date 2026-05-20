@@ -3221,11 +3221,41 @@ class GatewayRunner:
             if agent is not _AGENT_PENDING_SENTINEL
         }
 
-    def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> None:
+    def _queue_or_replace_pending_event(
+        self,
+        session_key: str,
+        event: MessageEvent,
+        *,
+        merge_text: bool = False,
+    ) -> None:
         adapter = self.adapters.get(event.source.platform)
         if not adapter:
             return
-        merge_pending_message_event(adapter._pending_messages, session_key, event)
+        merge_pending_message_event(
+            adapter._pending_messages,
+            session_key,
+            event,
+            merge_text=merge_text,
+        )
+
+    @staticmethod
+    def _is_media_followup_event(event: MessageEvent) -> bool:
+        """Return True for file/media events that should batch while busy.
+
+        Telegram delivers multi-file sends as many updates. In ask-mode, prompting
+        once per document/photo/video creates a notification storm and splits what
+        the user intended as one input batch. Media attachments are safer to stage
+        for the next turn and merge into one pending event; text-only follow-ups
+        can still use the queue/steer choice prompt.
+        """
+        media_types = {
+            MessageType.PHOTO,
+            MessageType.VIDEO,
+            MessageType.AUDIO,
+            MessageType.VOICE,
+            MessageType.DOCUMENT,
+        }
+        return bool(getattr(event, "media_urls", None)) or event.message_type in media_types
 
     def _busy_status_detail(self, running_agent: Any, session_key: str, *, now: Optional[float] = None) -> str:
         """Return compact status detail for busy-input prompts/acks."""
@@ -3440,6 +3470,17 @@ class GatewayRunner:
 
         running_agent = self._running_agents.get(session_key)
         platform_value = getattr(event.source.platform, "value", event.source.platform)
+        if (
+            self._busy_input_mode == "ask"
+            and platform_value == Platform.TELEGRAM.value
+            and self._is_media_followup_event(event)
+        ):
+            logger.debug(
+                "Telegram media/file follow-up for busy session %s — batching for next turn without choice prompt",
+                session_key,
+            )
+            self._queue_or_replace_pending_event(session_key, event, merge_text=True)
+            return True
         if self._busy_input_mode == "ask" and platform_value == Platform.TELEGRAM.value:
             try:
                 result = await adapter.send_busy_choice_prompt(
@@ -7555,11 +7596,16 @@ class GatewayRunner:
                     f"mid-turn. Wait for the current response or `/stop` first."
                 )
 
-            if event.message_type == MessageType.PHOTO:
-                logger.debug("PRIORITY photo follow-up for session %s — queueing without interrupt", _quick_key)
+            if self._is_media_followup_event(event):
+                logger.debug("PRIORITY media/file follow-up for session %s — queueing without interrupt", _quick_key)
                 adapter = self.adapters.get(source.platform)
                 if adapter:
-                    merge_pending_message_event(adapter._pending_messages, _quick_key, event)
+                    merge_pending_message_event(
+                        adapter._pending_messages,
+                        _quick_key,
+                        event,
+                        merge_text=True,
+                    )
                 return None
 
             _telegram_followup_grace = float(

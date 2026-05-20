@@ -38,7 +38,16 @@ from gateway.platforms.base import (
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_event(text="hello", chat_id="123", platform_val="telegram"):
+def _make_event(
+    text="hello",
+    chat_id="123",
+    platform_val="telegram",
+    *,
+    message_type=MessageType.TEXT,
+    message_id="msg1",
+    media_urls=None,
+    media_types=None,
+):
     """Build a minimal MessageEvent."""
     source = SessionSource(
         platform=MagicMock(value=platform_val),
@@ -48,9 +57,11 @@ def _make_event(text="hello", chat_id="123", platform_val="telegram"):
     )
     evt = MessageEvent(
         text=text,
-        message_type=MessageType.TEXT,
+        message_type=message_type,
         source=source,
-        message_id="msg1",
+        message_id=message_id,
+        media_urls=list(media_urls or []),
+        media_types=list(media_types or []),
     )
     return evt
 
@@ -557,7 +568,7 @@ class TestBusySessionOnboardingHint:
 
     @pytest.mark.asyncio
     async def test_ask_mode_sends_telegram_busy_choice_prompt(self):
-        """busy_input_mode='ask' defers routing to Telegram inline queue/steer buttons."""
+        """busy_input_mode='ask' defers text routing to Telegram inline queue/steer buttons."""
         from gateway.run import GatewayRunner
 
         runner, _sentinel = _make_runner()
@@ -583,6 +594,75 @@ class TestBusySessionOnboardingHint:
         agent.interrupt.assert_not_called()
         assert sk not in adapter._pending_messages
         adapter._send_with_retry.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_ask_mode_batches_busy_file_burst_without_choice_prompts(self):
+        """Telegram multi-file sends should become one queued batch, not N prompts."""
+        from gateway.run import GatewayRunner
+
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "ask"
+        adapter = _make_adapter()
+
+        first = _make_event(
+            text="",
+            message_type=MessageType.DOCUMENT,
+            message_id="doc1",
+            media_urls=["/tmp/a.pdf"],
+            media_types=["application/pdf"],
+        )
+        second = MessageEvent(
+            text="",
+            message_type=MessageType.DOCUMENT,
+            source=first.source,
+            message_id="doc2",
+            media_urls=["/tmp/b.pdf"],
+            media_types=["application/pdf"],
+        )
+        sk = build_session_key(first.source)
+        runner.adapters[first.source.platform] = adapter
+        runner._running_agents[sk] = MagicMock()
+
+        result1 = await GatewayRunner._handle_active_session_busy_message(runner, first, sk)
+        result2 = await GatewayRunner._handle_active_session_busy_message(runner, second, sk)
+
+        assert result1 is True
+        assert result2 is True
+        adapter.send_busy_choice_prompt.assert_not_called()
+        adapter._send_with_retry.assert_not_called()
+        pending = adapter._pending_messages[sk]
+        assert pending is first
+        assert pending.media_urls == ["/tmp/a.pdf", "/tmp/b.pdf"]
+        assert pending.media_types == ["application/pdf", "application/pdf"]
+        runner._running_agents[sk].interrupt.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_priority_running_agent_batches_document_followup_without_interrupt(self):
+        """The fast _handle_message running-agent path also batches non-photo files."""
+        from gateway.run import GatewayRunner
+
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "ask"
+        adapter = _make_adapter()
+
+        event = _make_event(
+            text="",
+            message_type=MessageType.DOCUMENT,
+            media_urls=["/tmp/report.pdf"],
+            media_types=["application/pdf"],
+        )
+        sk = build_session_key(event.source)
+        agent = MagicMock()
+        runner._running_agents[sk] = agent
+        runner.adapters[event.source.platform] = adapter
+
+        result = await GatewayRunner._handle_message(runner, event)
+
+        assert result is None
+        assert adapter._pending_messages[sk] is event
+        adapter.send_busy_choice_prompt.assert_not_called()
+        adapter._send_with_retry.assert_not_called()
+        agent.interrupt.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_busy_choice_queue_routes_to_pending_without_ack(self):
