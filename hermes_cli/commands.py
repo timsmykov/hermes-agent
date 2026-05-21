@@ -511,6 +511,68 @@ def telegram_bot_commands() -> list[tuple[str, str]]:
     return result
 
 
+_TELEGRAM_MENU_PRIORITY = (
+    # Most-typed everyday commands first.
+    "help",
+    "new",
+    "stop",
+    "status",
+    "resume",
+    "sessions",
+    "model",
+    # Maintenance / diagnostics — the ones that prompted this priority list.
+    "debug",
+    "restart",
+    "update",
+    "verbose",
+    "commands",
+    # Mid-turn session control.
+    "approve",
+    "deny",
+    "queue",
+    "steer",
+    "background",
+    # Lower-priority but still useful operational built-ins.
+    "reasoning",
+    "usage",
+    "platforms",
+    "platform",
+    "profile",
+    "whoami",
+)
+"""Built-in commands that should stay visible in Telegram's capped menu.
+
+Telegram only displays a small BotCommand menu in practice.  The full Hermes
+registry is still dispatchable when typed manually, but operational commands
+need to survive the visible menu cap ahead of lower-priority built-ins.
+"""
+
+
+def _prioritize_telegram_menu_commands(
+    commands: list[tuple[str, str]],
+) -> list[tuple[str, str]]:
+    priority = {
+        _sanitize_telegram_name(name): index
+        for index, name in enumerate(_TELEGRAM_MENU_PRIORITY)
+    }
+    return [
+        command
+        for _index, command in sorted(
+            enumerate(commands),
+            key=lambda item: (
+                0,
+                priority[item[1][0]],
+                item[0],
+            )
+            if item[1][0] in priority
+            else (
+                1,
+                item[0],
+            ),
+        )
+    ]
+
+
 _CMD_NAME_LIMIT = 32
 """Max command name length shared by Telegram and Discord."""
 
@@ -737,6 +799,7 @@ _TELEGRAM_MENU_PRIORITY: tuple[str, ...] = (
     "debug",
     "platform",
     "update",
+    "verbose",
     "retry",
     "undo",
     "compress",
@@ -795,11 +858,12 @@ def telegram_menu_commands(max_commands: int = 100) -> tuple[list[tuple[str, str
 
     Returns:
         (menu_commands, hidden_count) where hidden_count is the number of
-        skill commands omitted due to the cap.
+        commands omitted due to the cap.
     """
     core_commands = _telegram_core_menu_commands()
     reserved_names = {n for n, _ in core_commands}
     all_commands = list(core_commands)
+    hidden_core_count = max(0, len(all_commands) - max_commands)
 
     remaining_slots = max(0, max_commands - len(all_commands))
     entries, hidden_count = _collect_gateway_skill_entries(
@@ -811,7 +875,7 @@ def telegram_menu_commands(max_commands: int = 100) -> tuple[list[tuple[str, str
     )
     # Drop the cmd_key — Telegram only needs (name, desc) pairs.
     all_commands.extend((n, d) for n, d, _k in entries)
-    return all_commands[:max_commands], hidden_count
+    return all_commands[:max_commands], hidden_count + hidden_core_count
 
 
 def discord_skill_commands(
@@ -1078,6 +1142,20 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
         # Slack description cap is 2000 chars; keep it short.
         entries.append((slack_name, desc[:140], hint[:100]))
         seen.add(slack_name)
+
+    # Priority aliases are muscle-memory shortcuts; add them before the
+    # canonical registry can consume Slack's 50-command cap.
+    priority_aliases = ("btw", "bg", "reset", "q")
+    by_alias = {
+        alias: cmd
+        for cmd in COMMAND_REGISTRY
+        if _is_gateway_available(cmd, overrides)
+        for alias in cmd.aliases
+    }
+    for alias in priority_aliases:
+        cmd = by_alias.get(alias)
+        if cmd:
+            _add(alias, f"Alias for /{cmd.name} — {cmd.description}", cmd.args_hint or "")
 
     # First pass: canonical names (so they win slots if we hit the cap).
     for cmd in COMMAND_REGISTRY:
