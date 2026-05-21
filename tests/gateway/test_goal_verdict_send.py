@@ -17,6 +17,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.run import _extract_natural_language_goal_text
 from gateway.session import SessionEntry, SessionSource, build_session_key
 
 
@@ -268,6 +269,51 @@ async def test_goal_set_sends_control_card_and_queues_kickoff(hermes_home):
     assert card["metadata"]["goal_status"] == "active"
     assert card["metadata"].get("goal_control_id")
     assert adapter._pending_messages, "goal text should be queued as kickoff turn"
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("поставь себе цель проверить goal routing", "проверить goal routing"),
+        ("поставь все необходимые цели: довести релиз до зелёного статуса", "довести релиз до зелёного статуса"),
+        ("установи цель для агента — разобраться с логами", "разобраться с логами"),
+        ("set yourself a goal to verify Telegram goal cards", "verify Telegram goal cards"),
+        ("set all necessary goals for shipping the feature", "shipping the feature"),
+    ],
+)
+def test_natural_language_goal_intent_extracts_ru_and_en_payloads(text, expected):
+    assert _extract_natural_language_goal_text(text) == expected
+
+
+def test_natural_language_goal_intent_does_not_trigger_on_discussion_or_slash_command():
+    assert _extract_natural_language_goal_text("почему цель не работает?") is None
+    assert _extract_natural_language_goal_text("/goal already canonical") is None
+    assert _extract_natural_language_goal_text("set goals") is None
+
+
+@pytest.mark.asyncio
+async def test_natural_language_goal_request_can_use_canonical_goal_handler(hermes_home):
+    runner, adapter, _session_entry, src = _make_runner_with_adapter()
+
+    from gateway.platforms.base import MessageEvent, MessageType
+
+    payload = _extract_natural_language_goal_text(
+        "поставь себе цель: проверить, что карточка цели видна"
+    )
+    event = MessageEvent(
+        text=f"/goal {payload}",
+        message_type=MessageType.TEXT,
+        source=src,
+        message_id="incoming-nl-goal-1",
+    )
+    result = await runner._handle_goal_command(event)
+
+    assert result == ""
+    assert adapter.sends
+    assert adapter.sends[0]["kind"] == "goal_card"
+    assert "Цель активирована" in adapter.sends[0]["content"]
+    assert "проверить, что карточка цели видна" in adapter.sends[0]["content"]
+    assert adapter._pending_messages, "NL goal rewrite should still queue canonical kickoff"
 
 
 @pytest.mark.asyncio

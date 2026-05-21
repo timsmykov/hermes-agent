@@ -68,6 +68,57 @@ _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 
+_NL_GOAL_PREFIX_RE = re.compile(
+    r"^\s*(?:"
+    # Russian: поставь/установи/задай/создай/активируй ... цель/цели
+    r"(?:поставь|поставьте|установи|установите|задай|задайте|создай|создайте|активируй|активируйте|сформулируй|сформулируйте)"
+    r"(?:\s+(?:мне|себе|нам|для\s+себя|для\s+меня|для\s+агента|для\s+агентов|агенту|субагентам|subagents?|main\s+agent))*"
+    r"\s+(?:все\s+)?(?:необходимые\s+|нужные\s+|рабочие\s+)?цел(?:ь|и)"
+    r"|"
+    # English: set/create/activate ... goal(s)
+    r"(?:set|create|define|activate|start)"
+    r"(?:\s+(?:me|myself|yourself|your\s+own|the\s+agent|the\s+agents|subagents?|all\s+necessary|all\s+needed|necessary|a|an|the))*"
+    r"\s+goals?"
+    r")\b",
+    re.IGNORECASE | re.UNICODE,
+)
+
+_NL_GOAL_FILLER_RE = re.compile(
+    r"^\s*(?:"
+    r"[:：\-–—,.;]+"
+    r"|(?:для\s+(?:агента|агентов|субагентов|себя|меня)|for\s+(?:the\s+)?(?:agent|agents|subagents?|myself|yourself))\b"
+    r"|(?:для|на|по|чтобы|и|а|then|to|for|so\s+that|about)\b"
+    r")\s*",
+    re.IGNORECASE | re.UNICODE,
+)
+
+
+def _extract_natural_language_goal_text(text: str) -> Optional[str]:
+    """Extract a `/goal` payload from explicit RU/EN natural-language asks.
+
+    This is intentionally deterministic gateway routing, not an LLM guess. It
+    only fires on imperative phrases like "поставь себе цель ..." or "set
+    yourself a goal ..." so the canonical `/goal` handler still owns state,
+    kickoff, Telegram cards, and lifecycle controls.
+    """
+    raw = str(text or "").strip()
+    if not raw or raw.startswith("/"):
+        return None
+    match = _NL_GOAL_PREFIX_RE.match(raw)
+    if not match:
+        return None
+    goal = raw[match.end():].strip()
+    for _ in range(3):
+        new_goal = _NL_GOAL_FILLER_RE.sub("", goal, count=1).strip()
+        if new_goal == goal:
+            break
+        goal = new_goal
+    goal = goal.strip(" \t\n\r:：-–—.,;«»\"'")
+    if not goal:
+        return None
+    return goal
+
+
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not Telegram chat
     r"auxiliary\s+.+\s+failed"
@@ -8057,6 +8108,19 @@ class GatewayRunner:
                         command = target_command.split()[0] if target_command else target_command
                         _cmd_def = _resolve_cmd(command) if command else None
                         canonical = _cmd_def.name if _cmd_def else command
+
+        # Deterministic natural-language goal intent routing.  This must happen
+        # before normal chat reaches the LLM: explicit RU/EN asks like
+        # "поставь себе цель ..." / "set yourself a goal ..." are rewritten
+        # into the canonical /goal path so state, kickoff, Telegram card, and
+        # lifecycle controls are identical to a manual slash command.
+        if not command:
+            _nl_goal = _extract_natural_language_goal_text(event.text or "")
+            if _nl_goal:
+                event.text = f"/goal {_nl_goal}"
+                command = event.get_command()
+                _cmd_def = _resolve_cmd(command) if command else None
+                canonical = _cmd_def.name if _cmd_def else command
 
         # Per-platform slash command access control. Only kicks in when the
         # operator has set ``allow_admin_from`` for the source's scope (DM
