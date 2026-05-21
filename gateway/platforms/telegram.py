@@ -2892,7 +2892,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     f"⚙ *Model Configuration*\n\n"
                     f"Current model: `{current_model or 'unknown'}`\n"
                     f"Provider: {provider_label}\n\n"
-                    f"Select a provider:"
+                    f"Use a quick switch or select a provider:"
                 )
             )
 
@@ -3004,6 +3004,39 @@ class TelegramAdapter(BasePlatformAdapter):
             state["selected_provider_name"] = provider.get("name", provider_slug)
             state["model_list"] = models
             state["model_page"] = 0
+
+            # Fast path: providers with a single model do not need a second picker screen.
+            if len(models) == 1:
+                callback = state.get("on_model_selected")
+                if not callback:
+                    await query.answer(text="Picker expired.")
+                    return
+
+                model_id = models[0]
+                try:
+                    result_text = await callback(chat_id, model_id, provider_slug)
+                except Exception as exc:
+                    logger.error("Model picker switch failed: %s", exc)
+                    result_text = f"Error switching model: {exc}"
+
+                try:
+                    await query.edit_message_text(
+                        text=self.format_message(result_text),
+                        parse_mode=ParseMode.MARKDOWN_V2,
+                        reply_markup=None,
+                    )
+                except Exception:
+                    try:
+                        await query.edit_message_text(
+                            text=result_text,
+                            parse_mode=None,
+                            reply_markup=None,
+                        )
+                    except Exception:
+                        pass
+                await query.answer(text="Model switched!")
+                self._model_picker_state.pop(chat_id, None)
+                return
 
             keyboard, page_info = self._build_model_keyboard(models, 0)
 
