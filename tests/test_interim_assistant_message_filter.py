@@ -31,6 +31,32 @@ def test_suppresses_terse_tool_call_scratchpad_fragment():
     assert calls == []
 
 
+def test_suppresses_long_tool_call_scratchpad_fragment():
+    calls = []
+    agent = _agent_with_callback(calls)
+
+    agent._emit_interim_assistant_message(
+        {
+            "role": "assistant",
+            "content": (
+                "Need test. Add after no_thread maybe. Use "
+                "runner._running_agents[session_key]=object. watcher with "
+                "session_key. Ensure adapter.send not called, handle_message "
+                "called, internal, text contains current orchestration. Also output."
+            ),
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "patch", "arguments": "{}"},
+                }
+            ],
+        }
+    )
+
+    assert calls == []
+
+
 def test_keeps_user_facing_tool_call_commentary():
     calls = []
     agent = _agent_with_callback(calls)
