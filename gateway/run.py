@@ -3139,6 +3139,69 @@ class GatewayRunner:
         return "\n".join(lines)
 
     @staticmethod
+    def _summarize_background_traceback_output(clean_output: str) -> str | None:
+        """Return a compact public summary for Python tracebacks.
+
+        Telegram notifications are not the place for full stack traces. Keep the
+        actionable exception and, when present, summarize structured JSON payloads
+        such as grading QA failures.
+        """
+        if "Traceback (most recent call last):" not in clean_output:
+            return None
+
+        lines = [line.strip() for line in clean_output.splitlines() if line.strip()]
+        exception_line = next(
+            (
+                line
+                for line in reversed(lines)
+                if ":" in line and not line.startswith(("File ", "raise "))
+            ),
+            "",
+        )
+        if not exception_line:
+            return "Failure summary:\n- Python traceback captured; raw log kept in process/server logs."
+
+        exception_type, _, exception_message = exception_line.partition(":")
+        exception_type = exception_type.strip() or "Exception"
+        exception_message = exception_message.strip()
+
+        qa_json = None
+        for json_start in [idx for idx, char in enumerate(exception_message) if char == "{"]:
+            try:
+                qa_json = json.loads(exception_message[json_start:])
+                exception_message = exception_message[:json_start].rstrip(" :")
+                break
+            except Exception:
+                continue
+
+        lines_out = ["Failure summary:", f"- exception: {exception_type}"]
+        if exception_message:
+            lines_out.append(f"- reason: {exception_message[:240]}")
+
+        if isinstance(qa_json, dict):
+            item = qa_json.get("item")
+            group = qa_json.get("group")
+            run_id = qa_json.get("run_id")
+            expected = qa_json.get("expected_present")
+            graded = qa_json.get("graded")
+            missing = qa_json.get("missing_students")
+            if item or group:
+                lines_out.append(f"- scope: {' '.join(str(x) for x in (item, group) if x)}")
+            if run_id:
+                lines_out.append(f"- run: {run_id}")
+            if expected is not None or graded is not None:
+                lines_out.append(f"- graded: {graded if graded is not None else '?'} / expected {expected if expected is not None else '?'}")
+            if isinstance(missing, list) and missing:
+                lines_out.append(f"- missing students: {len(missing)}")
+                for student in missing[:5]:
+                    lines_out.append(f"  • {student}")
+                if len(missing) > 5:
+                    lines_out.append(f"  • …and {len(missing) - 5} more")
+
+        lines_out.append("- raw traceback: available in the process/server logs")
+        return "\n".join(lines_out)
+
+    @staticmethod
     def _format_background_process_notification(
         *,
         exit_code: int | None,
@@ -3158,7 +3221,10 @@ class GatewayRunner:
         except Exception:
             clean_output = output or ""
         clean_output = clean_output.strip()
-        summarized_output = GatewayRunner._summarize_background_structured_output(clean_output)
+        summarized_output = (
+            GatewayRunner._summarize_background_structured_output(clean_output)
+            or GatewayRunner._summarize_background_traceback_output(clean_output)
+        )
         display_output = summarized_output or clean_output
 
         if running:
