@@ -219,6 +219,36 @@ def test_format_background_process_notification_is_user_facing():
     assert "[Background process" not in message
 
 
+def test_format_background_process_notification_summarizes_traceback_qa_failure():
+    output = """group2-20260521
+Traceback (most recent call last):
+  File "/root/hermes-workspace/rudn-student-repositories/grading-runs-20260521/grade_all_repositories.py", line 245, in <module>
+    main()
+  File "/root/hermes-workspace/rudn-student-repositories/grading-runs-20260521/grade_all_repositories.py", line 238, in main
+    raise RuntimeError(f'QA failed for {item} {group_name}: {json.dumps(qa,ensure_ascii=False)}')
+RuntimeError: QA failed for Unit 6 Group 2: {"item":"Unit 6","group":"Group 2","run_id":"rudn-unit6-group2-20260521","expected_present":17,"graded":16,"coverage":{"total_bundles":16,"processed_bundles":16,"missing_bundles":[],"artifact_count":16,"all_artifacts_covered":true},"all_scores_integer":true,"confidence_0_100":true,"missing_students":["Ахсан Шеикх Мд Джуборадж","Полякова Елизавета Дмитриевна","Акопян Георгий Даниилович","Абшилава Константин Константинович","Романов Дэни Вадимович"],"passed":false}
+"""
+
+    message = GatewayRunner._format_background_process_notification(
+        exit_code=1,
+        output=output,
+    )
+
+    assert message.startswith("⚠️ Background task failed (exit code 1).")
+    assert "Summary:" in message
+    assert "Failure summary:" in message
+    assert "exception: RuntimeError" in message
+    assert "reason: QA failed for Unit 6 Group 2" in message
+    assert "scope: Unit 6 Group 2" in message
+    assert "graded: 16 / expected 17" in message
+    assert "missing students: 5" in message
+    assert "Ахсан Шеикх Мд Джуборадж" in message
+    assert "Traceback" not in message
+    assert "File \"/root/hermes-workspace" not in message
+    assert "json.dumps" not in message
+    assert "coverage" not in message
+
+
 def test_format_background_process_notification_summarizes_jsonl_artifacts():
     output = "\n".join([
         '{"ready":"Wei Zihang-PW11.docx","unit":11,"path":"/secret/path/Wei Zihang-PW11.docx"}',
