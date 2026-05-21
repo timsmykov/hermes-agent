@@ -3022,12 +3022,12 @@ class AIAgent:
         if user_facing:
             return True
 
-        # Single short sentence + tool call is usually internal task framing,
-        # not content the user asked to see as a separate message.
-        if len(text) <= 160 and "\n" not in visible and text.count(".") <= 1:
-            return False
-
-        return True
+        # Any assistant text attached to a tool-call turn is suspect unless it
+        # clearly addresses the user. Providers often put planning scratchpad in
+        # `content` next to tool calls ("Need test...", "Use X..."). If we
+        # surface it, Telegram shows private task notes as standalone bubbles.
+        # The tool-progress bubble already gives public observability.
+        return False
 
     def _emit_interim_assistant_message(self, assistant_msg: Dict[str, Any]) -> None:
         """Surface a real mid-turn assistant commentary message to the UI layer."""
