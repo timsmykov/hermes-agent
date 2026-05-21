@@ -20,6 +20,7 @@ test runner at ``scripts/run_tests.sh``.
 """
 
 import asyncio
+import logging
 import os
 import re
 import sys
@@ -185,6 +186,8 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "HERMES_SESSION_THREAD_ID",
     "HERMES_SESSION_SOURCE",
     "HERMES_SESSION_KEY",
+    "HERMES_SESSION_ID",
+    "HERMES_SESSION_MESSAGE_ID",
     "HERMES_GATEWAY_SESSION",
     "HERMES_PLATFORM",
     "HERMES_MODEL",
@@ -405,10 +408,135 @@ def _isolate_hermes_home(_hermetic_environment):
 # tests in the same file share mutable state, either reset it explicitly
 # in a fixture or split them across files.
 #
-# The skill ``test-suite-cascade-diagnosis`` documents the cascade patterns
-# this replaces; the running example was ``test_command_guards`` failing
-# 12/15 CI runs because ``tools.approval._session_approved`` carried
-# approvals from one test's session into another's.
+# The skill `test-suite-cascade-diagnosis` documents the concrete patterns
+# this closes; the running example was `test_command_guards` failing 12/15
+# CI runs because ``tools.approval._session_approved`` carried approvals
+# from one test's session into another's.
+
+@pytest.fixture(autouse=True)
+def _reset_module_state():
+    """Clear module-level mutable state and ContextVars between tests.
+
+    Keeps state from leaking across tests on the same xdist worker. Modules
+    that don't exist yet (test collection before production import) are
+    skipped silently — production import later creates fresh empty state.
+    """
+    # --- logging — quiet/one-shot paths mutate process-global logger state ---
+    logging.disable(logging.NOTSET)
+    for _logger_name in ("tools", "run_agent", "trajectory_compressor", "cron", "hermes_cli"):
+        _logger = logging.getLogger(_logger_name)
+        _logger.disabled = False
+        _logger.setLevel(logging.NOTSET)
+        _logger.propagate = True
+
+    # --- tools.approval — the single biggest source of cross-test pollution ---
+    try:
+        from tools import approval as _approval_mod
+        _approval_mod._session_approved.clear()
+        _approval_mod._session_yolo.clear()
+        _approval_mod._permanent_approved.clear()
+        _approval_mod._pending.clear()
+        _approval_mod._gateway_queues.clear()
+        _approval_mod._gateway_notify_cbs.clear()
+        # ContextVar: reset to empty string so get_current_session_key()
+        # falls through to the env var / default path, matching a fresh
+        # process.
+        _approval_mod._approval_session_key.set("")
+    except Exception:
+        pass
+
+    # --- tools.interrupt — per-thread interrupt flag set ---
+    try:
+        from tools import interrupt as _interrupt_mod
+        with _interrupt_mod._lock:
+            _interrupt_mod._interrupted_threads.clear()
+    except Exception:
+        pass
+
+    # --- gateway.session_context — ContextVars that represent
+    #     the active gateway session. If set in one test and not reset,
+    #     the next test's get_session_env() reads stale values.
+    try:
+        from gateway import session_context as _sc_mod
+        for _cv in (
+            _sc_mod._SESSION_PLATFORM,
+            _sc_mod._SESSION_CHAT_ID,
+            _sc_mod._SESSION_CHAT_NAME,
+            _sc_mod._SESSION_THREAD_ID,
+            _sc_mod._SESSION_USER_ID,
+            _sc_mod._SESSION_USER_NAME,
+            _sc_mod._SESSION_KEY,
+            _sc_mod._SESSION_ID,
+            _sc_mod._SESSION_MESSAGE_ID,
+            _sc_mod._CRON_AUTO_DELIVER_PLATFORM,
+            _sc_mod._CRON_AUTO_DELIVER_CHAT_ID,
+            _sc_mod._CRON_AUTO_DELIVER_THREAD_ID,
+        ):
+            _cv.set(_sc_mod._UNSET)
+    except Exception:
+        pass
+
+    # --- tools.env_passthrough — ContextVar<set[str]> with no default ---
+    # LookupError is normal if the test never set it. Setting it to an
+    # empty set unconditionally normalizes the starting state.
+    try:
+        from tools import env_passthrough as _envp_mod
+        _envp_mod._allowed_env_vars_var.set(set())
+    except Exception:
+        pass
+
+    # --- tools.terminal_tool — active environment/cwd cache ---
+    # File tools prefer a live terminal cwd when one is cached for the task.
+    # Clear terminal environments between tests so a prior terminal call can't
+    # override TERMINAL_CWD in path-resolution tests.
+    try:
+        from tools import terminal_tool as _term_mod
+        _envs_to_cleanup = []
+        with _term_mod._env_lock:
+            _envs_to_cleanup = list(_term_mod._active_environments.values())
+            _term_mod._active_environments.clear()
+            _term_mod._last_activity.clear()
+            _term_mod._creation_locks.clear()
+        for _env in _envs_to_cleanup:
+            try:
+                _env.cleanup()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # --- tools.credential_files — ContextVar<dict> ---
+    try:
+        from tools import credential_files as _credf_mod
+        _credf_mod._registered_files_var.set({})
+    except Exception:
+        pass
+
+    # --- agent.auxiliary_client — runtime main provider/model override and
+    #     payment-error health cache. Both are process-global in production;
+    #     reset them per test so one worker's fallback/402 test does not make
+    #     later auxiliary-client tests skip otherwise-available providers.
+    try:
+        from agent import auxiliary_client as _aux_mod
+        _aux_mod.clear_runtime_main()
+        _aux_mod._reset_aux_unhealthy_cache()
+    except Exception:
+        pass
+
+    # --- tools.file_tools — per-task read history + file-ops cache ---
+    # _read_tracker accumulates per-task_id read history for loop detection,
+    # capped by _READ_HISTORY_CAP. If entries from a prior test persist, the
+    # cap is hit faster than expected and capacity-related tests flake.
+    try:
+        from tools import file_tools as _ft_mod
+        with _ft_mod._read_tracker_lock:
+            _ft_mod._read_tracker.clear()
+        with _ft_mod._file_ops_lock:
+            _ft_mod._file_ops_cache.clear()
+    except Exception:
+        pass
+
+    yield
 
 
 @pytest.fixture()

@@ -42,7 +42,12 @@ def test_set_session_env_sets_contextvars(monkeypatch):
         user_name="alice",
         thread_id="17585",
     )
-    context = SessionContext(source=source, connected_platforms=[], home_channels={})
+    context = SessionContext(
+        source=source,
+        connected_platforms=[],
+        home_channels={},
+        session_id="session-abc",
+    )
 
     monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
     monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
@@ -50,6 +55,7 @@ def test_set_session_env_sets_contextvars(monkeypatch):
     monkeypatch.delenv("HERMES_SESSION_USER_ID", raising=False)
     monkeypatch.delenv("HERMES_SESSION_USER_NAME", raising=False)
     monkeypatch.delenv("HERMES_SESSION_THREAD_ID", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
 
     tokens = runner._set_session_env(context)
 
@@ -60,6 +66,7 @@ def test_set_session_env_sets_contextvars(monkeypatch):
     assert get_session_env("HERMES_SESSION_USER_ID") == "123456"
     assert get_session_env("HERMES_SESSION_USER_NAME") == "alice"
     assert get_session_env("HERMES_SESSION_THREAD_ID") == "17585"
+    assert get_session_env("HERMES_SESSION_ID") == "session-abc"
 
     # os.environ should NOT be touched
     assert os.getenv("HERMES_SESSION_PLATFORM") is None
@@ -89,7 +96,12 @@ def test_clear_session_env_restores_previous_state(monkeypatch):
         user_name="alice",
         thread_id="17585",
     )
-    context = SessionContext(source=source, connected_platforms=[], home_channels={})
+    context = SessionContext(
+        source=source,
+        connected_platforms=[],
+        home_channels={},
+        session_id="session-abc",
+    )
 
     tokens = runner._set_session_env(context)
     assert get_session_env("HERMES_SESSION_PLATFORM") == "telegram"
@@ -104,6 +116,7 @@ def test_clear_session_env_restores_previous_state(monkeypatch):
     assert get_session_env("HERMES_SESSION_USER_ID") == ""
     assert get_session_env("HERMES_SESSION_USER_NAME") == ""
     assert get_session_env("HERMES_SESSION_THREAD_ID") == ""
+    assert get_session_env("HERMES_SESSION_ID") == ""
 
 
 def test_get_session_env_falls_back_to_os_environ(monkeypatch):
@@ -218,6 +231,46 @@ def test_set_session_env_includes_session_key():
     assert get_session_env("HERMES_SESSION_KEY") != "tg:-1001:17585"
 
 
+def test_session_id_set_via_contextvars(monkeypatch):
+    """set_session_vars should not let HERMES_SESSION_ID fall back to stale process env."""
+    monkeypatch.setenv("HERMES_SESSION_ID", "stale-session-from-other-turn")
+
+    tokens = set_session_vars(session_key="topic-A", session_id="session-A")
+    assert get_session_env("HERMES_SESSION_ID") == "session-A"
+
+    clear_session_vars(tokens)
+    assert get_session_env("HERMES_SESSION_ID") == ""
+
+
+def test_set_session_env_includes_session_id(monkeypatch):
+    """_set_session_env should propagate session_id from SessionContext for tool isolation."""
+    monkeypatch.setenv("HERMES_SESSION_ID", "stale-session-from-other-turn")
+    runner = object.__new__(GatewayRunner)
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="2144471399",
+        chat_type="dm",
+        user_id="123456",
+        thread_id="463723",
+    )
+    context = SessionContext(
+        source=source,
+        connected_platforms=[],
+        home_channels={},
+        session_key="agent:main:telegram:dm:2144471399:463723",
+        session_id="session-current-topic",
+    )
+
+    tokens = runner._set_session_env(context)
+    try:
+        assert get_session_env("HERMES_SESSION_KEY") == "agent:main:telegram:dm:2144471399:463723"
+        assert get_session_env("HERMES_SESSION_ID") == "session-current-topic"
+    finally:
+        runner._clear_session_env(tokens)
+
+    assert get_session_env("HERMES_SESSION_ID") == ""
+
+
 def test_session_key_no_race_condition_with_contextvars(monkeypatch):
     """Prove contextvars isolates SESSION_KEY across concurrent async tasks.
 
@@ -277,6 +330,7 @@ async def test_run_in_executor_with_context_preserves_session_env(monkeypatch):
         connected_platforms=[],
         home_channels={},
         session_key="agent:main:telegram:dm:2144471399",
+        session_id="session-executor",
     )
 
     tokens = runner._set_session_env(context)
@@ -287,6 +341,7 @@ async def test_run_in_executor_with_context_preserves_session_env(monkeypatch):
                 "chat_id": get_session_env("HERMES_SESSION_CHAT_ID"),
                 "user_id": get_session_env("HERMES_SESSION_USER_ID"),
                 "session_key": get_session_env("HERMES_SESSION_KEY"),
+                "session_id": get_session_env("HERMES_SESSION_ID"),
             }
         )
     finally:
@@ -297,6 +352,7 @@ async def test_run_in_executor_with_context_preserves_session_env(monkeypatch):
         "chat_id": "2144471399",
         "user_id": "123456",
         "session_key": "agent:main:telegram:dm:2144471399",
+        "session_id": "session-executor",
     }
 
 
