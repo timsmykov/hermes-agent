@@ -771,6 +771,78 @@ def _collect_gateway_skill_entries(
 # Platform-specific wrappers
 # ---------------------------------------------------------------------------
 
+_TELEGRAM_MENU_PRIORITY: tuple[str, ...] = (
+    # Keep the Telegram slash menu useful under the adapter's intentionally
+    # small payload cap.  Aliases that users expect to see can be listed here
+    # even when the canonical command is registered elsewhere (e.g. /reset is
+    # an alias for /new).
+    "new",
+    "reset",
+    "help",
+    "commands",
+    "limits",
+    "usage",
+    "status",
+    "model",
+    "reasoning",
+    "fast",
+    "voice",
+    "topic",
+    "goal",
+    "plan",
+    "agents",
+    "queue",
+    "steer",
+    "background",
+    "stop",
+    "restart",
+    "debug",
+    "platform",
+    "update",
+    "verbose",
+    "retry",
+    "undo",
+    "compress",
+    "resume",
+    "sessions",
+    "title",
+    "yolo",
+)
+
+
+def _telegram_core_menu_commands() -> list[tuple[str, str]]:
+    """Return core Telegram menu commands ordered for compact UX.
+
+    ``telegram_bot_commands()`` exposes every gateway-available canonical
+    command for callers that want the full registry.  The actual Telegram menu
+    is capped lower in the gateway to avoid Bot API payload failures, so this
+    helper pins high-value commands before lower-frequency maintenance entries.
+    """
+    entries = list(telegram_bot_commands())
+    by_name: dict[str, tuple[str, str]] = {name: (name, desc) for name, desc in entries}
+
+    # /reset is the muscle-memory alias for /new.  Telegram only shows commands
+    # that are explicitly registered, so pin the alias as its own visible entry.
+    if "new" in by_name and "reset" not in by_name:
+        by_name["reset"] = ("reset", "Start a new session (alias for /new)")
+
+    ordered: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for name in _TELEGRAM_MENU_PRIORITY:
+        entry = by_name.get(name)
+        if entry and name not in seen:
+            ordered.append(entry)
+            seen.add(name)
+
+    # Preserve registry order for the rest so full-menu callers remain stable.
+    for name, desc in entries:
+        if name not in seen:
+            ordered.append((name, desc))
+            seen.add(name)
+
+    return ordered
+
+
 def telegram_menu_commands(max_commands: int = 100) -> tuple[list[tuple[str, str]], int]:
     """Return Telegram menu commands capped to the Bot API limit.
 
@@ -788,7 +860,7 @@ def telegram_menu_commands(max_commands: int = 100) -> tuple[list[tuple[str, str
         (menu_commands, hidden_count) where hidden_count is the number of
         commands omitted due to the cap.
     """
-    core_commands = _prioritize_telegram_menu_commands(list(telegram_bot_commands()))
+    core_commands = _telegram_core_menu_commands()
     reserved_names = {n for n, _ in core_commands}
     all_commands = list(core_commands)
     hidden_core_count = max(0, len(all_commands) - max_commands)
@@ -1070,6 +1142,20 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
         # Slack description cap is 2000 chars; keep it short.
         entries.append((slack_name, desc[:140], hint[:100]))
         seen.add(slack_name)
+
+    # Priority aliases are muscle-memory shortcuts; add them before the
+    # canonical registry can consume Slack's 50-command cap.
+    priority_aliases = ("btw", "bg", "reset", "q")
+    by_alias = {
+        alias: cmd
+        for cmd in COMMAND_REGISTRY
+        if _is_gateway_available(cmd, overrides)
+        for alias in cmd.aliases
+    }
+    for alias in priority_aliases:
+        cmd = by_alias.get(alias)
+        if cmd:
+            _add(alias, f"Alias for /{cmd.name} — {cmd.description}", cmd.args_hint or "")
 
     # First pass: canonical names (so they win slots if we hit the cap).
     for cmd in COMMAND_REGISTRY:
