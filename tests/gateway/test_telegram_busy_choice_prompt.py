@@ -65,6 +65,10 @@ async def test_busy_choice_prompt_does_not_repeat_user_message(monkeypatch):
     assert "processing previous turn" in text
     assert "это длинный prompt" not in text
     assert "<blockquote>" not in text
+    assert kwargs["reply_to_message_id"] is None
+    assert kwargs["_hermes_metadata"].get("telegram_reply_to_message_id") is None
+    assert kwargs["_hermes_metadata"].get("telegram_dm_topic_reply_fallback") is True
+    assert kwargs["message_thread_id"] == 463637
     assert kwargs["reply_markup"] is not None
     rows = kwargs["reply_markup"].inline_keyboard
     labels = [button.text for row in rows for button in row]

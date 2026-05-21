@@ -2857,16 +2857,19 @@ class TelegramAdapter(BasePlatformAdapter):
                 ]
             ])
 
-            reply_anchor = getattr(event, "message_id", None)
+            # This is a transient routing prompt, not a semantic reply to the
+            # user's text.  Keep it in the same topic, but do not set a visible
+            # Telegram reply anchor: otherwise Telegram renders a quoted block
+            # for the just-sent (or occasionally stale) user message, making it
+            # look like Hermes is asking to re-ingest context it already saw.
             metadata = {
                 "thread_id": event.source.thread_id,
                 "notify": True,
             }
-            if event.source.thread_id and event.source.chat_type == "dm" and reply_anchor:
+            if event.source.thread_id and event.source.chat_type == "dm":
                 metadata["telegram_dm_topic_reply_fallback"] = True
-                metadata["telegram_reply_to_message_id"] = str(reply_anchor)
             thread_id = self._metadata_thread_id(metadata)
-            reply_to_id = self._reply_to_message_id_for_send(reply_anchor, metadata)
+            reply_to_id = self._reply_to_message_id_for_send(None, metadata, reply_to_mode="off")
             kwargs: Dict[str, Any] = {
                 "chat_id": int(event.source.chat_id),
                 "text": text,
@@ -2878,6 +2881,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     thread_id,
                     metadata,
                     reply_to_message_id=reply_to_id,
+                    reply_to_mode="off",
                 ),
                 **self._link_preview_kwargs(),
                 **self._notification_kwargs(metadata),
