@@ -171,6 +171,56 @@ def worker_env(monkeypatch, tmp_path):
     return tid
 
 
+def test_stamp_worker_session_metadata_uses_contextvar_not_stale_env(monkeypatch, worker_env):
+    """Worker metadata must use the active session context, not process-global stale env."""
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_SESSION_ID", "stale-session-from-other-topic")
+    tokens = set_session_vars(session_id="active-topic-session")
+    try:
+        stamped = kt._stamp_worker_session_metadata(worker_env, {"existing": True})
+    finally:
+        clear_session_vars(tokens)
+
+    assert stamped == {"existing": True, "worker_session_id": "active-topic-session"}
+
+
+def test_stamp_worker_session_metadata_cleared_context_blocks_env_fallback(monkeypatch, worker_env):
+    """After session cleanup, stale HERMES_SESSION_ID in env must not be reused."""
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_SESSION_ID", "stale-session-from-other-topic")
+    tokens = set_session_vars(session_id="active-topic-session")
+    clear_session_vars(tokens)
+
+    assert kt._stamp_worker_session_metadata(worker_env, {}) == {}
+
+
+def test_create_uses_context_session_id_not_stale_env(monkeypatch, worker_env):
+    """kanban_create should stamp child tasks with the active gateway session id."""
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_SESSION_ID", "stale-session-from-other-topic")
+    tokens = set_session_vars(session_id="active-topic-session")
+    try:
+        out = kt._handle_create({"title": "child", "assignee": "worker"})
+    finally:
+        clear_session_vars(tokens)
+
+    d = json.loads(out)
+    assert d["ok"] is True
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, d["task_id"])
+    finally:
+        conn.close()
+    assert task.session_id == "active-topic-session"
+
+
 def test_show_defaults_to_env_task_id(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_show({})
