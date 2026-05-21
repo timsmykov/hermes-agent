@@ -344,6 +344,17 @@ _PROGRESS_MAIN_BLOCK_ID = "main"
 _PROGRESS_VISIBLE_STEPS_PER_BLOCK = 15
 
 
+def _progress_visible_limit_for_block(block_id: str) -> int:
+    """Return the per-pane timeline step limit.
+
+    Tim wants the main orchestrator timeline to be complete. Delegated
+    subagents stay compact so child panes do not overwhelm the Telegram thread.
+    A limit <= 0 means no per-block trimming; platform message-length overflow
+    is still handled later by the progress-bubble sender.
+    """
+    return 0 if block_id == _PROGRESS_MAIN_BLOCK_ID else _PROGRESS_VISIBLE_STEPS_PER_BLOCK
+
+
 def _append_progress_block_line(
     blocks: OrderedDict,
     block_id: str,
@@ -352,7 +363,7 @@ def _append_progress_block_line(
     *,
     pinned: bool = False,
     replace_kind: Optional[str] = None,
-    visible_limit: int = _PROGRESS_VISIBLE_STEPS_PER_BLOCK,
+    visible_limit: Optional[int] = None,
 ) -> None:
     """Update a structured progress block in-place.
 
@@ -383,6 +394,8 @@ def _append_progress_block_line(
                 return
 
     lines.append({"text": line, "pinned": bool(pinned), "kind": replace_kind})
+    if visible_limit is None:
+        visible_limit = _progress_visible_limit_for_block(str(block_id))
     _trim_progress_block_lines(block, visible_limit=visible_limit)
 
 

@@ -1,9 +1,11 @@
 from collections import OrderedDict
 
 from gateway.run import (
+    _PROGRESS_VISIBLE_STEPS_PER_BLOCK,
     _append_progress_block_line,
     _format_subagent_progress_line,
     _infer_subagent_display_name,
+    _progress_visible_limit_for_block,
     _render_progress_blocks,
 )
 
@@ -131,6 +133,37 @@ def test_progress_block_keeps_important_lines_while_trimming_to_visible_limit():
     assert "step 0" not in rendered
     assert "step 7" in rendered
     assert "earlier steps" in rendered
+
+
+def test_main_progress_block_is_untrimmed_by_default():
+    blocks = OrderedDict()
+    _append_progress_block_line(blocks, "main", "🧭 main agent", "start", pinned=True)
+    for idx in range(_PROGRESS_VISIBLE_STEPS_PER_BLOCK + 8):
+        _append_progress_block_line(blocks, "main", "🧭 main agent", f"main step {idx}")
+
+    rendered = _render_progress_blocks(blocks)
+
+    assert "earlier steps" not in rendered
+    assert "main step 0" in rendered
+    assert f"main step {_PROGRESS_VISIBLE_STEPS_PER_BLOCK + 7}" in rendered
+
+
+def test_subagent_progress_block_remains_trimmed_by_default():
+    blocks = OrderedDict()
+    _append_progress_block_line(blocks, "agent:0", "🤖 agent 1", "🤖 start", pinned=True)
+    for idx in range(_PROGRESS_VISIBLE_STEPS_PER_BLOCK + 8):
+        _append_progress_block_line(blocks, "agent:0", "🤖 agent 1", f"agent step {idx}")
+
+    rendered = _render_progress_blocks(blocks)
+
+    assert "earlier steps" in rendered
+    assert "agent step 0" not in rendered
+    assert f"agent step {_PROGRESS_VISIBLE_STEPS_PER_BLOCK + 7}" in rendered
+
+
+def test_progress_visible_limit_policy_keeps_main_unlimited_and_children_compact():
+    assert _progress_visible_limit_for_block("main") == 0
+    assert _progress_visible_limit_for_block("agent:0") == _PROGRESS_VISIBLE_STEPS_PER_BLOCK
 
 
 def test_progress_block_replaces_thinking_line_instead_of_appending_noise():
