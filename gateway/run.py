@@ -15670,6 +15670,57 @@ class GatewayRunner:
                         if p.value == platform_name:
                             adapter = a
                             break
+
+                    # If the originating orchestrator is still active, this is
+                    # not user-facing news yet. Feed the completion back into the
+                    # same session as an internal event so the agent can inspect,
+                    # recover, retry, or explain it in the final answer. Only
+                    # fall back to a public Telegram alert when no active agent is
+                    # available to consume the failure.
+                    active_sessions = getattr(adapter, "_active_sessions", {}) if adapter else {}
+                    active_orchestrator = bool(
+                        session_key
+                        and (
+                            session_key in self._running_agents
+                            or session_key in active_sessions
+                        )
+                    )
+                    if active_orchestrator:
+                        source = self._build_process_event_source({
+                            "session_id": session_id,
+                            "session_key": session_key,
+                            "platform": platform_name,
+                            "chat_id": chat_id,
+                            "thread_id": thread_id,
+                            "user_id": user_id,
+                            "user_name": user_name,
+                        })
+                        if source and adapter:
+                            try:
+                                synth_event = MessageEvent(
+                                    text=(
+                                        "[IMPORTANT: Background task connected to the "
+                                        "current orchestration finished. Treat this as "
+                                        "tool feedback, not as a user request. "
+                                        f"Exit code: {session.exit_code}.\n"
+                                        f"Command: {getattr(session, 'command', '')}\n"
+                                        f"Output:\n{new_output}]"
+                                    ),
+                                    message_type=MessageType.TEXT,
+                                    source=source,
+                                    internal=True,
+                                    message_id=message_id,
+                                )
+                                logger.info(
+                                    "Process %s finished — routed watcher result to active orchestrator for session %s",
+                                    session_id,
+                                    session_key,
+                                )
+                                await adapter.handle_message(synth_event)
+                                break
+                            except Exception as e:
+                                logger.error("Active orchestrator watcher injection error: %s", e)
+
                     if adapter and chat_id:
                         try:
                             send_meta = {"thread_id": thread_id} if thread_id else None

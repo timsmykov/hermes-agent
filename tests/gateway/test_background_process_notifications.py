@@ -320,6 +320,51 @@ async def test_no_thread_id_sends_no_metadata(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_active_orchestrator_gets_background_failure_internally(monkeypatch, tmp_path):
+    """A background failure during an active run should go back to the agent,
+    not directly to Telegram as a standalone alert."""
+    import tools.process_registry as pr_module
+
+    sessions = [SimpleNamespace(
+        output_buffer="Traceback...\nRuntimeError: QA failed\n",
+        exited=True,
+        exit_code=1,
+        command="python grade_all_repositories.py",
+    )]
+    monkeypatch.setattr(pr_module, "process_registry", _FakeRegistry(sessions))
+
+    async def _instant_sleep(*_a, **_kw):
+        pass
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    adapter = runner.adapters[Platform.TELEGRAM]
+    session_key = "agent:main:telegram:dm:123:24296"
+    runner._running_agents[session_key] = object()
+
+    watcher = {
+        "session_id": "proc_active_fail",
+        "check_interval": 0,
+        "session_key": session_key,
+        "platform": "telegram",
+        "chat_id": "123",
+        "thread_id": "24296",
+        "message_id": "555",
+    }
+    await runner._run_process_watcher(watcher)
+
+    adapter.send.assert_not_awaited()
+    adapter.handle_message.assert_awaited_once()
+    synth_event = adapter.handle_message.await_args.args[0]
+    assert synth_event.internal is True
+    assert synth_event.message_id == "555"
+    assert synth_event.source.thread_id == "24296"
+    assert "current orchestration" in synth_event.text
+    assert "Exit code: 1" in synth_event.text
+    assert "QA failed" in synth_event.text
+
+
+@pytest.mark.asyncio
 async def test_inject_watch_notification_routes_from_session_store_origin(monkeypatch, tmp_path):
     from gateway.session import SessionSource
 
