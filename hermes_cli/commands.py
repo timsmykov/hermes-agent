@@ -709,6 +709,77 @@ def _collect_gateway_skill_entries(
 # Platform-specific wrappers
 # ---------------------------------------------------------------------------
 
+_TELEGRAM_MENU_PRIORITY: tuple[str, ...] = (
+    # Keep the Telegram slash menu useful under the adapter's intentionally
+    # small payload cap.  Aliases that users expect to see can be listed here
+    # even when the canonical command is registered elsewhere (e.g. /reset is
+    # an alias for /new).
+    "new",
+    "reset",
+    "help",
+    "commands",
+    "limits",
+    "usage",
+    "status",
+    "model",
+    "reasoning",
+    "fast",
+    "voice",
+    "topic",
+    "goal",
+    "plan",
+    "agents",
+    "queue",
+    "steer",
+    "background",
+    "stop",
+    "restart",
+    "debug",
+    "platform",
+    "update",
+    "retry",
+    "undo",
+    "compress",
+    "resume",
+    "sessions",
+    "title",
+    "yolo",
+)
+
+
+def _telegram_core_menu_commands() -> list[tuple[str, str]]:
+    """Return core Telegram menu commands ordered for compact UX.
+
+    ``telegram_bot_commands()`` exposes every gateway-available canonical
+    command for callers that want the full registry.  The actual Telegram menu
+    is capped lower in the gateway to avoid Bot API payload failures, so this
+    helper pins high-value commands before lower-frequency maintenance entries.
+    """
+    entries = list(telegram_bot_commands())
+    by_name: dict[str, tuple[str, str]] = {name: (name, desc) for name, desc in entries}
+
+    # /reset is the muscle-memory alias for /new.  Telegram only shows commands
+    # that are explicitly registered, so pin the alias as its own visible entry.
+    if "new" in by_name and "reset" not in by_name:
+        by_name["reset"] = ("reset", "Start a new session (alias for /new)")
+
+    ordered: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for name in _TELEGRAM_MENU_PRIORITY:
+        entry = by_name.get(name)
+        if entry and name not in seen:
+            ordered.append(entry)
+            seen.add(name)
+
+    # Preserve registry order for the rest so full-menu callers remain stable.
+    for name, desc in entries:
+        if name not in seen:
+            ordered.append((name, desc))
+            seen.add(name)
+
+    return ordered
+
+
 def telegram_menu_commands(max_commands: int = 100) -> tuple[list[tuple[str, str]], int]:
     """Return Telegram menu commands capped to the Bot API limit.
 
@@ -726,7 +797,7 @@ def telegram_menu_commands(max_commands: int = 100) -> tuple[list[tuple[str, str
         (menu_commands, hidden_count) where hidden_count is the number of
         skill commands omitted due to the cap.
     """
-    core_commands = list(telegram_bot_commands())
+    core_commands = _telegram_core_menu_commands()
     reserved_names = {n for n, _ in core_commands}
     all_commands = list(core_commands)
 

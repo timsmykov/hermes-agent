@@ -944,6 +944,25 @@ class TestDiscordSkillCmdKeyDispatch:
 class TestTelegramMenuCommands:
     """Integration: telegram_menu_commands enforces the 32-char limit."""
 
+    def test_compact_menu_pins_high_value_commands(self):
+        """The live Telegram adapter registers only a compact menu.
+
+        Muscle-memory commands like /reset and account/status commands like
+        /limits must not be pushed below that cap by lower-frequency entries.
+        """
+        menu, _ = telegram_menu_commands(max_commands=30)
+        names = [name for name, _desc in menu]
+
+        for expected in ("new", "reset", "limits", "usage", "commands", "help"):
+            assert expected in names, f"missing /{expected} from compact Telegram menu"
+
+    def test_compact_menu_removes_lower_priority_commands(self):
+        menu, _ = telegram_menu_commands(max_commands=30)
+        names = {name for name, _desc in menu}
+
+        for lower_priority in ("branch", "rollback", "approve", "deny", "whoami", "profile"):
+            assert lower_priority not in names
+
     def test_all_names_within_limit(self):
         menu, _ = telegram_menu_commands(max_commands=100)
         for name, _desc in menu:
