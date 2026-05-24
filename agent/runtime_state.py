@@ -44,11 +44,11 @@ def render_active_state_context(agent: Any, user_message: str) -> str:
     try:
         from agent.reference_resolver import ReferenceResolver
 
-        resolver = ReferenceResolver(store)
+        resolver = ReferenceResolver(store, getattr(agent, "_session_db", None))
         resolution = resolver.resolve(scope, user_message or "")
         if resolution.status in {"resolved", "needs_clarification"}:
             blocks.append("## Reference Resolver\n" + json.dumps(resolution.to_dict(), ensure_ascii=False, sort_keys=True))
-        if resolution.status == "needs_clarification":
+        if resolution.status == "needs_clarification" or resolution.source == "session_lineage":
             lineage_hits = 0
             try:
                 from agent.lineage_retrieval import render_lineage_evidence, retrieve_lineage
@@ -192,11 +192,25 @@ def record_tool_route_observation(agent: Any, tool_name: str) -> None:
         return
 
 
-def record_compaction_handoff(agent: Any, *, old_session_id: str, new_session_id: str, before_count: int, after_count: int) -> None:
-    """Persist an audited handoff marker after context compression rotates sessions."""
+def record_compaction_handoff(
+    agent: Any,
+    *,
+    old_session_id: str,
+    new_session_id: str,
+    before_count: int,
+    after_count: int,
+    raw_window: Optional[list] = None,
+    retry_once: bool = True,
+) -> bool:
+    """Persist an audited handoff marker after context compression rotates sessions.
+
+    Returns True on verified persistence. On audit write failure it retries once;
+    if persistence still fails, it preserves a bounded raw-window marker on the
+    agent object so the caller can abort/continue without silently losing state.
+    """
     store = active_state_store_for_agent(agent)
     if store is None:
-        return
+        return False
     scope = scope_from_agent(agent)
     state = store.get(scope)
     handoff = {
@@ -210,4 +224,40 @@ def record_compaction_handoff(agent: Any, *, old_session_id: str, new_session_id
         "current_task": state.current_task,
         "created_at": time.time(),
     }
-    store.record_handoff(scope, handoff)
+    attempts = 2 if retry_once else 1
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            store.record_handoff(scope, handoff)
+            persisted = store.get(scope).handoff or {}
+            if (
+                persisted.get("kind") == "context_compaction"
+                and persisted.get("old_session_id") == old_session_id
+                and persisted.get("new_session_id") == new_session_id
+            ):
+                return True
+            last_error = RuntimeError("compaction handoff audit verification failed")
+        except Exception as exc:
+            last_error = exc
+    preserved = {
+        "kind": "context_compaction_audit_failed",
+        "old_session_id": old_session_id,
+        "new_session_id": new_session_id,
+        "before_message_count": before_count,
+        "after_message_count": after_count,
+        "current_task": state.current_task,
+        "raw_window": list(raw_window or [])[-20:],
+        "error": str(last_error)[:500] if last_error else "unknown",
+        "created_at": time.time(),
+    }
+    try:
+        setattr(agent, "_pending_compaction_raw_window", preserved)
+    except Exception:
+        pass
+    try:
+        emit_warning = getattr(agent, "_emit_warning", None)
+        if callable(emit_warning):
+            emit_warning("⚠️ Compaction audit failed; preserved raw window and skipped silent handoff loss.")
+    except Exception:
+        pass
+    return False

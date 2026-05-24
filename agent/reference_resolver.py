@@ -52,8 +52,9 @@ class ResolutionResult:
 class ReferenceResolver:
     """Resolve ambiguous references from one isolated active session scope."""
 
-    def __init__(self, active_state_store: ActiveStateStore):
+    def __init__(self, active_state_store: ActiveStateStore, session_db: Any = None):
         self.active_state_store = active_state_store
+        self.session_db = session_db or getattr(active_state_store, "session_db", None)
 
     @staticmethod
     def has_ambiguous_reference(text: str) -> bool:
@@ -92,6 +93,23 @@ class ReferenceResolver:
         if priority_artifacts:
             artifacts = priority_artifacts
         if not artifacts:
+            lineage_candidates = self._lineage_candidates(scope, text)
+            if lineage_candidates:
+                if len(lineage_candidates) == 1:
+                    return ResolutionResult(
+                        status="resolved",
+                        source="session_lineage",
+                        query=text,
+                        artifact=lineage_candidates[0],
+                        candidates=lineage_candidates,
+                    )
+                return ResolutionResult(
+                    status="needs_clarification",
+                    source="session_lineage",
+                    query=text,
+                    candidates=lineage_candidates[:5],
+                    reason="multiple_lineage_candidates",
+                )
             return ResolutionResult(
                 status="needs_clarification",
                 source="active_state",
@@ -127,3 +145,27 @@ class ReferenceResolver:
             candidates=candidates[:5],
             reason="multiple_active_artifacts",
         )
+
+    def _lineage_candidates(self, scope: SessionScope, text: str) -> List[Dict[str, Any]]:
+        if self.session_db is None:
+            return []
+        try:
+            from agent.lineage_retrieval import retrieve_lineage
+
+            evidence = retrieve_lineage(self.session_db, scope, text, limit=5)
+        except Exception:
+            return []
+        return [
+            {
+                "artifact_id": f"lineage:{item.session_id}:{item.ordinal}",
+                "kind": "lineage_evidence",
+                "title": item.content[:120],
+                "content": item.content,
+                "source": item.source,
+                "session_id": item.session_id,
+                "role": item.role,
+                "score": item.score,
+                "ordinal": item.ordinal,
+            }
+            for item in evidence
+        ]

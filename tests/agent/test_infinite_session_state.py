@@ -92,3 +92,27 @@ def test_active_state_archives_stale_artifacts(tmp_path):
     assert state.active_artifacts[0]["status_reason"] == "stale"
     events = db.list_active_session_events(scope.scope_key)
     assert events[0]["event_type"] == "artifacts_archived_stale"
+
+
+def test_current_task_updates_from_user_and_final_assistant_output(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    store = ActiveStateStore(db)
+    scope = SessionScope(platform="telegram", chat_id="806409559", thread_id="468587", session_id="s-a")
+
+    store.update_latest_user_request(scope, text="доработай Infinite Session Engine", message_id="u1")
+    store.update_current_task_from_assistant(scope, text="Готово: задача завершена.", message_id="a1")
+
+    state = store.get(scope)
+    assert state.current_task["text"] == "доработай Infinite Session Engine"
+    assert state.current_task["status"] == "completed"
+    assert state.current_task["completed_message_id"] == "a1"
+
+
+def test_current_task_ignores_low_signal_user_turn(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    store = ActiveStateStore(db)
+    scope = SessionScope(platform="telegram", chat_id="806409559", thread_id="468587", session_id="s-a")
+
+    store.update_latest_user_request(scope, text="спасибо", message_id="u1")
+
+    assert store.get(scope).current_task is None

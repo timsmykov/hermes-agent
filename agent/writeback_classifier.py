@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List
+from typing import Any, Callable, Dict, Iterable, List
 
 
 _DURABLE_RE = re.compile(
@@ -122,3 +122,32 @@ def writeback_wrapper(decision: WritebackDecision) -> Dict[str, Any]:
         data["target"] = None
         data["promotion_required"] = False
     return data
+
+
+def verify_writeback_retrieval_after_embed(
+    wrapper: Dict[str, Any],
+    retrieve: Callable[[str], Iterable[Any]],
+    *,
+    expected: str | None = None,
+) -> Dict[str, Any]:
+    """Verify that a written/embedded candidate is retrievable."""
+    action = wrapper.get("action")
+    if action == "skip":
+        return {"status": "not_applicable", "reason": "writeback_skipped", "match_count": 0}
+    payload = wrapper.get("payload") or {}
+    query = expected or payload.get("summary_source") or wrapper.get("reason") or ""
+    query = str(query).strip()[:240]
+    if not query:
+        return {"status": "failed", "reason": "missing_retrieval_query", "match_count": 0}
+    try:
+        matches = list(retrieve(query) or [])
+    except Exception as exc:
+        return {"status": "failed", "reason": "retrieval_error", "error": str(exc)[:300], "match_count": 0}
+    if matches:
+        return {
+            "status": "verified",
+            "reason": "retrievable_after_embed",
+            "match_count": len(matches),
+            "query": query,
+        }
+    return {"status": "failed", "reason": "not_retrievable_after_embed", "match_count": 0, "query": query}

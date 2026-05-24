@@ -406,13 +406,16 @@ def compress_context(
             agent._session_db.update_system_prompt(agent.session_id, new_system_prompt)
             try:
                 from agent.runtime_state import record_compaction_handoff
-                record_compaction_handoff(
+                handoff_ok = record_compaction_handoff(
                     agent,
                     old_session_id=old_session_id,
                     new_session_id=agent.session_id,
                     before_count=_pre_msg_count,
                     after_count=len(compressed),
+                    raw_window=messages[-20:],
                 )
+                if not handoff_ok:
+                    logger.warning("active-state compaction handoff audit failed; raw window preserved on agent")
             except Exception as _handoff_err:
                 logger.debug("active-state compaction handoff failed: %s", _handoff_err)
             # Reset flush cursor — new session starts with no messages written

@@ -4179,6 +4179,19 @@ def run_conversation(
         except Exception as exc:
             logger.warning("transform_llm_output hook failed: %s", exc)
 
+    if final_response and not interrupted:
+        try:
+            from agent.runtime_state import active_state_store_for_agent, scope_from_agent
+
+            _active_store = active_state_store_for_agent(agent)
+            if _active_store is not None:
+                _active_store.update_current_task_from_assistant(
+                    scope_from_agent(agent),
+                    text=final_response,
+                )
+        except Exception as exc:
+            logger.debug("active-state current_task final-output update failed: %s", exc)
+
     # Plugin hook: post_llm_call
     # Fired once per turn after the tool-calling loop completes.
     # Plugins can use this to persist conversation data (e.g. sync

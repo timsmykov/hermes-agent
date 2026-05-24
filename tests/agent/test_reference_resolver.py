@@ -79,3 +79,19 @@ def test_reference_resolver_prefers_reply_or_attachment_artifact(tmp_path):
     assert result.status == "resolved"
     assert result.artifact is not None
     assert result.artifact["artifact_id"] == "reply"
+
+
+def test_reference_resolver_falls_back_to_current_lineage(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    store = ActiveStateStore(db)
+    resolver = ReferenceResolver(store, db)
+    scope = SessionScope(platform="telegram", chat_id="806409559", thread_id="468587", session_id="s-a")
+    db.create_session("s-a", source="telegram")
+    db.append_message("s-a", role="assistant", content="Сделал отчёт по Infinite Session Engine в /tmp/session-report.md")
+
+    result = resolver.resolve(scope, "продолжи этот отчёт")
+
+    assert result.source == "session_lineage"
+    assert result.status == "resolved"
+    assert result.artifact is not None
+    assert "session-report" in result.artifact["content"]

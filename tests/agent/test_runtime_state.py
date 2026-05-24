@@ -99,3 +99,28 @@ def test_record_compaction_handoff_preserves_active_state_audit(tmp_path):
     assert state["handoff"]["active_artifact_count"] == 1
     events = agent._session_db.list_active_session_events(scope.scope_key)
     assert events[0]["event_type"] == "handoff_recorded"
+
+
+def test_record_compaction_handoff_retries_and_preserves_raw_window_on_failure(tmp_path, monkeypatch):
+    agent = _agent(tmp_path)
+    warnings = []
+    agent._emit_warning = warnings.append
+
+    def fail_record_handoff(self, scope, handoff):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr("agent.active_state.ActiveStateStore.record_handoff", fail_record_handoff)
+
+    ok = record_compaction_handoff(
+        agent,
+        old_session_id="s-old",
+        new_session_id="s-new",
+        before_count=120,
+        after_count=12,
+        raw_window=[{"role": "user", "content": "raw"}],
+    )
+
+    assert ok is False
+    assert agent._pending_compaction_raw_window["kind"] == "context_compaction_audit_failed"
+    assert agent._pending_compaction_raw_window["raw_window"][0]["content"] == "raw"
+    assert warnings

@@ -1,6 +1,10 @@
 from agent.active_state import ActiveStateStore
 from agent.session_health import build_session_health_report, render_session_health_report
-from agent.writeback_classifier import classify_writeback_candidate, writeback_wrapper
+from agent.writeback_classifier import (
+    classify_writeback_candidate,
+    verify_writeback_retrieval_after_embed,
+    writeback_wrapper,
+)
 from tests.agent.test_runtime_state import _agent
 from agent.runtime_state import scope_from_agent
 
@@ -65,3 +69,29 @@ def test_session_health_report_surfaces_route_and_writeback_metrics(tmp_path):
     assert report["writeback_pending"] == 1
     assert "Infinite Session Health" in rendered
     assert "route_warnings: 1" in rendered
+
+
+def test_verify_writeback_retrieval_after_embed_success():
+    decision = classify_writeback_candidate(
+        [{"role": "assistant", "content": "Решили архитектурный принцип: Gbrain canonical only."}],
+        artifact_count=1,
+    )
+    wrapped = writeback_wrapper(decision)
+
+    audit = verify_writeback_retrieval_after_embed(wrapped, lambda query: [{"slug": "roadmaps/hermes"}])
+
+    assert audit["status"] == "verified"
+    assert audit["match_count"] == 1
+
+
+def test_verify_writeback_retrieval_after_embed_failure():
+    decision = classify_writeback_candidate(
+        [{"role": "assistant", "content": "Решили архитектурный принцип: Gbrain canonical only."}],
+        artifact_count=1,
+    )
+    wrapped = writeback_wrapper(decision)
+
+    audit = verify_writeback_retrieval_after_embed(wrapped, lambda query: [])
+
+    assert audit["status"] == "failed"
+    assert audit["reason"] == "not_retrievable_after_embed"

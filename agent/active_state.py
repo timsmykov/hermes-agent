@@ -2,12 +2,47 @@
 
 from __future__ import annotations
 
-import json
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from agent.session_scope import SessionScope
+
+
+_LOW_SIGNAL_USER_PREFIXES = (
+    "ok",
+    "ок",
+    "спасибо",
+    "thanks",
+    "ага",
+    "понял",
+)
+_COMPLETION_MARKERS = (
+    "готово",
+    "done",
+    "completed",
+    "завершено",
+    "implemented",
+    "исправлено",
+)
+
+
+def _looks_like_task_text(text: str) -> bool:
+    """Conservatively decide whether a user turn is an active task."""
+    normalized = " ".join((text or "").strip().split())
+    if len(normalized) < 8:
+        return False
+    lowered = normalized.lower()
+    if any(lowered == marker or lowered.startswith(marker + " ") for marker in _LOW_SIGNAL_USER_PREFIXES):
+        return False
+    return True
+
+
+def _assistant_completion_status(text: str) -> Optional[str]:
+    lowered = (text or "").lower()
+    if any(marker in lowered for marker in _COMPLETION_MARKERS):
+        return "completed"
+    return None
 
 
 @dataclass
@@ -137,7 +172,7 @@ class ActiveStateStore:
             "message_id": message_id,
             "timestamp": timestamp or time.time(),
         }
-        if not state.current_task:
+        if _looks_like_task_text(text):
             state.current_task = {
                 "text": text,
                 "status": "in_progress",
@@ -145,6 +180,29 @@ class ActiveStateStore:
                 "updated_at": timestamp or time.time(),
             }
         return self.save(state, event_type="latest_user_request")
+
+    def update_current_task_from_assistant(
+        self,
+        scope: SessionScope,
+        *,
+        text: str,
+        message_id: Optional[str] = None,
+        timestamp: Optional[float] = None,
+    ) -> ActiveSessionState:
+        """Update active task status from final assistant output only."""
+        state = self.get(scope)
+        if not state.current_task:
+            return state
+        status = _assistant_completion_status(text)
+        state.current_task = dict(state.current_task)
+        if status:
+            state.current_task["status"] = status
+            state.current_task["completed_message_id"] = message_id
+            state.current_task["completed_at"] = timestamp or time.time()
+            return self.save(state, event_type="current_task_completed")
+        state.current_task["last_assistant_message_id"] = message_id
+        state.current_task["last_assistant_at"] = timestamp or time.time()
+        return self.save(state, event_type="current_task_observed")
 
     def register_artifact(self, scope: SessionScope, artifact: Dict[str, Any]) -> ActiveSessionState:
         state = self.get(scope)
