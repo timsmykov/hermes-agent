@@ -13,9 +13,9 @@ def build_session_health_report(session_db: Any, scope: SessionScope) -> Dict[st
     store = ActiveStateStore(session_db)
     health = store.session_health(scope)
     status = "healthy"
-    if health["route_warnings"] > 0 or health["unresolved_asks"] > 0:
+    if health["route_warnings"] > 0 or health["unresolved_asks"] > 0 or health.get("writeback_pending", 0) > 0:
         status = "attention"
-    if health["route_pending"] > 3:
+    if health["route_pending"] > 3 or health.get("handoff_kind") == "context_compaction_audit_failed":
         status = "degraded"
     return {**health, "status": status}
 

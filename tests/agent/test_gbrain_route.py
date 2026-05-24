@@ -76,6 +76,22 @@ def test_route_trace_records_expected_and_actual_first_tool(tmp_path):
     assert trace["compliance"] == "matched"
 
 
+def test_route_trace_warns_on_gbrain_tool_while_lineage_route_is_deferred(tmp_path):
+    agent = _agent(tmp_path)
+    agent._session_db.create_session("s-current", "telegram")
+    agent._session_db.append_message("s-current", "user", "roadmap проекта уже обсуждался локально")
+    scope = scope_from_agent(agent)
+
+    render_active_state_context(agent, "найди roadmap проекта")
+    record_tool_route_observation(agent, "mcp_gbrain_knowledge_get_page")
+
+    state = ActiveStateStore(agent._session_db).get(scope)
+    trace = state.route_traces[0]
+    assert trace["route_status"] == "defer"
+    assert trace["compliance"] == "warn"
+    assert trace["bypass_reason"] == "gbrain_used_while_lineage_deferred"
+
+
 def test_route_trace_warns_on_bypass(tmp_path):
     agent = _agent(tmp_path)
     agent._session_db.create_session("s-current", "telegram")

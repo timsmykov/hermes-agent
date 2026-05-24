@@ -116,3 +116,27 @@ def test_current_task_ignores_low_signal_user_turn(tmp_path):
     store.update_latest_user_request(scope, text="спасибо", message_id="u1")
 
     assert store.get(scope).current_task is None
+
+
+def test_current_task_does_not_overwrite_in_progress_task_with_status_question(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    store = ActiveStateStore(db)
+    scope = SessionScope(platform="telegram", chat_id="806409559", thread_id="468587", session_id="s-a")
+
+    store.update_latest_user_request(scope, text="закрыть roadmap до конца", message_id="u1")
+    store.update_latest_user_request(scope, text="что по статусу?", message_id="u2")
+
+    state = store.get(scope)
+    assert state.current_task["text"] == "закрыть roadmap до конца"
+    assert state.latest_user_request["text"] == "что по статусу?"
+
+
+def test_current_task_not_completed_by_negated_assistant_output(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    store = ActiveStateStore(db)
+    scope = SessionScope(platform="telegram", chat_id="806409559", thread_id="468587", session_id="s-a")
+
+    store.update_latest_user_request(scope, text="доделать компонент", message_id="u1")
+    store.update_current_task_from_assistant(scope, text="Not done yet — need more tests", message_id="a1")
+
+    assert store.get(scope).current_task["status"] == "in_progress"

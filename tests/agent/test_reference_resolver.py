@@ -30,6 +30,27 @@ def test_reference_resolver_resolves_current_scope_artifact(tmp_path):
     assert result.artifact["artifact_id"] == "report-a"
 
 
+def test_reference_resolver_treats_report_hint_as_file_compatible(tmp_path):
+    store = _store(tmp_path)
+    resolver = ReferenceResolver(store)
+    scope = SessionScope(platform="telegram", chat_id="806409559", thread_id="468587", session_id="s-a")
+
+    store.register_artifact(
+        scope,
+        {
+            "artifact_id": "report-file",
+            "kind": "file",
+            "title": "otchet-infinite-session.md",
+        },
+    )
+
+    result = resolver.resolve(scope, "продолжи этот отчёт")
+
+    assert result.status == "resolved"
+    assert result.artifact is not None
+    assert result.artifact["artifact_id"] == "report-file"
+
+
 def test_reference_resolver_does_not_cross_topic_scope(tmp_path):
     store = _store(tmp_path)
     resolver = ReferenceResolver(store)

@@ -27,6 +27,12 @@ _ARTIFACT_KIND_HINTS = {
     "image": {"картин", "image", "photo", "изображ", "pic"},
     "page": {"страниц", "page", "notion", "gbrain"},
 }
+_ARTIFACT_KIND_COMPATIBILITY = {
+    "report": {"file", "page", "report"},
+    "file": {"file"},
+    "image": {"image"},
+    "page": {"page"},
+}
 
 
 @dataclass
@@ -68,6 +74,20 @@ class ReferenceResolver:
             if any(hint in lowered for hint in hints):
                 kinds.add(kind)
         return kinds
+
+    @staticmethod
+    def _hint_strings(kinds: set[str]) -> set[str]:
+        hints: set[str] = set()
+        for kind in kinds:
+            hints.update(_ARTIFACT_KIND_HINTS.get(kind, set()))
+        return hints
+
+    @staticmethod
+    def _compatible_kinds(kinds: set[str]) -> set[str]:
+        compatible: set[str] = set()
+        for kind in kinds:
+            compatible.update(_ARTIFACT_KIND_COMPATIBILITY.get(kind, {kind}))
+        return compatible
 
     def resolve(self, scope: SessionScope, text: str) -> ResolutionResult:
         if not self.has_ambiguous_reference(text):
@@ -121,11 +141,13 @@ class ReferenceResolver:
         hinted_kinds = self._hinted_kinds(text)
         candidates = artifacts
         if hinted_kinds:
+            lexical_hints = self._hint_strings(hinted_kinds)
+            compatible_kinds = self._compatible_kinds(hinted_kinds)
             candidates = [
                 artifact
                 for artifact in artifacts
-                if artifact.get("kind") in hinted_kinds
-                or any(str(artifact.get(field, "")).lower().find(hint) >= 0 for field in ("title", "local_path", "uri") for hint in hinted_kinds)
+                if artifact.get("kind") in compatible_kinds
+                or any(str(artifact.get(field, "")).lower().find(hint) >= 0 for field in ("title", "local_path", "uri") for hint in lexical_hints)
             ]
             if not candidates:
                 candidates = artifacts

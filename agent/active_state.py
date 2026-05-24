@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -17,13 +18,17 @@ _LOW_SIGNAL_USER_PREFIXES = (
     "ага",
     "понял",
 )
-_COMPLETION_MARKERS = (
-    "готово",
-    "done",
-    "completed",
-    "завершено",
-    "implemented",
-    "исправлено",
+_STATUS_QUESTION_RE = re.compile(
+    r"\b(статус|status|как дела|what'?s up|что по|как там|progress|прогресс)\b",
+    re.IGNORECASE,
+)
+_COMPLETION_RE = re.compile(
+    r"\b(done|completed|implemented)\b|\b(готово|завершено|исправлено)\b",
+    re.IGNORECASE,
+)
+_NEGATED_COMPLETION_RE = re.compile(
+    r"\b(not|isn'?t|wasn'?t|не|ещ[её] не|пока не)\s+\b(done|completed|implemented|готово|завершено|исправлено)\b",
+    re.IGNORECASE,
 )
 
 
@@ -35,12 +40,16 @@ def _looks_like_task_text(text: str) -> bool:
     lowered = normalized.lower()
     if any(lowered == marker or lowered.startswith(marker + " ") for marker in _LOW_SIGNAL_USER_PREFIXES):
         return False
+    if _STATUS_QUESTION_RE.search(lowered) and ("?" in normalized or lowered.startswith(("что", "как", "where", "what"))):
+        return False
     return True
 
 
 def _assistant_completion_status(text: str) -> Optional[str]:
     lowered = (text or "").lower()
-    if any(marker in lowered for marker in _COMPLETION_MARKERS):
+    if _NEGATED_COMPLETION_RE.search(lowered):
+        return None
+    if _COMPLETION_RE.search(lowered):
         return "completed"
     return None
 
@@ -172,7 +181,8 @@ class ActiveStateStore:
             "message_id": message_id,
             "timestamp": timestamp or time.time(),
         }
-        if _looks_like_task_text(text):
+        current_status = (state.current_task or {}).get("status")
+        if _looks_like_task_text(text) and (not state.current_task or current_status == "completed"):
             state.current_task = {
                 "text": text,
                 "status": "in_progress",
@@ -294,7 +304,10 @@ class ActiveStateStore:
         latest["actual_first_tool"] = tool_name
         latest["actual_first_tool_family"] = tool_family
         expected = latest.get("expected_first_tool_family")
-        if expected is None:
+        if latest.get("route_status") == "defer" and tool_family == "gbrain":
+            latest["compliance"] = "warn"
+            latest["bypass_reason"] = "gbrain_used_while_lineage_deferred"
+        elif expected is None:
             latest["compliance"] = "not_applicable"
             latest["bypass_reason"] = "no_expected_first_tool"
         elif expected == tool_family:

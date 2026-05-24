@@ -71,6 +71,20 @@ def test_session_health_report_surfaces_route_and_writeback_metrics(tmp_path):
     assert "route_warnings: 1" in rendered
 
 
+def test_session_health_degraded_on_compaction_audit_failure(tmp_path):
+    agent = _agent(tmp_path)
+    scope = scope_from_agent(agent)
+    store = ActiveStateStore(agent._session_db)
+    state = store.get(scope)
+    state.handoff = {"kind": "context_compaction_audit_failed"}
+    store.save(state, event_type="handoff_failed")
+
+    report = build_session_health_report(agent._session_db, scope)
+
+    assert report["status"] == "degraded"
+    assert report["handoff_kind"] == "context_compaction_audit_failed"
+
+
 def test_verify_writeback_retrieval_after_embed_success():
     decision = classify_writeback_candidate(
         [{"role": "assistant", "content": "Решили архитектурный принцип: Gbrain canonical only."}],
