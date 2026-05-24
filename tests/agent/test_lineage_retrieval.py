@@ -22,6 +22,20 @@ def test_retrieve_lineage_searches_current_compression_chain(tmp_path):
     assert "artifact registry" in rendered.lower()
 
 
+def test_retrieve_lineage_projects_root_session_to_latest_tip(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("s-root", "telegram")
+    db.append_message("s-root", "user", "Root topic started before compaction")
+    db.create_session("s-child", "telegram", parent_session_id="s-root")
+    db.append_message("s-child", "assistant", "Latest tip contains route metrics and writeback classifier")
+
+    scope = SessionScope(platform="telegram", chat_id="806409559", thread_id="468587", session_id="s-root")
+    evidence = retrieve_lineage(db, scope, "writeback classifier", limit=3)
+
+    assert evidence
+    assert any("writeback classifier" in item.content for item in evidence)
+
+
 def test_retrieve_lineage_does_not_cross_unrelated_session(tmp_path):
     db = SessionDB(tmp_path / "state.db")
     db.create_session("s-current", "telegram")

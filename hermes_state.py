@@ -2098,15 +2098,17 @@ class SessionDB:
         if not session_id:
             return [session_id]
 
-        chain = []
+        ancestor_chain = []
         current = session_id
         seen = set()
         with self._lock:
+            if self._conn is None:
+                return [session_id]
             for _ in range(100):
                 if not current or current in seen:
                     break
                 seen.add(current)
-                chain.append(current)
+                ancestor_chain.append(current)
                 row = self._conn.execute(
                     "SELECT parent_session_id FROM sessions WHERE id = ?",
                     (current,),
@@ -2114,7 +2116,32 @@ class SessionDB:
                 if row is None:
                     break
                 current = row["parent_session_id"] if hasattr(row, "keys") else row[0]
-        return list(reversed(chain)) or [session_id]
+
+            root_to_current = list(reversed(ancestor_chain)) or [session_id]
+            root = root_to_current[0]
+            projected_chain = [root]
+            current = root
+            seen = {root}
+            for _ in range(100):
+                row = self._conn.execute(
+                    """
+                    SELECT id FROM sessions
+                    WHERE parent_session_id = ?
+                    ORDER BY started_at DESC
+                    LIMIT 1
+                    """,
+                    (current,),
+                ).fetchone()
+                if row is None:
+                    break
+                child = row["id"] if hasattr(row, "keys") else row[0]
+                if not child or child in seen:
+                    break
+                projected_chain.append(child)
+                seen.add(child)
+                current = child
+
+        return projected_chain or root_to_current
 
     @staticmethod
     def _is_duplicate_replayed_user_message(messages: List[Dict[str, Any]], msg: Dict[str, Any]) -> bool:

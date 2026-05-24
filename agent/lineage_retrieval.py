@@ -94,7 +94,8 @@ def retrieve_lineage(
     if not lineage_ids:
         return []
     try:
-        messages = session_db.get_messages_as_conversation(scope.session_id, include_ancestors=True)
+        tip_session_id = lineage_ids[-1]
+        messages = session_db.get_messages_as_conversation(tip_session_id, include_ancestors=True)
     except Exception:
         return []
     terms = _terms(query)
