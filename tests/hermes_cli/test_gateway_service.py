@@ -214,6 +214,7 @@ class TestSystemdServiceRefresh:
         monkeypatch.setattr(gateway_cli, "get_systemd_unit_path", lambda system=False: unit_path)
         monkeypatch.setattr(gateway_cli, "generate_systemd_unit", lambda system=False, run_as_user=None: "new unit\n")
         monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: True)
+        monkeypatch.setattr(gateway_cli, "_systemd_refresh_scopes_for_running_gateway", lambda: [False])
 
         calls = []
 
@@ -233,6 +234,50 @@ class TestSystemdServiceRefresh:
 
         assert unit_path.read_text(encoding="utf-8") == "new unit\n"
         assert ["systemctl", "--user", "daemon-reload"] in calls
+
+    def test_run_gateway_refreshes_root_system_unit_on_boot(self, tmp_path, monkeypatch):
+        """Root system services must refresh the system unit, not only the user unit.
+
+        Intentional self-restarts exit with code 75 and are respawned directly
+        by systemd, bypassing `hermes gateway restart`. If boot-time refresh
+        only checks the user scope, a stale root-owned system unit can keep old
+        restart backoff settings forever.
+        """
+        user_unit = tmp_path / "user-hermes-gateway.service"
+        system_unit = tmp_path / "system-hermes-gateway.service"
+        user_unit.write_text("old user unit\n", encoding="utf-8")
+        system_unit.write_text("old system unit\n", encoding="utf-8")
+
+        def fake_unit_path(system=False):
+            return system_unit if system else user_unit
+
+        def fake_generate(system=False, run_as_user=None):
+            return "new system unit\n" if system else "new user unit\n"
+
+        monkeypatch.setattr(gateway_cli, "get_systemd_unit_path", fake_unit_path)
+        monkeypatch.setattr(gateway_cli, "generate_systemd_unit", fake_generate)
+        monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: True)
+        monkeypatch.setattr(gateway_cli.os, "geteuid", lambda: 0, raising=False)
+
+        calls = []
+
+        def fake_run(cmd, check=True, **kwargs):
+            calls.append(cmd)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        async def fake_start_gateway(**kwargs):
+            return True
+
+        monkeypatch.setattr("gateway.run.start_gateway", fake_start_gateway)
+
+        gateway_cli.run_gateway()
+
+        assert user_unit.read_text(encoding="utf-8") == "new user unit\n"
+        assert system_unit.read_text(encoding="utf-8") == "new system unit\n"
+        assert ["systemctl", "--user", "daemon-reload"] in calls
+        assert ["systemctl", "daemon-reload"] in calls
 
     def test_refresh_refuses_to_bake_pytest_tmpdir_into_real_user_unit(
         self, tmp_path, monkeypatch
@@ -381,6 +426,11 @@ class TestGeneratedSystemdUnits:
             gateway_cli,
             "_get_restart_drain_timeout",
             lambda: DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_system_service_identity",
+            lambda run_as_user=None: ("alice", "alice", "/home/alice"),
         )
         unit = gateway_cli.generate_systemd_unit(system=True)
 
@@ -1310,6 +1360,11 @@ class TestGeneratedUnitIncludesLocalBin:
             gateway_cli,
             "_build_user_local_paths",
             lambda home_path, existing: [str(home_path / ".local" / "bin")],
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_system_service_identity",
+            lambda run_as_user=None: ("alice", "alice", "/home/alice"),
         )
         unit = gateway_cli.generate_systemd_unit(system=True)
         # System unit uses the resolved home dir from _system_service_identity

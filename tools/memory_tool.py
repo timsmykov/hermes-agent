@@ -27,6 +27,8 @@ import json
 import logging
 import os
 import re
+import shutil
+import subprocess
 import tempfile
 import time
 from contextlib import contextmanager
@@ -598,6 +600,135 @@ class MemoryStore:
                 raise
         except (OSError, IOError) as e:
             raise RuntimeError(f"Failed to write memory file {path}: {e}")
+
+
+class GbrainMemoryStore(MemoryStore):
+    """Gbrain-backed replacement for the local MEMORY.md / USER.md store.
+
+    The public interface mirrors :class:`MemoryStore`, so the existing
+    ``memory`` tool and system-prompt injection path continue to work while
+    Gbrain becomes the canonical backing store. Writes use the local Gbrain CLI
+    instead of broad MCP mutation tools, then refresh embeddings on the touched
+    page.
+    """
+
+    _SLUGS = {"memory": "memories/memory", "user": "memories/user"}
+    _TITLES = {"memory": "MEMORY", "user": "USER"}
+
+    def __init__(
+        self,
+        memory_char_limit: int = 12000,
+        user_char_limit: int = 8000,
+        gbrain_cli: Optional[str] = None,
+    ):
+        super().__init__(memory_char_limit=memory_char_limit, user_char_limit=user_char_limit)
+        self.gbrain_cli = self._resolve_gbrain_cli(gbrain_cli)
+
+    @staticmethod
+    def _resolve_gbrain_cli(configured: Optional[str] = None) -> str:
+        candidates = [
+            configured,
+            os.getenv("GBRAIN_CLI"),
+            "/opt/gbrain/app/node_modules/.bin/gbrain",
+            "/usr/local/bin/gbrain",
+            shutil.which("gbrain"),
+        ]
+        for candidate in candidates:
+            if candidate and Path(candidate).exists():
+                return str(candidate)
+        return "gbrain"
+
+    @staticmethod
+    def _strip_frontmatter(markdown: str) -> str:
+        text = markdown.lstrip("\ufeff")
+        if not text.startswith("---"):
+            return markdown.strip()
+        lines = text.splitlines()
+        for idx in range(1, len(lines)):
+            if lines[idx].strip() == "---":
+                return "\n".join(lines[idx + 1:]).strip()
+        return markdown.strip()
+
+    def _run_gbrain(
+        self,
+        args: List[str],
+        *,
+        input_text: Optional[str] = None,
+        timeout: int = 60,
+    ) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [self.gbrain_cli, *args],
+            input=input_text,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+
+    def _slug_for(self, target: str) -> str:
+        return self._SLUGS["user" if target == "user" else "memory"]
+
+    def _entries_from_gbrain(self, target: str) -> List[str]:
+        proc = self._run_gbrain(["get", self._slug_for(target)], timeout=60)
+        if proc.returncode != 0:
+            logger.warning(
+                "Gbrain memory read failed for %s: %s",
+                self._slug_for(target),
+                (proc.stderr or proc.stdout or "").strip()[:500],
+            )
+            return []
+        body = self._strip_frontmatter(proc.stdout)
+        if not body.strip():
+            return []
+        entries = [e.strip() for e in body.split(ENTRY_DELIMITER)]
+        return [e for e in entries if e]
+
+    def load_from_disk(self):
+        """Load entries from Gbrain, capture system prompt snapshot."""
+        self.memory_entries = list(dict.fromkeys(self._entries_from_gbrain("memory")))
+        self.user_entries = list(dict.fromkeys(self._entries_from_gbrain("user")))
+        self._system_prompt_snapshot = {
+            "memory": self._render_block("memory", self.memory_entries),
+            "user": self._render_block("user", self.user_entries),
+        }
+
+    @staticmethod
+    def _path_for(target: str) -> Path:
+        """Profile-scoped lock path used only for local write serialization."""
+        mem_dir = get_memory_dir()
+        return mem_dir / ("GBRAIN_USER.lock" if target == "user" else "GBRAIN_MEMORY.lock")
+
+    def _reload_target(self, target: str):
+        fresh = list(dict.fromkeys(self._entries_from_gbrain(target)))
+        self._set_entries(target, fresh)
+
+    def save_to_disk(self, target: str):
+        """Persist entries to the canonical Gbrain memory page."""
+        target = "user" if target == "user" else "memory"
+        slug = self._slug_for(target)
+        title = self._TITLES[target]
+        content = ENTRY_DELIMITER.join(self._entries_for(target)) if self._entries_for(target) else ""
+        markdown = (
+            "---\n"
+            "type: note\n"
+            f"title: {title}\n"
+            "source: hermes-gbrain-memory-store\n"
+            "---\n\n"
+            f"{content}\n"
+        )
+        proc = self._run_gbrain(["put", slug, "--content", markdown], timeout=90)
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"Failed to write Gbrain memory page {slug}: "
+                f"{(proc.stderr or proc.stdout or '').strip()[:800]}"
+            )
+        embed = self._run_gbrain(["embed", slug], timeout=90)
+        if embed.returncode != 0:
+            logger.warning(
+                "Gbrain memory embed refresh failed for %s: %s",
+                slug,
+                (embed.stderr or embed.stdout or "").strip()[:500],
+            )
 
 
 def memory_tool(

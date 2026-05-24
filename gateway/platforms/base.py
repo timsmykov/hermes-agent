@@ -1556,6 +1556,7 @@ class BasePlatformAdapter(ABC):
         self._post_delivery_callbacks: Dict[str, Any] = {}
         self._expected_cancelled_tasks: set[asyncio.Task] = set()
         self._busy_session_handler: Optional[Callable[[MessageEvent, str], Awaitable[bool]]] = None
+        self._active_state_store: Any = None
         # Auto-TTS on voice input: ``_auto_tts_default`` is the global default
         # (``voice.auto_tts`` in config.yaml, pushed by GatewayRunner on connect).
         # Per-chat overrides live in two sets populated from ``_voice_mode``:
@@ -3295,6 +3296,33 @@ class BasePlatformAdapter(ABC):
 
         await self._drain_pending_after_session_command(session_key, command_guard)
 
+    def _record_active_user_request(self, event: MessageEvent, session_key: str) -> None:
+        """Best-effort materialization of the latest user turn for this scope."""
+        if not getattr(event, "text", None):
+            return
+        try:
+            if self._active_state_store is None:
+                from agent.active_state import ActiveStateStore
+                from hermes_state import SessionDB
+
+                self._active_state_store = ActiveStateStore(SessionDB())
+            from agent.session_scope import SessionScope
+
+            scope = SessionScope.from_session_source(event.source, session_id=session_key)
+            self._active_state_store.update_latest_user_request(
+                scope,
+                text=event.text,
+                message_id=getattr(event, "message_id", None),
+            )
+        except Exception as exc:
+            logger.debug(
+                "[%s] Active session state update failed for %s: %s",
+                self.name,
+                session_key,
+                exc,
+                exc_info=True,
+            )
+
     async def handle_message(self, event: MessageEvent) -> None:
         """
         Process an incoming message.
@@ -3313,6 +3341,7 @@ class BasePlatformAdapter(ABC):
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
         )
+        self._record_active_user_request(event, session_key)
 
         # On-entry self-heal: if the adapter still has an _active_sessions
         # entry for this key but the owner task has already exited (done or

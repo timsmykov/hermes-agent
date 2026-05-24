@@ -1,10 +1,12 @@
 """Tests for tools/memory_tool.py — MemoryStore, security scanning, and tool dispatcher."""
 
 import json
+import subprocess
 import pytest
 from pathlib import Path
 
 from tools.memory_tool import (
+    GbrainMemoryStore,
     MemoryStore,
     memory_tool,
     _scan_memory_content,
@@ -393,6 +395,52 @@ class TestMemoryStoreSnapshot:
 
     def test_empty_snapshot_returns_none(self, store):
         assert store.format_for_system_prompt("memory") is None
+
+
+class TestGbrainMemoryStore:
+    def test_load_reads_canonical_gbrain_pages(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+
+        def fake_run(args, **kwargs):
+            slug = args[2]
+            body = {
+                "memories/memory": "---\ntitle: MEMORY\n---\n\nserver fact\n§\nserver fact\n§\noperator fact",
+                "memories/user": "---\ntitle: USER\n---\n\nTim prefers Russian",
+            }[slug]
+            return subprocess.CompletedProcess(args, 0, stdout=body, stderr="")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        store = GbrainMemoryStore(gbrain_cli="/tmp/gbrain")
+        store.load_from_disk()
+
+        assert store.memory_entries == ["server fact", "operator fact"]
+        assert store.user_entries == ["Tim prefers Russian"]
+        user_prompt = store.format_for_system_prompt("user")
+        assert user_prompt is not None
+        assert "USER PROFILE" in user_prompt
+
+    def test_save_writes_with_put_content_and_embeds(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+        calls = []
+
+        def fake_run(args, **kwargs):
+            calls.append((args, kwargs.get("input")))
+            if args[1:3] == ["get", "memories/memory"]:
+                return subprocess.CompletedProcess(args, 0, stdout="existing", stderr="")
+            if args[1:3] == ["get", "memories/user"]:
+                return subprocess.CompletedProcess(args, 0, stdout="Tim", stderr="")
+            return subprocess.CompletedProcess(args, 0, stdout="ok", stderr="")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        store = GbrainMemoryStore(gbrain_cli="/tmp/gbrain")
+        store.load_from_disk()
+        result = store.add("memory", "new fact")
+
+        assert result["success"] is True
+        put_call = next(args for args, _ in calls if args[1:3] == ["put", "memories/memory"])
+        assert "--content" in put_call
+        assert "existing\n§\nnew fact" in put_call[put_call.index("--content") + 1]
+        assert any(args[1:3] == ["embed", "memories/memory"] for args, _ in calls)
 
 
 # =========================================================================

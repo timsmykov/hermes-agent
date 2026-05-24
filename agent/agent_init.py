@@ -1120,11 +1120,20 @@ def init_agent(
             agent._user_profile_enabled = mem_config.get("user_profile_enabled", False)
             agent._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
             if agent._memory_enabled or agent._user_profile_enabled:
-                from tools.memory_tool import MemoryStore
-                agent._memory_store = MemoryStore(
-                    memory_char_limit=mem_config.get("memory_char_limit", 2200),
-                    user_char_limit=mem_config.get("user_char_limit", 1375),
-                )
+                _mem_provider_name = (mem_config.get("provider", "") or "").strip().lower()
+                if _mem_provider_name == "gbrain":
+                    from tools.memory_tool import GbrainMemoryStore
+                    agent._memory_store = GbrainMemoryStore(
+                        memory_char_limit=mem_config.get("memory_char_limit", 12000),
+                        user_char_limit=mem_config.get("user_char_limit", 8000),
+                        gbrain_cli=mem_config.get("gbrain_cli"),
+                    )
+                else:
+                    from tools.memory_tool import MemoryStore
+                    agent._memory_store = MemoryStore(
+                        memory_char_limit=mem_config.get("memory_char_limit", 2200),
+                        user_char_limit=mem_config.get("user_char_limit", 1375),
+                    )
                 agent._memory_store.load_from_disk()
         except Exception:
             pass  # Memory is optional -- don't break agent init
@@ -1138,7 +1147,7 @@ def init_agent(
         try:
             _mem_provider_name = mem_config.get("provider", "") if mem_config else ""
 
-            if _mem_provider_name and _mem_provider_name.strip():
+            if _mem_provider_name and _mem_provider_name.strip() and _mem_provider_name.strip().lower() != "gbrain":
                 from agent.memory_manager import MemoryManager as _MemoryManager
                 from plugins.memory import load_memory_provider as _load_mem
                 agent._memory_manager = _MemoryManager()

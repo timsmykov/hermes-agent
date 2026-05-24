@@ -246,10 +246,29 @@ CREATE TABLE IF NOT EXISTS state_meta (
     value TEXT
 );
 
+CREATE TABLE IF NOT EXISTS session_active_state (
+    scope_key TEXT PRIMARY KEY,
+    session_id TEXT,
+    lineage_id TEXT,
+    state_json TEXT NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS session_state_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    scope_key TEXT NOT NULL,
+    session_id TEXT,
+    lineage_id TEXT,
+    event_type TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
+CREATE INDEX IF NOT EXISTS idx_session_state_events_scope ON session_state_events(scope_key, created_at DESC);
 """
 
 FTS_SQL = """
@@ -461,6 +480,89 @@ class SessionDB:
                     pass
                 self._conn.close()
                 self._conn = None
+
+    def get_active_session_state(self, scope_key: str) -> Optional[Dict[str, Any]]:
+        """Return materialized active state for one isolated session scope."""
+        if self._conn is None:
+            return None
+        row = self._conn.execute(
+            "SELECT state_json FROM session_active_state WHERE scope_key = ?",
+            (scope_key,),
+        ).fetchone()
+        if not row:
+            return None
+        try:
+            return json.loads(row["state_json"] or "{}")
+        except json.JSONDecodeError:
+            logger.warning("Invalid active session state JSON for scope %s", scope_key)
+            return None
+
+    def set_active_session_state(
+        self,
+        scope_key: str,
+        state: Dict[str, Any],
+        *,
+        session_id: Optional[str] = None,
+        lineage_id: Optional[str] = None,
+        event_type: str = "save",
+    ) -> None:
+        """Persist materialized active state and append an audit event."""
+        now = time.time()
+        payload = json.dumps(state, ensure_ascii=False, sort_keys=True)
+
+        def _write(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                """
+                INSERT INTO session_active_state(scope_key, session_id, lineage_id, state_json, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(scope_key) DO UPDATE SET
+                    session_id = excluded.session_id,
+                    lineage_id = excluded.lineage_id,
+                    state_json = excluded.state_json,
+                    updated_at = excluded.updated_at
+                """,
+                (scope_key, session_id, lineage_id, payload, now),
+            )
+            conn.execute(
+                """
+                INSERT INTO session_state_events(scope_key, session_id, lineage_id, event_type, payload_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (scope_key, session_id, lineage_id, event_type, payload, now),
+            )
+
+        self._execute_write(_write)
+
+    def list_active_session_events(self, scope_key: str, limit: int = 50) -> List[Dict[str, Any]]:
+        """Return recent active-state events for debugging and evals."""
+        if self._conn is None:
+            return []
+        rows = self._conn.execute(
+            """
+            SELECT id, scope_key, session_id, lineage_id, event_type, payload_json, created_at
+            FROM session_state_events
+            WHERE scope_key = ?
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (scope_key, int(limit)),
+        ).fetchall()
+        events: List[Dict[str, Any]] = []
+        for row in rows:
+            try:
+                payload = json.loads(row["payload_json"] or "{}")
+            except json.JSONDecodeError:
+                payload = {}
+            events.append({
+                "id": row["id"],
+                "scope_key": row["scope_key"],
+                "session_id": row["session_id"],
+                "lineage_id": row["lineage_id"],
+                "event_type": row["event_type"],
+                "payload": payload,
+                "created_at": row["created_at"],
+            })
+        return events
 
     @staticmethod
     def _parse_schema_columns(schema_sql: str) -> Dict[str, Dict[str, str]]:

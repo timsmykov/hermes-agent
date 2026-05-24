@@ -151,6 +151,12 @@ def _get_available_providers() -> list:
 
     results = []
     for name, desc, available in raw:
+        # Tim's orchestrator retired external mem0 in favor of Gbrain-backed
+        # canonical memory. Keep the upstream plugin source in the checkout, but
+        # hide it from local setup/status so it is not presented as an installed
+        # server memory option.
+        if name == "mem0":
+            continue
         try:
             provider = load_memory_provider(name)
             if not provider:
@@ -399,40 +405,47 @@ def cmd_status(args) -> None:
     print(f"  Provider:  {provider_name or '(none — built-in only)'}")
 
     if provider_name:
-        provider_config = mem_config.get(provider_name, {})
-        if provider_config:
-            print(f"\n  {provider_name} config:")
-            for key, val in provider_config.items():
-                print(f"    {key}: {val}")
-
-        providers = _get_available_providers()
-        found = any(name == provider_name for name, _, _ in providers)
-        if found:
-            print(f"\n  Plugin:    installed ✓")
-            for pname, _, p in providers:
-                if pname == provider_name:
-                    if p.is_available():
-                        print(f"  Status:    available ✓")
-                    else:
-                        print(f"  Status:    not available ✗")
-                        schema = p.get_config_schema() if hasattr(p, "get_config_schema") else []
-                        # Check all fields that have env_var (both secret and non-secret)
-                        required_fields = [f for f in schema if f.get("env_var")]
-                        if required_fields:
-                            print(f"  Missing:")
-                            for f in required_fields:
-                                env_var = f.get("env_var", "")
-                                url = f.get("url", "")
-                                is_set = bool(os.environ.get(env_var))
-                                mark = "✓" if is_set else "✗"
-                                line = f"    {mark} {env_var}"
-                                if url and not is_set:
-                                    line += f"  → {url}"
-                                print(line)
-                    break
+        if provider_name == "gbrain":
+            print("\n  Backend:   Gbrain canonical memory pages ✓")
+            print("  Pages:     memories/user, memories/memory")
+            cli_path = mem_config.get("gbrain_cli")
+            if cli_path:
+                print(f"  CLI:       {cli_path}")
         else:
-            print(f"\n  Plugin:    NOT installed ✗")
-            print(f"  Install the '{provider_name}' memory plugin to ~/.hermes/plugins/")
+            provider_config = mem_config.get(provider_name, {})
+            if provider_config:
+                print(f"\n  {provider_name} config:")
+                for key, val in provider_config.items():
+                    print(f"    {key}: {val}")
+
+            providers = _get_available_providers()
+            found = any(name == provider_name for name, _, _ in providers)
+            if found:
+                print(f"\n  Plugin:    installed ✓")
+                for pname, _, p in providers:
+                    if pname == provider_name:
+                        if p.is_available():
+                            print(f"  Status:    available ✓")
+                        else:
+                            print(f"  Status:    not available ✗")
+                            schema = p.get_config_schema() if hasattr(p, "get_config_schema") else []
+                            # Check all fields that have env_var (both secret and non-secret)
+                            required_fields = [f for f in schema if f.get("env_var")]
+                            if required_fields:
+                                print(f"  Missing:")
+                                for f in required_fields:
+                                    env_var = f.get("env_var", "")
+                                    url = f.get("url", "")
+                                    is_set = bool(os.environ.get(env_var))
+                                    mark = "✓" if is_set else "✗"
+                                    line = f"    {mark} {env_var}"
+                                    if url and not is_set:
+                                        line += f"  → {url}"
+                                    print(line)
+                        break
+            else:
+                print(f"\n  Plugin:    NOT installed ✗")
+                print(f"  Install the '{provider_name}' memory plugin to ~/.hermes/plugins/")
 
     providers = _get_available_providers()
     if providers:

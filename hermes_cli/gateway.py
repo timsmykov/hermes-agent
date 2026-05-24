@@ -3159,6 +3159,27 @@ def _guard_official_docker_root_gateway() -> None:
     sys.exit(1)
 
 
+def _systemd_refresh_scopes_for_running_gateway() -> list[bool]:
+    """Return systemd scopes whose installed gateway unit may need refresh.
+
+    `run_gateway()` is executed both under user units and root-owned system
+    units.  A service respawn via exit-code-75 bypasses `hermes gateway
+    restart`, so boot-time refresh is the only chance to pick up updated
+    restart settings.  Refresh the user scope by default (legacy behaviour),
+    and also refresh the system scope when the process is root and a system
+    unit exists.
+    """
+    scopes = [False]
+    try:
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            system_unit = get_systemd_unit_path(system=True)
+            if system_unit.exists():
+                scopes.append(True)
+    except Exception:
+        pass
+    return scopes
+
+
 def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False):
     """Run the gateway in foreground.
     
@@ -3220,10 +3241,11 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False):
     # `hermes gateway start/restart` — leaving the gateway vulnerable to
     # the exact failure mode the new settings were meant to prevent.
     if supports_systemd_services():
-        try:
-            refresh_systemd_unit_if_needed(system=False)
-        except Exception:
-            pass  # best-effort; don't block gateway startup
+        for _system_scope in _systemd_refresh_scopes_for_running_gateway():
+            try:
+                refresh_systemd_unit_if_needed(system=_system_scope)
+            except Exception:
+                pass  # best-effort; don't block gateway startup
     
     from gateway.run import start_gateway
     

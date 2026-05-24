@@ -12,6 +12,18 @@ from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageTyp
 from gateway.session import SessionSource, build_session_key
 
 
+class FakeActiveStateStore:
+    def __init__(self):
+        self.requests = []
+
+    def update_latest_user_request(self, scope, *, text, message_id=None, timestamp=None):
+        self.requests.append({
+            "scope_key": scope.scope_key,
+            "text": text,
+            "message_id": message_id,
+        })
+
+
 class DummyTelegramAdapter(BasePlatformAdapter):
     def __init__(self):
         super().__init__(PlatformConfig(enabled=True, token="fake-token"), Platform.TELEGRAM)
@@ -65,6 +77,38 @@ def _make_event(chat_id: str, thread_id: str, message_id: str = "1") -> MessageE
 
 
 class TestBasePlatformTopicSessions:
+    @pytest.mark.asyncio
+    async def test_handle_message_records_latest_user_request_by_topic(self, monkeypatch):
+        adapter = DummyTelegramAdapter()
+        adapter.set_message_handler(lambda event: asyncio.sleep(0, result=None))
+        fake_store = FakeActiveStateStore()
+        adapter._active_state_store = fake_store
+
+        scheduled = []
+
+        def fake_create_task(coro):
+            scheduled.append(coro)
+            coro.close()
+            return SimpleNamespace()
+
+        monkeypatch.setattr(asyncio, "create_task", fake_create_task)
+
+        await adapter.handle_message(_make_event("806409559", "468587", message_id="m-1"))
+        await adapter.handle_message(_make_event("806409559", "465413", message_id="m-2"))
+
+        assert fake_store.requests == [
+            {
+                "scope_key": "telegram:806409559:thread:468587",
+                "text": "hello",
+                "message_id": "m-1",
+            },
+            {
+                "scope_key": "telegram:806409559:thread:465413",
+                "text": "hello",
+                "message_id": "m-2",
+            },
+        ]
+
     @pytest.mark.asyncio
     async def test_handle_message_does_not_interrupt_different_topic(self, monkeypatch):
         adapter = DummyTelegramAdapter()
