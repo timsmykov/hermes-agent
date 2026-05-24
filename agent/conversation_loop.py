@@ -839,7 +839,12 @@ def run_conversation(
                     _injections.append(_plugin_user_context)
                 try:
                     from agent.runtime_state import render_active_state_context
-                    _active_state_context = render_active_state_context(agent, user_message)
+                    _active_turn_id = f"{agent.session_id or '-'}:{current_turn_user_idx}"
+                    try:
+                        setattr(agent, "_current_turn_id", _active_turn_id)
+                    except Exception:
+                        pass
+                    _active_state_context = render_active_state_context(agent, user_message, turn_id=_active_turn_id)
                     if _active_state_context:
                         _injections.append(_active_state_context)
                 except Exception as _active_state_err:
@@ -4185,9 +4190,15 @@ def run_conversation(
 
             _active_store = active_state_store_for_agent(agent)
             if _active_store is not None:
+                _active_scope = scope_from_agent(agent)
                 _active_store.update_current_task_from_assistant(
-                    scope_from_agent(agent),
+                    _active_scope,
                     text=final_response,
+                )
+                _active_store.close_route_trace_without_tool(
+                    _active_scope,
+                    turn_id=getattr(agent, "_current_turn_id", None),
+                    reason="assistant_final_response_without_tool",
                 )
         except Exception as exc:
             logger.debug("active-state current_task final-output update failed: %s", exc)

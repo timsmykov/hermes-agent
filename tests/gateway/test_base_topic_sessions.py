@@ -7,6 +7,8 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from agent.runtime_state import scope_from_agent
+from agent.session_scope import SessionScope
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, ProcessingOutcome, SendResult
 from gateway.session import SessionSource, build_session_key
@@ -77,6 +79,35 @@ def _make_event(chat_id: str, thread_id: str, message_id: str = "1") -> MessageE
 
 
 class TestBasePlatformTopicSessions:
+    def test_gateway_event_scope_matches_runtime_agent_scope_for_topic(self):
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="806409559",
+            chat_type="dm",
+            thread_id="468587",
+        )
+        session_id = "agent:main:telegram:dm:806409559:468587"
+        event_scope = SessionScope.from_session_source(source, session_id=session_id, profile="orchestrator")
+        agent = SimpleNamespace(
+            platform="telegram",
+            session_id=session_id,
+            _gateway_session_key=session_id,
+            _chat_id="806409559",
+            _thread_id="468587",
+            _profile_name="orchestrator",
+        )
+        runtime_scope = scope_from_agent(agent)
+
+        assert event_scope.scope_key == runtime_scope.scope_key
+        assert event_scope.scope_key == "telegram:806409559:thread:468587"
+
+    def test_gateway_event_scope_separates_different_topics(self):
+        session_id = "agent:main:telegram:dm:806409559"
+        scope_a = SessionScope.from_session_source(_make_event("806409559", "468587").source, session_id=session_id)
+        scope_b = SessionScope.from_session_source(_make_event("806409559", "465413").source, session_id=session_id)
+
+        assert scope_a.scope_key != scope_b.scope_key
+
     @pytest.mark.asyncio
     async def test_handle_message_records_latest_user_request_by_topic(self, monkeypatch):
         adapter = DummyTelegramAdapter()

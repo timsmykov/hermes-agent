@@ -30,12 +30,19 @@ def active_state_store_for_agent(agent: Any) -> Optional[ActiveStateStore]:
     return ActiveStateStore(db)
 
 
-def render_active_state_context(agent: Any, user_message: str) -> str:
+def render_active_state_context(agent: Any, user_message: str, *, turn_id: Optional[str] = None) -> str:
     """Render API-call-time active state and reference resolution context."""
     store = active_state_store_for_agent(agent)
     if store is None:
         return ""
     scope = scope_from_agent(agent)
+    if turn_id is None:
+        turn_id = getattr(agent, "_current_turn_id", None)
+    if turn_id is not None:
+        try:
+            setattr(agent, "_current_turn_id", str(turn_id))
+        except Exception:
+            pass
     state = store.get(scope)
     blocks = []
     rendered = state.render_for_prompt()
@@ -71,7 +78,7 @@ def render_active_state_context(agent: Any, user_message: str) -> str:
                 rendered_hint = render_gbrain_route_hint(hint)
                 if rendered_hint:
                     blocks.append(rendered_hint)
-                    store.record_route_trace(scope, route_trace_from_hint(hint))
+                    store.record_route_trace(scope, route_trace_from_hint(hint), turn_id=turn_id)
             except Exception:
                 pass
         elif resolution.status == "not_applicable":
@@ -97,7 +104,7 @@ def render_active_state_context(agent: Any, user_message: str) -> str:
                 rendered_hint = render_gbrain_route_hint(hint)
                 if rendered_hint:
                     blocks.append(rendered_hint)
-                    store.record_route_trace(scope, route_trace_from_hint(hint))
+                    store.record_route_trace(scope, route_trace_from_hint(hint), turn_id=turn_id)
             except Exception:
                 pass
     except Exception:
@@ -187,7 +194,8 @@ def record_tool_route_observation(agent: Any, tool_name: str) -> None:
     try:
         from agent.gbrain_route import tool_family
 
-        store.record_first_tool(scope_from_agent(agent), tool_name=tool_name, tool_family=tool_family(tool_name))
+        turn_id = getattr(agent, "_current_turn_id", None)
+        store.record_first_tool(scope_from_agent(agent), tool_name=tool_name, tool_family=tool_family(tool_name), turn_id=turn_id)
     except Exception:
         return
 

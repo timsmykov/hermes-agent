@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from agent.session_scope import SessionScope
 
@@ -54,6 +54,56 @@ def _assistant_completion_status(text: str) -> Optional[str]:
     return None
 
 
+_ADDITIVE_LIST_FIELDS = (
+    "active_artifacts",
+    "unresolved_asks",
+    "constraints",
+    "running_processes",
+    "files_touched",
+    "route_traces",
+    "writeback_decisions",
+    "mutation_audit",
+)
+
+
+def _item_dedupe_key(item: Dict[str, Any], *, field_name: str) -> str:
+    """Return a stable merge key for additive active-state list entries."""
+    for key in ("artifact_id", "trace_id", "decision_id", "ask_id", "process_id", "path", "local_path"):
+        if item.get(key) is not None:
+            return f"{field_name}:{key}:{item.get(key)}"
+    if item.get("turn_id") is not None and item.get("created_at") is not None:
+        return f"{field_name}:turn:{item.get('turn_id')}:{item.get('created_at')}"
+    return f"{field_name}:repr:{repr(sorted(item.items()))}"
+
+
+def _merge_list_field(field_name: str, newer_items: Iterable[Dict[str, Any]], older_items: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Merge additive lists while preserving newest-first ordering."""
+    merged: List[Dict[str, Any]] = []
+    seen = set()
+    for source in (newer_items, older_items):
+        for raw_item in source or []:
+            if not isinstance(raw_item, dict):
+                continue
+            item = dict(raw_item)
+            key = _item_dedupe_key(item, field_name=field_name)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(item)
+    return merged[:50]
+
+
+def _newer_mapping(candidate: Optional[Dict[str, Any]], current: Optional[Dict[str, Any]], *, timestamp_keys: tuple[str, ...]) -> Optional[Dict[str, Any]]:
+    """Pick the mapping with the newest timestamp-like field."""
+    if not candidate:
+        return dict(current) if current else None
+    if not current:
+        return dict(candidate)
+    candidate_ts = max(float(candidate.get(key) or 0) for key in timestamp_keys)
+    current_ts = max(float(current.get(key) or 0) for key in timestamp_keys)
+    return dict(candidate if candidate_ts >= current_ts else current)
+
+
 @dataclass
 class ActiveSessionState:
     """Materialized working state for one isolated session lane."""
@@ -68,6 +118,7 @@ class ActiveSessionState:
     files_touched: List[Dict[str, Any]] = field(default_factory=list)
     route_traces: List[Dict[str, Any]] = field(default_factory=list)
     writeback_decisions: List[Dict[str, Any]] = field(default_factory=list)
+    mutation_audit: List[Dict[str, Any]] = field(default_factory=list)
     handoff: Optional[Dict[str, Any]] = None
     updated_at: Optional[float] = None
     version: int = 1
@@ -90,6 +141,7 @@ class ActiveSessionState:
             files_touched=list(data.get("files_touched") or []),
             route_traces=list(data.get("route_traces") or []),
             writeback_decisions=list(data.get("writeback_decisions") or []),
+            mutation_audit=list(data.get("mutation_audit") or []),
             handoff=data.get("handoff"),
             updated_at=data.get("updated_at"),
             version=int(data.get("version") or 1),
@@ -108,6 +160,7 @@ class ActiveSessionState:
             "files_touched": self.files_touched,
             "route_traces": self.route_traces,
             "writeback_decisions": self.writeback_decisions,
+            "mutation_audit": self.mutation_audit,
             "handoff": self.handoff,
             "updated_at": self.updated_at,
         }
@@ -156,8 +209,74 @@ class ActiveStateStore:
             state.scope = scope
         return state
 
+    def _merge_for_save(self, candidate: ActiveSessionState, current: Optional[ActiveSessionState], *, event_type: str) -> ActiveSessionState:
+        """Merge stale candidate updates into the freshest persisted state.
+
+        This is optimistic locking without a schema migration: every state has a
+        materialized version counter. If a caller saves a stale object, additive
+        fields from the stale object are merged into the current persisted row
+        instead of blindly overwriting it.
+        """
+        now = time.time()
+        if current is None:
+            candidate.version = max(1, int(candidate.version or 1))
+            candidate.updated_at = now
+            candidate.mutation_audit = _merge_list_field(
+                "mutation_audit",
+                [{"kind": event_type, "version": candidate.version, "created_at": now}],
+                candidate.mutation_audit,
+            )[:20]
+            return candidate
+
+        stale_save = int(current.version or 1) >= int(candidate.version or 1)
+        current_is_strictly_newer = int(current.version or 1) > int(candidate.version or 1)
+        merged = current if current_is_strictly_newer else candidate
+        other = candidate if current_is_strictly_newer else current
+        for field_name in _ADDITIVE_LIST_FIELDS:
+            setattr(
+                merged,
+                field_name,
+                _merge_list_field(
+                    field_name,
+                    getattr(merged, field_name, []),
+                    getattr(other, field_name, []),
+                ),
+            )
+        merged.latest_user_request = _newer_mapping(
+            candidate.latest_user_request,
+            current.latest_user_request,
+            timestamp_keys=("timestamp", "updated_at", "created_at"),
+        )
+        merged.current_task = _newer_mapping(
+            candidate.current_task,
+            current.current_task,
+            timestamp_keys=("completed_at", "updated_at", "last_assistant_at", "created_at"),
+        )
+        merged.handoff = _newer_mapping(
+            candidate.handoff,
+            current.handoff,
+            timestamp_keys=("created_at", "updated_at"),
+        )
+        merged.version = max(int(current.version or 1), int(candidate.version or 1)) + 1
+        merged.updated_at = now
+        merged.mutation_audit = _merge_list_field(
+            "mutation_audit",
+            [{
+                "kind": event_type,
+                "version": merged.version,
+                "stale_save_merged": stale_save,
+                "created_at": now,
+            }],
+            merged.mutation_audit,
+        )[:20]
+        return merged
+
     def save(self, state: ActiveSessionState, *, event_type: str = "save") -> ActiveSessionState:
-        state.updated_at = time.time()
+        current_data = self.session_db.get_active_session_state(state.scope.scope_key)
+        current = ActiveSessionState.from_dict(current_data) if current_data else None
+        if current is not None:
+            current.scope = state.scope
+        state = self._merge_for_save(state, current, event_type=event_type)
         self.session_db.set_active_session_state(
             state.scope.scope_key,
             state.to_dict(),
@@ -218,11 +337,26 @@ class ActiveStateStore:
         state = self.get(scope)
         artifact = dict(artifact)
         artifact.setdefault("status", "active")
+        artifact.setdefault("lifecycle", artifact.get("status", "active"))
         artifact.setdefault("owner_scope", scope.scope_key)
         artifact.setdefault("created_at", time.time())
         artifact.setdefault("updated_at", time.time())
-        existing = [a for a in state.active_artifacts if a.get("artifact_id") != artifact.get("artifact_id")]
-        state.active_artifacts = [artifact, *existing]
+        artifact_id = artifact.get("artifact_id")
+        artifact_path = artifact.get("local_path") or artifact.get("path")
+        retained: List[Dict[str, Any]] = []
+        for existing in state.active_artifacts:
+            existing = dict(existing)
+            same_id = artifact_id is not None and existing.get("artifact_id") == artifact_id
+            same_path = artifact_path and (existing.get("local_path") or existing.get("path")) == artifact_path
+            if same_id or same_path:
+                existing["status"] = "superseded"
+                existing["lifecycle"] = "superseded"
+                existing["superseded_by"] = artifact_id
+                existing["updated_at"] = artifact["updated_at"]
+                retained.append(existing)
+            else:
+                retained.append(existing)
+        state.active_artifacts = [artifact, *retained]
         return self.save(state, event_type="artifact_registered")
 
     def mark_artifact_status(
@@ -238,6 +372,7 @@ class ActiveStateStore:
         for artifact in state.active_artifacts:
             if artifact.get("artifact_id") == artifact_id:
                 artifact["status"] = status
+                artifact["lifecycle"] = status
                 artifact["updated_at"] = now
                 if reason:
                     artifact["status_reason"] = reason
@@ -272,18 +407,28 @@ class ActiveStateStore:
         state.handoff = dict(handoff)
         return self.save(state, event_type="handoff_recorded")
 
-    def record_route_trace(self, scope: SessionScope, trace: Dict[str, Any]) -> ActiveSessionState:
+    def record_route_trace(self, scope: SessionScope, trace: Dict[str, Any], *, turn_id: Optional[str] = None) -> ActiveSessionState:
         state = self.get(scope)
         trace = dict(trace)
         trace.setdefault("created_at", time.time())
         trace.setdefault("status", "pending")
         trace.setdefault("compliance", "pending")
+        if turn_id is not None:
+            trace["turn_id"] = str(turn_id)
+        trace.setdefault("trace_id", f"route:{trace.get('turn_id') or 'unknown'}:{trace.get('created_at')}")
         state.route_traces = [trace, *state.route_traces[:19]]
         return self.save(state, event_type="route_trace_recorded")
 
-    def record_first_tool(self, scope: SessionScope, *, tool_name: str, tool_family: str) -> ActiveSessionState:
+    def record_first_tool(self, scope: SessionScope, *, tool_name: str, tool_family: str, turn_id: Optional[str] = None) -> ActiveSessionState:
         state = self.get(scope)
-        if not state.route_traces:
+        target_index = None
+        for idx, trace in enumerate(state.route_traces):
+            if trace.get("actual_first_tool"):
+                continue
+            if turn_id is None or trace.get("turn_id") == str(turn_id):
+                target_index = idx
+                break
+        if target_index is None:
             trace = {
                 "query": None,
                 "route_status": "unknown",
@@ -292,15 +437,15 @@ class ActiveStateStore:
                 "actual_first_tool_family": tool_family,
                 "compliance": "not_applicable",
                 "bypass_reason": "no_route_trace",
+                "turn_id": str(turn_id) if turn_id is not None else None,
                 "created_at": time.time(),
                 "completed_at": time.time(),
             }
-            state.route_traces = [trace]
+            trace["trace_id"] = f"route:{trace.get('turn_id') or 'unknown'}:{trace['created_at']}"
+            state.route_traces = [trace, *state.route_traces[:19]]
             return self.save(state, event_type="route_first_tool_recorded")
 
-        latest = dict(state.route_traces[0])
-        if latest.get("actual_first_tool"):
-            return state
+        latest = dict(state.route_traces[target_index])
         latest["actual_first_tool"] = tool_name
         latest["actual_first_tool_family"] = tool_family
         expected = latest.get("expected_first_tool_family")
@@ -317,8 +462,27 @@ class ActiveStateStore:
             latest["compliance"] = "warn"
             latest["bypass_reason"] = f"expected_{expected}_got_{tool_family}"
         latest["completed_at"] = time.time()
-        state.route_traces = [latest, *state.route_traces[1:]]
+        state.route_traces = [latest, *state.route_traces[:target_index], *state.route_traces[target_index + 1:]]
         return self.save(state, event_type="route_first_tool_recorded")
+
+    def close_route_trace_without_tool(self, scope: SessionScope, *, turn_id: Optional[str] = None, reason: str = "final_response") -> ActiveSessionState:
+        """Close a pending trace for a turn when the assistant finishes without tools."""
+        state = self.get(scope)
+        target_index = None
+        for idx, trace in enumerate(state.route_traces):
+            if trace.get("actual_first_tool") or trace.get("compliance") != "pending":
+                continue
+            if turn_id is None or trace.get("turn_id") == str(turn_id):
+                target_index = idx
+                break
+        if target_index is None:
+            return state
+        trace = dict(state.route_traces[target_index])
+        trace["compliance"] = "no_tool_used"
+        trace["bypass_reason"] = reason
+        trace["completed_at"] = time.time()
+        state.route_traces = [trace, *state.route_traces[:target_index], *state.route_traces[target_index + 1:]]
+        return self.save(state, event_type="route_trace_closed_without_tool")
 
     def record_writeback_decision(self, scope: SessionScope, decision: Dict[str, Any]) -> ActiveSessionState:
         state = self.get(scope)
@@ -330,7 +494,7 @@ class ActiveStateStore:
     def session_health(self, scope: SessionScope) -> Dict[str, Any]:
         state = self.get(scope)
         traces = state.route_traces
-        completed = [trace for trace in traces if trace.get("actual_first_tool")]
+        completed = [trace for trace in traces if trace.get("actual_first_tool") or trace.get("completed_at")]
         warnings = [trace for trace in completed if trace.get("compliance") == "warn"]
         pending_writebacks = [
             decision for decision in state.writeback_decisions
@@ -343,7 +507,8 @@ class ActiveStateStore:
             "unresolved_asks": len(state.unresolved_asks),
             "route_traces": len(traces),
             "route_warnings": len(warnings),
-            "route_pending": len([trace for trace in traces if not trace.get("actual_first_tool")]),
+            "route_no_tool_used": len([trace for trace in traces if trace.get("compliance") == "no_tool_used"]),
+            "route_pending": len([trace for trace in traces if not trace.get("completed_at") and not trace.get("actual_first_tool")]),
             "writeback_decisions": len(state.writeback_decisions),
             "writeback_pending": len(pending_writebacks),
             "handoff_kind": (state.handoff or {}).get("kind"),

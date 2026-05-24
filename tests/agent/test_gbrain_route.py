@@ -104,3 +104,36 @@ def test_route_trace_warns_on_bypass(tmp_path):
     trace = state.route_traces[0]
     assert trace["compliance"] == "warn"
     assert trace["bypass_reason"] == "expected_gbrain_got_web"
+
+
+def test_route_observation_is_bound_to_current_turn_id(tmp_path):
+    agent = _agent(tmp_path)
+    agent._session_db.create_session("s-current", "telegram")
+    scope = scope_from_agent(agent)
+
+    render_active_state_context(agent, "найди roadmap проекта в Gbrain", turn_id="turn-a")
+    render_active_state_context(agent, "найди roadmap проекта в Gbrain", turn_id="turn-b")
+    agent._current_turn_id = "turn-b"
+    record_tool_route_observation(agent, "mcp_gbrain_knowledge_get_page")
+
+    traces = ActiveStateStore(agent._session_db).get(scope).route_traces
+    by_turn = {trace.get("turn_id"): trace for trace in traces}
+    assert by_turn["turn-b"]["actual_first_tool"] == "mcp_gbrain_knowledge_get_page"
+    assert by_turn["turn-b"]["compliance"] == "matched"
+    assert by_turn["turn-a"]["compliance"] == "pending"
+    assert by_turn["turn-a"].get("actual_first_tool") is None
+
+
+def test_route_trace_closes_without_tool_for_same_turn_only(tmp_path):
+    agent = _agent(tmp_path)
+    agent._session_db.create_session("s-current", "telegram")
+    scope = scope_from_agent(agent)
+    store = ActiveStateStore(agent._session_db)
+
+    render_active_state_context(agent, "найди roadmap проекта в Gbrain", turn_id="turn-a")
+    render_active_state_context(agent, "найди roadmap проекта в Gbrain", turn_id="turn-b")
+    store.close_route_trace_without_tool(scope, turn_id="turn-a")
+
+    by_turn = {trace.get("turn_id"): trace for trace in store.get(scope).route_traces}
+    assert by_turn["turn-a"]["compliance"] == "no_tool_used"
+    assert by_turn["turn-b"]["compliance"] == "pending"
