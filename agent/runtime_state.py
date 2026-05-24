@@ -13,7 +13,7 @@ from agent.session_scope import SessionScope
 def scope_from_agent(agent: Any) -> SessionScope:
     """Build the active runtime scope for an AIAgent instance."""
     platform = getattr(agent, "platform", None) or "local"
-    session_id = getattr(agent, "_gateway_session_key", None) or getattr(agent, "session_id", None) or "default"
+    session_id = getattr(agent, "session_id", None) or getattr(agent, "_gateway_session_key", None) or "default"
     return SessionScope(
         platform=platform,
         chat_id=getattr(agent, "_chat_id", None),
@@ -48,6 +48,56 @@ def render_active_state_context(agent: Any, user_message: str) -> str:
         resolution = resolver.resolve(scope, user_message or "")
         if resolution.status in {"resolved", "needs_clarification"}:
             blocks.append("## Reference Resolver\n" + json.dumps(resolution.to_dict(), ensure_ascii=False, sort_keys=True))
+        if resolution.status == "needs_clarification":
+            lineage_hits = 0
+            try:
+                from agent.lineage_retrieval import render_lineage_evidence, retrieve_lineage
+
+                evidence = retrieve_lineage(getattr(agent, "_session_db", None), scope, user_message or "", limit=3)
+                lineage_hits = len(evidence)
+                rendered_evidence = render_lineage_evidence(evidence)
+                if rendered_evidence:
+                    blocks.append(rendered_evidence)
+            except Exception:
+                pass
+            try:
+                from agent.gbrain_route import classify_gbrain_route, render_gbrain_route_hint
+
+                hint = classify_gbrain_route(
+                    user_message or "",
+                    local_resolved=False,
+                    lineage_hits=lineage_hits,
+                )
+                rendered_hint = render_gbrain_route_hint(hint)
+                if rendered_hint:
+                    blocks.append(rendered_hint)
+            except Exception:
+                pass
+        elif resolution.status == "not_applicable":
+            lineage_hits = 0
+            try:
+                from agent.lineage_retrieval import render_lineage_evidence, retrieve_lineage
+
+                evidence = retrieve_lineage(getattr(agent, "_session_db", None), scope, user_message or "", limit=3)
+                lineage_hits = len(evidence)
+                rendered_evidence = render_lineage_evidence(evidence)
+                if rendered_evidence:
+                    blocks.append(rendered_evidence)
+            except Exception:
+                pass
+            try:
+                from agent.gbrain_route import classify_gbrain_route, render_gbrain_route_hint
+
+                hint = classify_gbrain_route(
+                    user_message or "",
+                    local_resolved=False,
+                    lineage_hits=lineage_hits,
+                )
+                rendered_hint = render_gbrain_route_hint(hint)
+                if rendered_hint:
+                    blocks.append(rendered_hint)
+            except Exception:
+                pass
     except Exception:
         pass
     return "\n\n".join(blocks)
