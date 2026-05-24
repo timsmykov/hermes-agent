@@ -92,6 +92,16 @@ _NL_GOAL_FILLER_RE = re.compile(
     re.IGNORECASE | re.UNICODE,
 )
 
+_PRESERVED_ACTIVE_GOAL_RE = re.compile(
+    r"(?im)^\s*-\s*\[>\]\s*goal\.\s*(?P<goal>.+?)\s*\(in_progress\)\s*$",
+    re.UNICODE,
+)
+
+_PRESERVED_GOAL_CONTINUE_RE = re.compile(
+    r"^\s*(?:делаем|работай|продолжай|go|continue|do\s+it)\b",
+    re.IGNORECASE | re.UNICODE,
+)
+
 
 def _extract_natural_language_goal_text(text: str) -> Optional[str]:
     """Extract a `/goal` payload from explicit RU/EN natural-language asks.
@@ -104,6 +114,11 @@ def _extract_natural_language_goal_text(text: str) -> Optional[str]:
     raw = str(text or "").strip()
     if not raw or raw.startswith("/"):
         return None
+    preserved_match = _PRESERVED_ACTIVE_GOAL_RE.search(raw)
+    if preserved_match and _PRESERVED_GOAL_CONTINUE_RE.match(raw):
+        goal = preserved_match.group("goal").strip()
+        goal = re.sub(r"^\s*Цель\s*:\s*", "", goal, flags=re.IGNORECASE | re.UNICODE).strip()
+        return goal or None
     match = _NL_GOAL_PREFIX_RE.match(raw)
     if not match:
         return None

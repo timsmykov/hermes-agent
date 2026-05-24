@@ -279,6 +279,10 @@ async def test_goal_set_sends_control_card_and_queues_kickoff(hermes_home):
         ("установи цель для агента — разобраться с логами", "разобраться с логами"),
         ("set yourself a goal to verify Telegram goal cards", "verify Telegram goal cards"),
         ("set all necessary goals for shipping the feature", "shipping the feature"),
+        (
+            "Делаем\n\n[Your active task list was preserved across context compression]\n- [>] goal. Цель: довести Infinite Session Engine до полноценной реализации и провести глубокую QA/bug hunt (in_progress)",
+            "довести Infinite Session Engine до полноценной реализации и провести глубокую QA/bug hunt",
+        ),
     ],
 )
 def test_natural_language_goal_intent_extracts_ru_and_en_payloads(text, expected):
