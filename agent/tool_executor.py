@@ -399,6 +399,11 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     )
                 except Exception as _ver_err:
                     logging.debug("file-mutation verifier record failed: %s", _ver_err)
+                try:
+                    from agent.runtime_state import register_tool_artifact
+                    register_tool_artifact(agent, function_name, function_args, function_result, failed=is_error)
+                except Exception as _artifact_err:
+                    logging.debug("active artifact registration failed: %s", _artifact_err)
 
             if not blocked and agent.tool_progress_callback:
                 try:
@@ -860,6 +865,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 )
             except Exception as _ver_err:
                 logging.debug("file-mutation verifier record failed: %s", _ver_err)
+            try:
+                from agent.runtime_state import register_tool_artifact
+                register_tool_artifact(agent, function_name, function_args, function_result, failed=_is_error_result)
+            except Exception as _artifact_err:
+                logging.debug("active artifact registration failed: %s", _artifact_err)
 
         if not _execution_blocked and agent.tool_progress_callback:
             try:

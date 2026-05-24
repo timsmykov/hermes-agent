@@ -61,3 +61,21 @@ def test_reference_resolver_ignores_non_ambiguous_text(tmp_path):
 
     assert result.status == "not_applicable"
     assert result.reason == "no_ambiguous_reference"
+
+
+def test_reference_resolver_prefers_reply_or_attachment_artifact(tmp_path):
+    store = _store(tmp_path)
+    resolver = ReferenceResolver(store)
+    scope = SessionScope(platform="telegram", chat_id="806409559", thread_id="468587", session_id="s-a")
+
+    store.register_artifact(scope, {"artifact_id": "old", "kind": "file", "title": "old.md"})
+    store.register_artifact(
+        scope,
+        {"artifact_id": "reply", "kind": "file", "title": "reply.md", "source": "reply"},
+    )
+
+    result = resolver.resolve(scope, "продолжи этот файл")
+
+    assert result.status == "resolved"
+    assert result.artifact is not None
+    assert result.artifact["artifact_id"] == "reply"

@@ -84,6 +84,13 @@ class ReferenceResolver:
             if artifact.get("status", "active") == "active"
             and artifact.get("owner_scope", scope.scope_key) == scope.scope_key
         ]
+        priority_sources = ("reply", "attachment", "current_turn")
+        priority_artifacts = [
+            artifact for artifact in artifacts
+            if artifact.get("source") in priority_sources or artifact.get("source_kind") in priority_sources
+        ]
+        if priority_artifacts:
+            artifacts = priority_artifacts
         if not artifacts:
             return ResolutionResult(
                 status="needs_clarification",

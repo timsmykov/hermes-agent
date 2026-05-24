@@ -143,5 +143,52 @@ class ActiveStateStore:
         state.active_artifacts = [artifact, *existing]
         return self.save(state, event_type="artifact_registered")
 
+    def mark_artifact_status(
+        self,
+        scope: SessionScope,
+        artifact_id: str,
+        status: str,
+        *,
+        reason: Optional[str] = None,
+    ) -> ActiveSessionState:
+        state = self.get(scope)
+        now = time.time()
+        for artifact in state.active_artifacts:
+            if artifact.get("artifact_id") == artifact_id:
+                artifact["status"] = status
+                artifact["updated_at"] = now
+                if reason:
+                    artifact["status_reason"] = reason
+                break
+        return self.save(state, event_type=f"artifact_{status}")
+
+    def archive_stale_artifacts(
+        self,
+        scope: SessionScope,
+        *,
+        older_than_seconds: float,
+        now: Optional[float] = None,
+    ) -> ActiveSessionState:
+        state = self.get(scope)
+        cutoff_now = now or time.time()
+        changed = False
+        for artifact in state.active_artifacts:
+            if artifact.get("status", "active") != "active":
+                continue
+            updated_at = float(artifact.get("updated_at") or artifact.get("created_at") or cutoff_now)
+            if cutoff_now - updated_at >= older_than_seconds:
+                artifact["status"] = "archived"
+                artifact["updated_at"] = cutoff_now
+                artifact["status_reason"] = "stale"
+                changed = True
+        if changed:
+            return self.save(state, event_type="artifacts_archived_stale")
+        return state
+
+    def record_handoff(self, scope: SessionScope, handoff: Dict[str, Any]) -> ActiveSessionState:
+        state = self.get(scope)
+        state.handoff = dict(handoff)
+        return self.save(state, event_type="handoff_recorded")
+
     def snapshot(self, scope: SessionScope) -> Dict[str, Any]:
         return self.get(scope).to_dict()

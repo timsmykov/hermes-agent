@@ -404,6 +404,17 @@ def compress_context(
                 except (ValueError, Exception) as e:
                     logger.debug("Could not propagate title on compression: %s", e)
             agent._session_db.update_system_prompt(agent.session_id, new_system_prompt)
+            try:
+                from agent.runtime_state import record_compaction_handoff
+                record_compaction_handoff(
+                    agent,
+                    old_session_id=old_session_id,
+                    new_session_id=agent.session_id,
+                    before_count=_pre_msg_count,
+                    after_count=len(compressed),
+                )
+            except Exception as _handoff_err:
+                logger.debug("active-state compaction handoff failed: %s", _handoff_err)
             # Reset flush cursor — new session starts with no messages written
             agent._last_flushed_db_idx = 0
         except Exception as e:

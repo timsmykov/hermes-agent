@@ -837,6 +837,13 @@ def run_conversation(
                         _injections.append(_fenced)
                 if _plugin_user_context:
                     _injections.append(_plugin_user_context)
+                try:
+                    from agent.runtime_state import render_active_state_context
+                    _active_state_context = render_active_state_context(agent, user_message)
+                    if _active_state_context:
+                        _injections.append(_active_state_context)
+                except Exception as _active_state_err:
+                    request_logger.debug("active-state context injection failed: %s", _active_state_err)
                 if _injections:
                     _base = api_msg.get("content", "")
                     if isinstance(_base, str):

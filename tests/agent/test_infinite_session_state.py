@@ -69,3 +69,26 @@ def test_active_state_store_persists_per_scope(tmp_path):
 
     events = db.list_active_session_events(scope_a.scope_key)
     assert [event["event_type"] for event in events] == ["artifact_registered", "latest_user_request"]
+
+
+def test_active_state_archives_stale_artifacts(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    store = ActiveStateStore(db)
+    scope = SessionScope(platform="telegram", chat_id="806409559", thread_id="468587", session_id="s-a")
+
+    store.register_artifact(
+        scope,
+        {
+            "artifact_id": "old-file",
+            "kind": "file",
+            "title": "old.md",
+            "created_at": 10.0,
+            "updated_at": 10.0,
+        },
+    )
+    state = store.archive_stale_artifacts(scope, older_than_seconds=100.0, now=200.0)
+
+    assert state.active_artifacts[0]["status"] == "archived"
+    assert state.active_artifacts[0]["status_reason"] == "stale"
+    events = db.list_active_session_events(scope.scope_key)
+    assert events[0]["event_type"] == "artifacts_archived_stale"
