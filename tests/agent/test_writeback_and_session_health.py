@@ -2,6 +2,7 @@ from agent.active_state import ActiveStateStore
 from agent.session_health import build_session_health_report, render_session_health_report
 from agent.writeback_classifier import (
     classify_writeback_candidate,
+    execute_writeback_candidate,
     verify_writeback_retrieval_after_embed,
     writeback_wrapper,
 )
@@ -109,3 +110,49 @@ def test_verify_writeback_retrieval_after_embed_failure():
 
     assert audit["status"] == "failed"
     assert audit["reason"] == "not_retrievable_after_embed"
+
+
+def test_execute_writeback_candidate_records_write_embed_and_verification():
+    decision = classify_writeback_candidate(
+        [{"role": "assistant", "content": "Решили архитектурный принцип: Gbrain canonical only."}],
+        artifact_count=1,
+    )
+    calls = []
+
+    def write(wrapper):
+        calls.append(("write", wrapper["target"]))
+        return {"slug": "staging/hermes"}
+
+    def embed(wrapper):
+        calls.append(("embed", wrapper["write_result"]["slug"]))
+        return {"job": "embed-1"}
+
+    result = execute_writeback_candidate(
+        decision,
+        write=write,
+        embed=embed,
+        retrieve=lambda query: [{"slug": "staging/hermes", "query": query}],
+    )
+
+    assert calls == [("write", "gbrain_staging_artifact"), ("embed", "staging/hermes")]
+    assert result["write_status"] == "written"
+    assert result["embed_status"] == "embedded"
+    assert result["verification_status"] == "verified"
+    assert result["match_count"] == 1
+    assert result["verified_at"] >= result["writeback_started_at"]
+
+
+def test_execute_writeback_candidate_records_write_failure_without_retrieval():
+    decision = classify_writeback_candidate(
+        [{"role": "assistant", "content": "Решили архитектурный принцип: Gbrain canonical only."}],
+        artifact_count=1,
+    )
+
+    result = execute_writeback_candidate(
+        decision,
+        write=lambda wrapper: (_ for _ in ()).throw(RuntimeError("write down")),
+        retrieve=lambda query: [{"slug": "should-not-run"}],
+    )
+
+    assert result["write_status"] == "failed"
+    assert result["verification"]["reason"] == "write_failed"

@@ -228,7 +228,14 @@ def record_compaction_handoff(
         "before_message_count": before_count,
         "after_message_count": after_count,
         "active_artifact_count": len(state.active_artifacts),
+        "active_artifacts": list(state.active_artifacts[:5]),
         "unresolved_ask_count": len(state.unresolved_asks),
+        "unresolved_asks": list(state.unresolved_asks[:5]),
+        "route_pending_count": len([trace for trace in state.route_traces if trace.get("compliance") == "pending"]),
+        "writeback_pending_count": len([
+            decision for decision in state.writeback_decisions
+            if decision.get("action") in {"raw_capture", "staged_artifact", "canonical_review"}
+        ]),
         "current_task": state.current_task,
         "created_at": time.time(),
     }
@@ -254,6 +261,8 @@ def record_compaction_handoff(
         "before_message_count": before_count,
         "after_message_count": after_count,
         "current_task": state.current_task,
+        "active_artifacts": list(state.active_artifacts[:5]),
+        "unresolved_asks": list(state.unresolved_asks[:5]),
         "raw_window": list(raw_window or [])[-20:],
         "error": str(last_error)[:500] if last_error else "unknown",
         "created_at": time.time(),

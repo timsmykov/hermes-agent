@@ -97,6 +97,8 @@ def test_record_compaction_handoff_preserves_active_state_audit(tmp_path):
     assert state["handoff"]["kind"] == "context_compaction"
     assert state["handoff"]["old_session_id"] == "s-old"
     assert state["handoff"]["active_artifact_count"] == 1
+    assert state["handoff"]["active_artifacts"][0]["local_path"] == "/tmp/report.md"
+    assert state["handoff"]["route_pending_count"] == 0
     events = agent._session_db.list_active_session_events(scope.scope_key)
     assert events[0]["event_type"] == "handoff_recorded"
 
@@ -123,4 +125,5 @@ def test_record_compaction_handoff_retries_and_preserves_raw_window_on_failure(t
     assert ok is False
     assert agent._pending_compaction_raw_window["kind"] == "context_compaction_audit_failed"
     assert agent._pending_compaction_raw_window["raw_window"][0]["content"] == "raw"
+    assert "active_artifacts" in agent._pending_compaction_raw_window
     assert warnings

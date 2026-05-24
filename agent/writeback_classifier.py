@@ -9,6 +9,7 @@ must still go through review-first promotion.
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List
 
@@ -151,3 +152,48 @@ def verify_writeback_retrieval_after_embed(
             "query": query,
         }
     return {"status": "failed", "reason": "not_retrievable_after_embed", "match_count": 0, "query": query}
+
+
+def execute_writeback_candidate(
+    decision: WritebackDecision,
+    *,
+    write: Callable[[Dict[str, Any]], Dict[str, Any] | None],
+    retrieve: Callable[[str], Iterable[Any]],
+    embed: Callable[[Dict[str, Any]], Any] | None = None,
+    expected: str | None = None,
+) -> Dict[str, Any]:
+    """Run canonical writeback wrapper with post-write retrieval verification.
+
+    The caller supplies concrete Gbrain/staging functions; this helper owns the
+    invariant that every non-skip writeback gets write status, optional embed
+    status, retrieval verification, and an audit timestamp in one payload.
+    """
+    wrapper = writeback_wrapper(decision)
+    wrapper["writeback_started_at"] = time.time()
+    if wrapper.get("action") == "skip":
+        wrapper["write_status"] = "skipped"
+        wrapper["verification"] = verify_writeback_retrieval_after_embed(wrapper, retrieve, expected=expected)
+        wrapper["verified_at"] = time.time()
+        return wrapper
+    try:
+        write_result = write(wrapper) or {}
+        wrapper["write_status"] = "written"
+        wrapper["write_result"] = write_result
+    except Exception as exc:
+        wrapper["write_status"] = "failed"
+        wrapper["write_error"] = str(exc)[:300]
+        wrapper["verification"] = {"status": "failed", "reason": "write_failed", "match_count": 0}
+        wrapper["verified_at"] = time.time()
+        return wrapper
+    if embed is not None:
+        try:
+            wrapper["embed_result"] = embed(wrapper)
+            wrapper["embed_status"] = "embedded"
+        except Exception as exc:
+            wrapper["embed_status"] = "failed"
+            wrapper["embed_error"] = str(exc)[:300]
+    wrapper["verification"] = verify_writeback_retrieval_after_embed(wrapper, retrieve, expected=expected)
+    wrapper["verification_status"] = wrapper["verification"].get("status")
+    wrapper["match_count"] = wrapper["verification"].get("match_count", 0)
+    wrapper["verified_at"] = time.time()
+    return wrapper

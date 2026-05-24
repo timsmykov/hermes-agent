@@ -20,6 +20,11 @@ _STOPWORDS = {
     "эти", "тот", "та", "то", "те", "его", "ее", "её", "их", "там", "в", "на", "и",
     "или", "для", "по", "с", "со", "из", "к", "ко", "про",
 }
+_ROLE_WEIGHT = {
+    "user": 3,
+    "assistant": 2,
+    "tool": 1,
+}
 
 
 @dataclass
@@ -45,6 +50,26 @@ class LineageEvidence:
 def _terms(query: str) -> List[str]:
     words = re.findall(r"[\w\u0400-\u04FF]{3,}", (query or "").lower(), flags=re.UNICODE)
     return [word for word in words if word not in _STOPWORDS]
+
+
+def _term_set(text: str) -> set[str]:
+    return set(_terms(text))
+
+
+def _score_message(*, query_terms: List[str], text: str, role: str, ordinal: int, total_messages: int) -> int:
+    """Deterministic lineage score: exact term matches + role + recency.
+
+    Exact term overlap prevents substring noise. Role and recency are small
+    tie-breakers, not substitutes for a semantic match.
+    """
+    if not query_terms:
+        return 0
+    terms_in_text = _term_set(text)
+    overlap = len(set(query_terms) & terms_in_text)
+    if overlap <= 0:
+        return 0
+    recency = max(0, min(3, ordinal - max(0, total_messages - 4) + 1))
+    return overlap * 100 + _ROLE_WEIGHT.get(role, 0) * 10 + recency
 
 
 def _content_to_text(content: Any) -> str:
@@ -100,6 +125,7 @@ def retrieve_lineage(
         return []
     terms = _terms(query)
     evidence: List[LineageEvidence] = []
+    total_messages = len(messages)
     for ordinal, msg in enumerate(messages):
         role = msg.get("role") or "unknown"
         if allowed_roles is not None and role not in allowed_roles:
@@ -107,8 +133,13 @@ def retrieve_lineage(
         text = _content_to_text(msg.get("content")).strip()
         if not text:
             continue
-        lowered = text.lower()
-        score = sum(1 for term in terms if term in lowered)
+        score = _score_message(
+            query_terms=terms,
+            text=text,
+            role=role,
+            ordinal=ordinal,
+            total_messages=total_messages,
+        )
         # If the query has no discriminative terms (e.g. only "продолжи"),
         # keep recent user/assistant turns as fallback lineage context.
         if terms and score <= 0:
@@ -118,7 +149,9 @@ def retrieve_lineage(
         evidence.append(LineageEvidence(session_id=session_id, role=role, content=clipped, score=score, ordinal=ordinal))
     if not evidence and not terms:
         # Conversation loader omits session ids; use current scope as provenance.
-        for ordinal, msg in enumerate(messages[-limit:]):
+        start_ordinal = max(0, len(messages) - limit)
+        for offset, msg in enumerate(messages[-limit:]):
+            ordinal = start_ordinal + offset
             role = msg.get("role") or "unknown"
             if allowed_roles is not None and role not in allowed_roles:
                 continue

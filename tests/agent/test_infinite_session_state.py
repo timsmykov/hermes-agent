@@ -176,3 +176,18 @@ def test_register_artifact_supersedes_previous_same_file_path(tmp_path):
     assert state.active_artifacts[1]["artifact_id"] == "file:v1"
     assert state.active_artifacts[1]["status"] == "superseded"
     assert state.active_artifacts[1]["superseded_by"] == "file:v2"
+
+
+def test_active_state_debug_report_is_compact_and_scoped(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    store = ActiveStateStore(db)
+    scope = SessionScope(platform="telegram", chat_id="806409559", thread_id="468587", session_id="s-a")
+
+    store.update_latest_user_request(scope, text="доделать runtime continuity", message_id="u1")
+    store.register_artifact(scope, {"artifact_id": "file:v1", "kind": "file", "local_path": "/tmp/report.md"})
+    report = store.render_debug_report(scope)
+
+    assert "Active Session Debug" in report
+    assert "telegram:806409559:thread:468587" in report
+    assert "current_task_status: in_progress" in report
+    assert "artifact: file active /tmp/report.md" in report

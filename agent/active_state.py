@@ -500,20 +500,48 @@ class ActiveStateStore:
             decision for decision in state.writeback_decisions
             if decision.get("action") in {"raw_capture", "staged_artifact", "canonical_review"}
         ]
+        active_artifact_count = len([a for a in state.active_artifacts if a.get("status", "active") == "active"])
+        route_pending_count = len([trace for trace in traces if not trace.get("completed_at") and not trace.get("actual_first_tool")])
         return {
             "scope_key": scope.scope_key,
             "session_id": scope.session_id,
-            "active_artifacts": len([a for a in state.active_artifacts if a.get("status", "active") == "active"]),
+            "active_artifacts": active_artifact_count,
+            "stale_artifacts": len([a for a in state.active_artifacts if a.get("status") in {"superseded", "deleted", "missing", "archived"}]),
             "unresolved_asks": len(state.unresolved_asks),
             "route_traces": len(traces),
             "route_warnings": len(warnings),
             "route_no_tool_used": len([trace for trace in traces if trace.get("compliance") == "no_tool_used"]),
-            "route_pending": len([trace for trace in traces if not trace.get("completed_at") and not trace.get("actual_first_tool")]),
+            "route_pending": route_pending_count,
             "writeback_decisions": len(state.writeback_decisions),
             "writeback_pending": len(pending_writebacks),
             "handoff_kind": (state.handoff or {}).get("kind"),
+            "current_task_status": (state.current_task or {}).get("status"),
+            "mutation_audit_entries": len(state.mutation_audit),
+            "version": state.version,
             "updated_at": state.updated_at,
         }
+
+    def render_debug_report(self, scope: SessionScope) -> str:
+        """Render a compact, redacted operator view of the continuity state."""
+        state = self.get(scope)
+        health = self.session_health(scope)
+        lines = [
+            "## Active Session Debug",
+            f"scope: {scope.scope_key}",
+            f"version: {health.get('version')}",
+            f"current_task_status: {health.get('current_task_status') or 'none'}",
+            f"active_artifacts: {health.get('active_artifacts')} stale_artifacts: {health.get('stale_artifacts')}",
+            f"route: pending={health.get('route_pending')} warnings={health.get('route_warnings')} no_tool={health.get('route_no_tool_used')}",
+            f"writeback: pending={health.get('writeback_pending')} decisions={health.get('writeback_decisions')}",
+            f"handoff: {health.get('handoff_kind') or 'none'}",
+        ]
+        if state.current_task:
+            task = str(state.current_task.get("text") or "")[:160].replace("\n", " ")
+            lines.append(f"current_task: {task}")
+        for artifact in state.active_artifacts[:5]:
+            title = str(artifact.get("title") or artifact.get("local_path") or artifact.get("uri") or artifact.get("artifact_id"))[:160]
+            lines.append(f"artifact: {artifact.get('kind', 'artifact')} {artifact.get('status', 'active')} {title}")
+        return "\n".join(lines)
 
     def snapshot(self, scope: SessionScope) -> Dict[str, Any]:
         return self.get(scope).to_dict()

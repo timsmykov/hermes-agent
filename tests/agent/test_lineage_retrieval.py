@@ -59,3 +59,30 @@ def test_active_state_context_injects_lineage_evidence_only_after_local_miss(tmp
     assert "Reference Resolver" in context
     assert "Current Session Lineage Evidence" in context
     assert "lineage retrieval" in context
+
+
+def test_retrieve_lineage_uses_exact_tokens_not_substrings(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("s-current", "telegram")
+    db.append_message("s-current", "assistant", "Path /tmp/preporting.md is unrelated")
+    db.append_message("s-current", "assistant", "Final report artifact is /tmp/report.md")
+
+    scope = SessionScope(platform="telegram", chat_id="806409559", thread_id="468587", session_id="s-current")
+    evidence = retrieve_lineage(db, scope, "report", limit=5)
+
+    assert evidence
+    assert evidence[0].content == "Final report artifact is /tmp/report.md"
+    assert all("preporting" not in item.content for item in evidence)
+
+
+def test_retrieve_lineage_prefers_recent_user_instruction_over_older_match(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("s-current", "telegram")
+    db.append_message("s-current", "assistant", "roadmap artifact mentioned in older assistant output")
+    db.append_message("s-current", "user", "please use the roadmap from the current task")
+
+    scope = SessionScope(platform="telegram", chat_id="806409559", thread_id="468587", session_id="s-current")
+    evidence = retrieve_lineage(db, scope, "roadmap", limit=2)
+
+    assert evidence[0].role == "user"
+    assert "current task" in evidence[0].content
