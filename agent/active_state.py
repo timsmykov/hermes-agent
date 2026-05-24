@@ -22,6 +22,8 @@ class ActiveSessionState:
     constraints: List[Dict[str, Any]] = field(default_factory=list)
     running_processes: List[Dict[str, Any]] = field(default_factory=list)
     files_touched: List[Dict[str, Any]] = field(default_factory=list)
+    route_traces: List[Dict[str, Any]] = field(default_factory=list)
+    writeback_decisions: List[Dict[str, Any]] = field(default_factory=list)
     handoff: Optional[Dict[str, Any]] = None
     updated_at: Optional[float] = None
     version: int = 1
@@ -42,6 +44,8 @@ class ActiveSessionState:
             constraints=list(data.get("constraints") or []),
             running_processes=list(data.get("running_processes") or []),
             files_touched=list(data.get("files_touched") or []),
+            route_traces=list(data.get("route_traces") or []),
+            writeback_decisions=list(data.get("writeback_decisions") or []),
             handoff=data.get("handoff"),
             updated_at=data.get("updated_at"),
             version=int(data.get("version") or 1),
@@ -58,6 +62,8 @@ class ActiveSessionState:
             "constraints": self.constraints,
             "running_processes": self.running_processes,
             "files_touched": self.files_touched,
+            "route_traces": self.route_traces,
+            "writeback_decisions": self.writeback_decisions,
             "handoff": self.handoff,
             "updated_at": self.updated_at,
         }
@@ -78,6 +84,14 @@ class ActiveSessionState:
             lines.append("unresolved_asks:")
             for ask in self.unresolved_asks[:5]:
                 lines.append(f"- {ask.get('text') or ask}")
+        if self.route_traces:
+            latest = self.route_traces[0]
+            lines.append(
+                "latest_route_trace: "
+                f"expected={latest.get('expected_first_tool_family') or 'none'} "
+                f"actual={latest.get('actual_first_tool') or 'pending'} "
+                f"status={latest.get('compliance') or 'pending'}"
+            )
         return "\n".join(lines)
 
 
@@ -189,6 +203,81 @@ class ActiveStateStore:
         state = self.get(scope)
         state.handoff = dict(handoff)
         return self.save(state, event_type="handoff_recorded")
+
+    def record_route_trace(self, scope: SessionScope, trace: Dict[str, Any]) -> ActiveSessionState:
+        state = self.get(scope)
+        trace = dict(trace)
+        trace.setdefault("created_at", time.time())
+        trace.setdefault("status", "pending")
+        trace.setdefault("compliance", "pending")
+        state.route_traces = [trace, *state.route_traces[:19]]
+        return self.save(state, event_type="route_trace_recorded")
+
+    def record_first_tool(self, scope: SessionScope, *, tool_name: str, tool_family: str) -> ActiveSessionState:
+        state = self.get(scope)
+        if not state.route_traces:
+            trace = {
+                "query": None,
+                "route_status": "unknown",
+                "expected_first_tool_family": None,
+                "actual_first_tool": tool_name,
+                "actual_first_tool_family": tool_family,
+                "compliance": "not_applicable",
+                "bypass_reason": "no_route_trace",
+                "created_at": time.time(),
+                "completed_at": time.time(),
+            }
+            state.route_traces = [trace]
+            return self.save(state, event_type="route_first_tool_recorded")
+
+        latest = dict(state.route_traces[0])
+        if latest.get("actual_first_tool"):
+            return state
+        latest["actual_first_tool"] = tool_name
+        latest["actual_first_tool_family"] = tool_family
+        expected = latest.get("expected_first_tool_family")
+        if expected is None:
+            latest["compliance"] = "not_applicable"
+            latest["bypass_reason"] = "no_expected_first_tool"
+        elif expected == tool_family:
+            latest["compliance"] = "matched"
+            latest["bypass_reason"] = None
+        else:
+            latest["compliance"] = "warn"
+            latest["bypass_reason"] = f"expected_{expected}_got_{tool_family}"
+        latest["completed_at"] = time.time()
+        state.route_traces = [latest, *state.route_traces[1:]]
+        return self.save(state, event_type="route_first_tool_recorded")
+
+    def record_writeback_decision(self, scope: SessionScope, decision: Dict[str, Any]) -> ActiveSessionState:
+        state = self.get(scope)
+        decision = dict(decision)
+        decision.setdefault("created_at", time.time())
+        state.writeback_decisions = [decision, *state.writeback_decisions[:19]]
+        return self.save(state, event_type="writeback_decision_recorded")
+
+    def session_health(self, scope: SessionScope) -> Dict[str, Any]:
+        state = self.get(scope)
+        traces = state.route_traces
+        completed = [trace for trace in traces if trace.get("actual_first_tool")]
+        warnings = [trace for trace in completed if trace.get("compliance") == "warn"]
+        pending_writebacks = [
+            decision for decision in state.writeback_decisions
+            if decision.get("action") in {"raw_capture", "staged_artifact", "canonical_review"}
+        ]
+        return {
+            "scope_key": scope.scope_key,
+            "session_id": scope.session_id,
+            "active_artifacts": len([a for a in state.active_artifacts if a.get("status", "active") == "active"]),
+            "unresolved_asks": len(state.unresolved_asks),
+            "route_traces": len(traces),
+            "route_warnings": len(warnings),
+            "route_pending": len([trace for trace in traces if not trace.get("actual_first_tool")]),
+            "writeback_decisions": len(state.writeback_decisions),
+            "writeback_pending": len(pending_writebacks),
+            "handoff_kind": (state.handoff or {}).get("kind"),
+            "updated_at": state.updated_at,
+        }
 
     def snapshot(self, scope: SessionScope) -> Dict[str, Any]:
         return self.get(scope).to_dict()

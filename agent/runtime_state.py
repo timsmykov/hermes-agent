@@ -61,7 +61,7 @@ def render_active_state_context(agent: Any, user_message: str) -> str:
             except Exception:
                 pass
             try:
-                from agent.gbrain_route import classify_gbrain_route, render_gbrain_route_hint
+                from agent.gbrain_route import classify_gbrain_route, render_gbrain_route_hint, route_trace_from_hint
 
                 hint = classify_gbrain_route(
                     user_message or "",
@@ -71,6 +71,7 @@ def render_active_state_context(agent: Any, user_message: str) -> str:
                 rendered_hint = render_gbrain_route_hint(hint)
                 if rendered_hint:
                     blocks.append(rendered_hint)
+                    store.record_route_trace(scope, route_trace_from_hint(hint))
             except Exception:
                 pass
         elif resolution.status == "not_applicable":
@@ -86,7 +87,7 @@ def render_active_state_context(agent: Any, user_message: str) -> str:
             except Exception:
                 pass
             try:
-                from agent.gbrain_route import classify_gbrain_route, render_gbrain_route_hint
+                from agent.gbrain_route import classify_gbrain_route, render_gbrain_route_hint, route_trace_from_hint
 
                 hint = classify_gbrain_route(
                     user_message or "",
@@ -96,6 +97,7 @@ def render_active_state_context(agent: Any, user_message: str) -> str:
                 rendered_hint = render_gbrain_route_hint(hint)
                 if rendered_hint:
                     blocks.append(rendered_hint)
+                    store.record_route_trace(scope, route_trace_from_hint(hint))
             except Exception:
                 pass
     except Exception:
@@ -175,6 +177,19 @@ def register_tool_artifact(agent: Any, tool_name: str, args: Dict[str, Any], res
     artifact.setdefault("source_tool", tool_name)
     artifact.setdefault("source_session_id", getattr(agent, "session_id", None))
     store.register_artifact(scope, artifact)
+
+
+def record_tool_route_observation(agent: Any, tool_name: str) -> None:
+    """Record the first actual tool family for route-compliance metrics."""
+    store = active_state_store_for_agent(agent)
+    if store is None:
+        return
+    try:
+        from agent.gbrain_route import tool_family
+
+        store.record_first_tool(scope_from_agent(agent), tool_name=tool_name, tool_family=tool_family(tool_name))
+    except Exception:
+        return
 
 
 def record_compaction_handoff(agent: Any, *, old_session_id: str, new_session_id: str, before_count: int, after_count: int) -> None:

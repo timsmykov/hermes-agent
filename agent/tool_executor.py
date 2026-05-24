@@ -169,6 +169,11 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     for tc, name, args, block_result, blocked_by_guardrail, routeguard_decision in parsed_calls:
         if block_result is not None:
             continue
+        try:
+            from agent.runtime_state import record_tool_route_observation
+            record_tool_route_observation(agent, name)
+        except Exception as _route_trace_err:
+            logging.debug("route observation failed: %s", _route_trace_err)
         if agent.tool_progress_callback:
             try:
                 preview = _build_tool_preview(name, args)
@@ -582,6 +587,13 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 set_activity_callback(agent._touch_activity)
             except Exception:
                 pass
+
+        if not _execution_blocked:
+            try:
+                from agent.runtime_state import record_tool_route_observation
+                record_tool_route_observation(agent, function_name)
+            except Exception as _route_trace_err:
+                logging.debug("route observation failed: %s", _route_trace_err)
 
         if not _execution_blocked and agent.tool_progress_callback:
             try:
