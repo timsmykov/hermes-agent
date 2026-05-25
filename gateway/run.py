@@ -3858,6 +3858,20 @@ class GatewayRunner:
         running_agent = self._running_agents.get(session_key)
 
         platform_value = getattr(event.source.platform, "value", event.source.platform)
+        if getattr(event, "internal", False):
+            # Synthetic gateway events (background-process completions, watch
+            # notifications, resume nudges) are not user follow-ups.  In ask
+            # mode they must not produce a Telegram "what should I do with this
+            # new message?" prompt, because Tim did not send a new message.
+            # Feed them directly back to the active orchestrator when possible;
+            # otherwise queue for the next turn without any public busy ack.
+            internal_mode = "steer" if running_agent and running_agent is not _AGENT_PENDING_SENTINEL else "queue"
+            logger.debug(
+                "Internal busy event for session %s — routing via %s without Telegram choice prompt",
+                session_key,
+                internal_mode,
+            )
+            return await self._route_busy_input(event, session_key, internal_mode, send_ack=False)
         if (
             self._busy_input_mode == "ask"
             and platform_value == Platform.TELEGRAM.value

@@ -3341,7 +3341,8 @@ class BasePlatformAdapter(ABC):
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
         )
-        self._record_active_user_request(event, session_key)
+        if not getattr(event, "internal", False):
+            self._record_active_user_request(event, session_key)
 
         # On-entry self-heal: if the adapter still has an _active_sessions
         # entry for this key but the owner task has already exited (done or

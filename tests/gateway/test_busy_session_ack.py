@@ -47,6 +47,7 @@ def _make_event(
     message_id="msg1",
     media_urls=None,
     media_types=None,
+    internal=False,
 ):
     """Build a minimal MessageEvent."""
     source = SessionSource(
@@ -62,6 +63,7 @@ def _make_event(
         message_id=message_id,
         media_urls=list(media_urls or []),
         media_types=list(media_types or []),
+        internal=internal,
     )
     return evt
 
@@ -173,6 +175,34 @@ class TestBusySessionAck:
 
         # Verify agent interrupt was called
         agent.interrupt.assert_called_once_with("Are you working?")
+
+    @pytest.mark.asyncio
+    async def test_internal_busy_event_does_not_send_telegram_choice_prompt(self):
+        """Synthetic watcher/tool events must not look like new user messages in ask mode."""
+        runner, sentinel = _make_runner()
+        runner._busy_input_mode = "ask"
+        adapter = _make_adapter()
+
+        event = _make_event(
+            text="[IMPORTANT: Background task connected to the current orchestration finished.]",
+            internal=True,
+        )
+        sk = build_session_key(event.source)
+        runner.adapters[event.source.platform] = adapter
+
+        agent = MagicMock()
+        agent.steer = MagicMock(return_value=True)
+        runner._running_agents[sk] = agent
+
+        with patch("gateway.run.merge_pending_message_event") as mock_merge:
+            result = await runner._handle_active_session_busy_message(event, sk)
+
+        assert result is True
+        agent.steer.assert_called_once_with(event.text)
+        agent.interrupt.assert_not_called()
+        mock_merge.assert_not_called()
+        adapter.send_busy_choice_prompt.assert_not_called()
+        adapter._send_with_retry.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_queue_mode_suppresses_interrupt_and_updates_ack(self):
