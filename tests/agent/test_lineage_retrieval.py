@@ -86,3 +86,21 @@ def test_retrieve_lineage_prefers_recent_user_instruction_over_older_match(tmp_p
 
     assert evidence[0].role == "user"
     assert "current task" in evidence[0].content
+
+
+def test_retrieve_lineage_filters_compaction_reference_only_blocks(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("s-current", "telegram")
+    db.append_message(
+        "s-current",
+        "assistant",
+        "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted into the summary below. Active Task: перегруз сервера",
+    )
+    db.append_message("s-current", "user", "надо сделать инспекцию памяти бесконечного чата")
+
+    scope = SessionScope(platform="telegram", chat_id="806409559", thread_id="468587", session_id="s-current")
+    evidence = retrieve_lineage(db, scope, "перегруз бесконечного", limit=5)
+
+    assert evidence
+    assert all("CONTEXT COMPACTION" not in item.content for item in evidence)
+    assert all("перегруз сервера" not in item.content for item in evidence)

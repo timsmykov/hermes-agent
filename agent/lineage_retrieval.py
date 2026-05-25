@@ -88,6 +88,11 @@ def _content_to_text(content: Any) -> str:
     return str(content or "")
 
 
+def _is_compaction_reference_only(text: str) -> bool:
+    normalized = " ".join((text or "").strip().split())
+    return normalized.startswith("[CONTEXT COMPACTION — REFERENCE ONLY]") or "Earlier turns were compacted into the summary below" in normalized
+
+
 def _session_ids_for_lineage(session_db: Any, session_id: str) -> List[str]:
     if not session_id:
         return []
@@ -131,7 +136,7 @@ def retrieve_lineage(
         if allowed_roles is not None and role not in allowed_roles:
             continue
         text = _content_to_text(msg.get("content")).strip()
-        if not text:
+        if not text or _is_compaction_reference_only(text):
             continue
         score = _score_message(
             query_terms=terms,
@@ -156,7 +161,7 @@ def retrieve_lineage(
             if allowed_roles is not None and role not in allowed_roles:
                 continue
             text = _content_to_text(msg.get("content")).strip()
-            if text:
+            if text and not _is_compaction_reference_only(text):
                 evidence.append(LineageEvidence(session_id=scope.session_id, role=role, content=text[:max_chars_per_item], score=0, ordinal=ordinal))
     evidence.sort(key=lambda item: (item.score, item.ordinal), reverse=True)
     return evidence[: max(0, int(limit))]

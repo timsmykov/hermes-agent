@@ -199,6 +199,23 @@ def test_register_artifact_supersedes_previous_same_file_path(tmp_path):
     assert state.active_artifacts[1]["superseded_by"] == "file:v2"
 
 
+def test_render_for_prompt_hides_missing_file_artifacts(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    store = ActiveStateStore(db)
+    scope = SessionScope(platform="telegram", chat_id="806409559", thread_id="468587", session_id="s-a")
+    missing = tmp_path / "deleted.md"
+    live = tmp_path / "live.md"
+    live.write_text("ok")
+
+    store.register_artifact(scope, {"artifact_id": "missing", "kind": "file", "title": "deleted.md", "local_path": str(missing)})
+    store.register_artifact(scope, {"artifact_id": "live", "kind": "file", "title": "live.md", "local_path": str(live)})
+
+    rendered = store.get(scope).render_for_prompt()
+
+    assert "live.md" in rendered
+    assert "deleted.md" not in rendered
+
+
 def test_active_state_debug_report_is_compact_and_scoped(tmp_path):
     db = SessionDB(tmp_path / "state.db")
     store = ActiveStateStore(db)

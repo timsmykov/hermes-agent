@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 from agent.session_scope import SessionScope
@@ -93,6 +94,16 @@ def _merge_list_field(field_name: str, newer_items: Iterable[Dict[str, Any]], ol
     return merged[:50]
 
 
+def _artifact_is_live_for_prompt(artifact: Dict[str, Any]) -> bool:
+    path = artifact.get("local_path") or artifact.get("path")
+    if not path:
+        return True
+    try:
+        return Path(str(path)).exists()
+    except Exception:
+        return True
+
+
 def _newer_mapping(candidate: Optional[Dict[str, Any]], current: Optional[Dict[str, Any]], *, timestamp_keys: tuple[str, ...]) -> Optional[Dict[str, Any]]:
     """Pick the mapping with the newest timestamp-like field."""
     if not candidate:
@@ -173,8 +184,10 @@ class ActiveSessionState:
         if self.latest_user_request:
             lines.append(f"latest_user_request: {self.latest_user_request.get('text') or self.latest_user_request}")
         if self.active_artifacts:
-            lines.append("active_artifacts:")
-            for artifact in self.active_artifacts[:max_artifacts]:
+            live_artifacts = [artifact for artifact in self.active_artifacts if _artifact_is_live_for_prompt(artifact)]
+            if live_artifacts:
+                lines.append("active_artifacts:")
+            for artifact in live_artifacts[:max_artifacts]:
                 title = artifact.get("title") or artifact.get("local_path") or artifact.get("uri") or artifact.get("artifact_id")
                 lines.append(f"- {artifact.get('kind', 'artifact')}: {title}")
         if self.unresolved_asks:

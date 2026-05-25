@@ -84,6 +84,38 @@ def test_reference_resolver_ignores_non_ambiguous_text(tmp_path):
     assert result.reason == "no_ambiguous_reference"
 
 
+def test_reference_resolver_does_not_dump_artifacts_for_generic_architecture_pronouns(tmp_path):
+    store = _store(tmp_path)
+    resolver = ReferenceResolver(store)
+    scope = SessionScope(platform="telegram", chat_id="806409559", thread_id="468587", session_id="s-a")
+    store.register_artifact(scope, {"artifact_id": "old-report", "kind": "file", "title": "old-report.md"})
+
+    result = resolver.resolve(
+        scope,
+        "сделай инспекцию того, как реализованы эталонные системы памяти; мы её уже реализовывали",
+    )
+
+    assert result.status == "not_applicable"
+    assert result.reason == "no_ambiguous_reference"
+
+
+def test_reference_resolver_filters_missing_file_artifacts(tmp_path):
+    store = _store(tmp_path)
+    resolver = ReferenceResolver(store)
+    scope = SessionScope(platform="telegram", chat_id="806409559", thread_id="468587", session_id="s-a")
+    missing = tmp_path / "deleted-report.md"
+    live = tmp_path / "live-report.md"
+    live.write_text("ok")
+    store.register_artifact(scope, {"artifact_id": "missing", "kind": "file", "title": "deleted-report.md", "local_path": str(missing)})
+    store.register_artifact(scope, {"artifact_id": "live", "kind": "file", "title": "live-report.md", "local_path": str(live)})
+
+    result = resolver.resolve(scope, "продолжи этот отчёт")
+
+    assert result.status == "resolved"
+    assert result.artifact is not None
+    assert result.artifact["artifact_id"] == "live"
+
+
 def test_reference_resolver_prefers_reply_or_attachment_artifact(tmp_path):
     store = _store(tmp_path)
     resolver = ReferenceResolver(store)

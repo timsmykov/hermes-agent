@@ -16,9 +16,10 @@ from agent.active_state import ActiveStateStore
 from agent.session_scope import SessionScope
 
 
-_AMBIGUOUS_REFERENCE_RE = re.compile(
-    r"\b(этот|эта|это|эти|тот|та|то|те|там|его|её|ее|их|продолжи|"
-    r"this|that|these|those|it|its|their|continue)\b",
+_STRONG_REFERENCE_RE = re.compile(r"\b(продолжи|continue)\b", re.IGNORECASE)
+_DEICTIC_RE = re.compile(
+    r"\b(этот|эта|это|эти|тот|та|то|те|там|его|её|ее|их|"
+    r"this|that|these|those|it|its|their)\b",
     re.IGNORECASE,
 )
 _ARTIFACT_KIND_HINTS = {
@@ -64,7 +65,25 @@ class ReferenceResolver:
 
     @staticmethod
     def has_ambiguous_reference(text: str) -> bool:
-        return bool(_AMBIGUOUS_REFERENCE_RE.search(text or ""))
+        text = text or ""
+        if _STRONG_REFERENCE_RE.search(text):
+            return True
+        # Generic pronouns like "это/её/it" are common in architecture
+        # questions and should not cause active-artifact dumps by themselves.
+        # Resolve only when the turn also contains an artifact-type hint.
+        return bool(_DEICTIC_RE.search(text) and ReferenceResolver._hinted_kinds(text))
+
+    @staticmethod
+    def _artifact_is_live(artifact: Dict[str, Any]) -> bool:
+        path = artifact.get("local_path") or artifact.get("path")
+        if not path:
+            return True
+        try:
+            from pathlib import Path
+
+            return Path(str(path)).exists()
+        except Exception:
+            return True
 
     @staticmethod
     def _hinted_kinds(text: str) -> set[str]:
@@ -104,6 +123,7 @@ class ReferenceResolver:
             for artifact in state.active_artifacts
             if artifact.get("status", "active") == "active"
             and artifact.get("owner_scope", scope.scope_key) == scope.scope_key
+            and self._artifact_is_live(artifact)
         ]
         priority_sources = ("reply", "attachment", "current_turn")
         priority_artifacts = [
