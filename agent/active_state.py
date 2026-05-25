@@ -300,8 +300,11 @@ class ActiveStateStore:
             "message_id": message_id,
             "timestamp": timestamp or time.time(),
         }
-        current_status = (state.current_task or {}).get("status")
-        if _looks_like_task_text(text) and (not state.current_task or current_status == "completed"):
+        if _looks_like_task_text(text):
+            # The latest substantive user turn is the active task.  Older
+            # in-progress tasks can survive compaction/handoff and must not
+            # keep steering the model after Tim has changed the instruction
+            # (for example: "commit everything" after an earlier ops incident).
             state.current_task = {
                 "text": text,
                 "status": "in_progress",

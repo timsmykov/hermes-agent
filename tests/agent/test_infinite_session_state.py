@@ -131,6 +131,27 @@ def test_current_task_does_not_overwrite_in_progress_task_with_status_question(t
     assert state.latest_user_request["text"] == "что по статусу?"
 
 
+def test_latest_substantive_user_turn_replaces_stale_in_progress_task(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    store = ActiveStateStore(db)
+    scope = SessionScope(platform="telegram", chat_id="806409559", thread_id="468587", session_id="s-a")
+
+    store.update_latest_user_request(scope, text="посмотри перегруз сервера", message_id="u1", timestamp=1000)
+    store.update_latest_user_request(
+        scope,
+        text="после завершения закоммить все изменения в репозиториях",
+        message_id="u2",
+        timestamp=2000,
+    )
+
+    state = store.get(scope)
+    assert state.current_task is not None
+    assert state.latest_user_request is not None
+    assert state.current_task["text"] == "после завершения закоммить все изменения в репозиториях"
+    assert state.current_task["source_message_id"] == "u2"
+    assert state.latest_user_request["text"] == "после завершения закоммить все изменения в репозиториях"
+
+
 def test_current_task_not_completed_by_negated_assistant_output(tmp_path):
     db = SessionDB(tmp_path / "state.db")
     store = ActiveStateStore(db)
