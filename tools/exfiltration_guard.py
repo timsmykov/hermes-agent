@@ -64,10 +64,22 @@ _SENSITIVE_READ_CMD_RE = re.compile(
     re.IGNORECASE,
 )
 
+_SENSITIVE_UPLOAD_ARG_RE = re.compile(
+    rf"\b(?:curl|wget)\b[^\n;&|]*(?:--data(?:-binary|-raw)?|--form|-F|-d)\s+@?({_SENSITIVE_PATH_FRAGMENT})",
+    re.IGNORECASE,
+)
+
 _NETWORK_EGRESS_RE = re.compile(
     r"\b(?:curl|wget|nc|ncat|netcat|socat|scp|rsync|ftp|sftp|ssh)\b|"
     r"https?://|wss?://|\brequests\.(?:post|put|get)\b|\burllib\.request\b",
     re.IGNORECASE,
+)
+
+_CLOUDFLARE_API_RE = re.compile(r"https://api\.cloudflare\.com/client/v4(?:/|\b)", re.IGNORECASE)
+_CLOUDFLARE_TOKEN_RE = re.compile(r"\bcfat_[A-Za-z0-9_-]{20,}\b")
+_CLOUDFLARE_OVERRIDE_MARKERS = (
+    "HERMES_ALLOW_CLOUDFLARE_API_TOKEN_EGRESS=1",
+    "--hermes-allow-cloudflare-token-egress",
 )
 
 
@@ -137,6 +149,27 @@ def egress_block_message(surface: str = "outbound message") -> str:
     )
 
 
+def _is_explicit_cloudflare_api_token_egress(command: str) -> bool:
+    """Allow Tim-approved Cloudflare API diagnostics without weakening generic DLP.
+
+    This narrow escape hatch is intentionally command-local and explicit: the
+    command must include one of the override markers, target Cloudflare's v4 API,
+    contain a Cloudflare API token shape, and must not read a known credential
+    file as part of the same shell command.
+    """
+    if not command:
+        return False
+    if not any(marker in command for marker in _CLOUDFLARE_OVERRIDE_MARKERS):
+        return False
+    if not _CLOUDFLARE_API_RE.search(command):
+        return False
+    if not _CLOUDFLARE_TOKEN_RE.search(command):
+        return False
+    if _SENSITIVE_READ_CMD_RE.search(command):
+        return False
+    return True
+
+
 def detect_sensitive_terminal_exfil(command: str) -> str | None:
     """Return a description when a shell command appears to exfiltrate secrets.
 
@@ -148,6 +181,10 @@ def detect_sensitive_terminal_exfil(command: str) -> str | None:
     decoded = unquote(cmd)
     if _SENSITIVE_READ_CMD_RE.search(decoded) and _NETWORK_EGRESS_RE.search(decoded):
         return "read sensitive credential file and send it to a network/external sink"
+    if _SENSITIVE_UPLOAD_ARG_RE.search(decoded):
+        return "read sensitive credential file and send it to a network/external sink"
+    if _is_explicit_cloudflare_api_token_egress(decoded):
+        return None
     if _NETWORK_EGRESS_RE.search(decoded) and message_contains_unredacted_secret(decoded):
         return "network/external command contains secret-looking material"
     return None
