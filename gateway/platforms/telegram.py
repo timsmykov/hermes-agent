@@ -6144,7 +6144,7 @@ class TelegramAdapter(BasePlatformAdapter):
         if self._enqueue_media_with_text_batch_if_needed(event):
             return
 
-        if msg.document:
+        if msg.document and not self._is_forwarded_message(msg):
             batch_key = self._document_batch_key(event)
             self._enqueue_document_event(batch_key, event)
             return
