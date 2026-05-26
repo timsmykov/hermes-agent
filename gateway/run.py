@@ -3689,6 +3689,18 @@ class GatewayRunner:
 
         running_agent = self._running_agents.get(session_key)
         effective_mode = mode if mode in {"queue", "steer", "interrupt"} else "interrupt"
+        demoted_for_subagents = (
+            effective_mode == "interrupt"
+            and self._agent_has_active_subagents(running_agent)
+        )
+        if demoted_for_subagents:
+            logger.info(
+                "Demoting busy_input_mode 'interrupt' to 'queue' for session %s "
+                "because the running agent has active subagents (#30170)",
+                session_key,
+            )
+            effective_mode = "queue"
+
         steered = False
         if effective_mode == "steer":
             steer_text = (event.text or "").strip()
@@ -3739,6 +3751,11 @@ class GatewayRunner:
             message = (
                 f"⏩ Steered into current run{status_detail}. "
                 f"Your message arrives after the next tool call."
+            )
+        elif is_queue_mode and demoted_for_subagents:
+            message = (
+                f"⏳ Subagent working{status_detail} — your message is queued for "
+                f"when it finishes (use /stop to cancel everything)."
             )
         elif is_queue_mode:
             message = (
