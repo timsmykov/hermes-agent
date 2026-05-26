@@ -341,9 +341,26 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 )
             break
 
-        # Stale-call detector: kill the connection if no response
-        # arrives within the configured timeout.
-        if _elapsed > _stale_timeout:
+        # Stale-call detector: kill the connection if no response arrives
+        # within the configured timeout. For Codex Responses calls the
+        # worker thread streams internally, including reasoning/progress
+        # events. Treat any provider stream event as activity so a long
+        # thinking phase does not get killed just because no final answer
+        # has arrived yet.
+        _provider_event_ts = 0.0
+        if agent.api_mode == "codex_responses":
+            try:
+                _provider_event_ts = float(
+                    getattr(agent, "_last_provider_stream_event_ts", 0.0) or 0.0
+                )
+            except (TypeError, ValueError):
+                _provider_event_ts = 0.0
+        _stale_elapsed = (
+            time.time() - _provider_event_ts
+            if _provider_event_ts >= _call_start
+            else _elapsed
+        )
+        if _stale_elapsed > _stale_timeout:
             _est_ctx = estimate_request_context_tokens(api_kwargs)
             _silent_hint: Optional[str] = None
             _hint_fn = getattr(agent, "_codex_silent_hang_hint", None)
@@ -353,21 +370,26 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 except Exception:
                     _silent_hint = None
             logger.warning(
-                "Non-streaming API call stale for %.0fs (threshold %.0fs). "
-                "model=%s context=~%s tokens. Killing connection.",
-                _elapsed, _stale_timeout,
+                "API call stale for %.0fs without provider activity "
+                "(elapsed %.0fs, threshold %.0fs). model=%s context=~%s "
+                "tokens last_event=%s. Killing connection.",
+                _stale_elapsed, _elapsed, _stale_timeout,
                 api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
+                getattr(agent, "_last_provider_stream_event_type", ""),
+            )
+            _mode_label = (
+                "stream" if agent.api_mode == "codex_responses" else "non-streaming"
             )
             if _silent_hint:
                 agent._emit_status(
-                    f"⚠️ No response from provider for {int(_elapsed)}s "
-                    f"(non-streaming, model: {api_kwargs.get('model', 'unknown')}). "
+                    f"⚠️ No provider activity for {int(_stale_elapsed)}s "
+                    f"({_mode_label}, model: {api_kwargs.get('model', 'unknown')}). "
                     f"{_silent_hint}"
                 )
             else:
                 agent._emit_status(
-                    f"⚠️ No response from provider for {int(_elapsed)}s "
-                    f"(non-streaming, model: {api_kwargs.get('model', 'unknown')}). "
+                    f"⚠️ No provider activity for {int(_stale_elapsed)}s "
+                    f"({_mode_label}, model: {api_kwargs.get('model', 'unknown')}). "
                     f"Aborting call."
                 )
             try:
@@ -379,21 +401,23 @@ def interruptible_api_call(agent, api_kwargs: dict):
             except Exception:
                 pass
             agent._touch_activity(
-                f"stale non-streaming call killed after {int(_elapsed)}s"
+                f"stale API call killed after {int(_stale_elapsed)}s without provider activity"
             )
             # Wait briefly for the thread to notice the closed connection.
             t.join(timeout=2.0)
             if result["error"] is None and result["response"] is None:
                 if _silent_hint:
                     result["error"] = TimeoutError(
-                        f"Non-streaming API call timed out after {int(_elapsed)}s "
-                        f"with no response (threshold: {int(_stale_timeout)}s). "
+                        f"API call timed out after {int(_elapsed)}s "
+                        f"with no provider activity for {int(_stale_elapsed)}s "
+                        f"(threshold: {int(_stale_timeout)}s). "
                         f"{_silent_hint}"
                     )
                 else:
                     result["error"] = TimeoutError(
-                        f"Non-streaming API call timed out after {int(_elapsed)}s "
-                        f"with no response (threshold: {int(_stale_timeout)}s)"
+                        f"API call timed out after {int(_elapsed)}s "
+                        f"with no provider activity for {int(_stale_elapsed)}s "
+                        f"(threshold: {int(_stale_timeout)}s)"
                     )
             break
 

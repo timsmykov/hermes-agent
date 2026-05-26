@@ -195,11 +195,15 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         try:
             with active_client.responses.stream(**api_kwargs) as stream:
                 for event in stream:
-                    # Mark stream activity for the TTFB watchdog in
-                    # interruptible_api_call. The Codex backend can accept the
-                    # connection but never emit a single event; this timestamp
-                    # staying None tells the watchdog no bytes are flowing.
-                    agent._codex_stream_last_event_ts = time.time()
+                    # Mark stream activity for watchdogs in interruptible_api_call.
+                    # The Codex backend can accept the connection but never emit a
+                    # single event; _codex_stream_last_event_ts staying None tells
+                    # the TTFB watchdog no bytes are flowing.  The generic provider
+                    # activity marker also keeps long reasoning/progress streams alive.
+                    _now = time.time()
+                    agent._codex_stream_last_event_ts = _now
+                    agent._last_provider_stream_event_ts = _now
+                    agent._last_provider_stream_event_type = getattr(event, "type", "")
                     agent._touch_activity("receiving stream response")
                     if agent._interrupt_requested:
                         break
@@ -357,6 +361,10 @@ def run_codex_create_stream_fallback(agent, api_kwargs: dict, client: Any = None
     collected_text_deltas: list = []
     try:
         for event in stream_or_response:
+            agent._last_provider_stream_event_ts = time.time()
+            agent._last_provider_stream_event_type = getattr(event, "type", None) or (
+                event.get("type") if isinstance(event, dict) else ""
+            )
             agent._touch_activity("receiving stream response")
             event_type = getattr(event, "type", None)
             if not event_type and isinstance(event, dict):
